@@ -6,10 +6,11 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-29 | Step 1 · Commit 2 | 新增蠟燭聚合引擎：`engine/timeutil.py`（naive parse + 週期 floor + bar key，時區鐵律）+ `engine/candle_aggregator.py`（tick→K 線聚合：OHLC 更新、volume delta、日 rollover reset、out-of-order guard）；50 項新單測全過（全套 61 passed）。剩餘：富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 | 2026-09-29 | Step 1 · Commit 1 | 專案初始化：`config.py` 設定模組（frozen dataclass + `.env` 唯一事實來源，11 項單測全過）；安裝並 pin PySide6 6.11.2；`requirements.txt` 經 `pip freeze` 同步。剩餘：蠟燭聚合引擎 → 富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 
 ### 下一步（Step 1 未完成項）
-- [ ] Commit 2：`engine/timeutil.py` + `engine/candle_aggregator.py`（tick→蠟燭聚合，純類單測）
+- [x] Commit 2：`engine/timeutil.py` + `engine/candle_aggregator.py`（tick→蠟燭聚合，純類單測）
 - [ ] Commit 3：`engine/futu_engine.py`（OpenD setup thread + pyqtSignal + `on_recv_rsp` 回調）
 - [ ] Commit 4：`ui/main_window.py` + `ui/candle_chart.py`（全屏幕深色主題蠟燭圖、volume subpane、crosshair、overlay hook）
 - [ ] Commit 5：`main.py` 入口 + `.env.example` + live smoke test
@@ -31,9 +32,9 @@
 D:\coding\ICT_v1\
 ├─ main.py                     # [Commit 5] entry：Config → QApplication + MainWindow + FutuEngine；SIGINT reset；clean shutdown
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import
-├─ engine\                     # [Commit 2-3] timeutil / candle_aggregator（純類）/ futu_engine（QObject）
+├─ engine\                     # ✅ timeutil / candle_aggregator（純類）；futu_engine（QObject）[Commit 3]
 ├─ ui\                         # [Commit 4] main_window / candle_chart
-├─ tests\                      # test_config.py ✅；test_timeutil / test_aggregator [Commit 2]
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # [Commit 5] commit 嘅配置文檔
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
