@@ -6,16 +6,21 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 1 · Commit 5（**Step 1 完成**） | 新增 `main.py` 入口：`Config.from_env()`（未知 KLINE_TYPE → stderr 報錯 exit(1)）→ QApplication + MainWindow `showFullScreen()`；SIGINT（Ctrl+C）排程 `app.quit()` 行完 event loop 先收；`exec()` 返回後 finally `window.shutdown()` clean stop。新增 `.env.example` 配置範本。**Live smoke test 實測通過**：offscreen 連真 OpenD → `history_ready` 300 根（夜期數據至 2026-09-30 03:00）→ QUOTE 訂閱成功 → close 乾淨斷線。全套 **136 passed** |
 | 2026-09-30 | Step 1 · Commit 4 | 新增全屏幕深色主題蠟燭圖表 UI：`ui/candle_chart.py`（純 QPainter、零第三方圖表庫——蠟燭 + volume subpane + nice-step grid/右軸 price label + last-price dashed line 同右軸 tag + crosshair OHLCV readout；backpressure = immutable snapshot + singleShot `QTimer(30ms)` coalesce repaint，tick burst 最多 ~30fps；`add_overlay()` 預留 ICT FVG / Order Block / Kill Zone 擴展點）+ `ui/main_window.py`（F11 全屏幕切換 / Esc 關閉、engine signal → chart 接線、深色主題跟 `.env` 配色）。20 項新單測全過（全套 **136 passed**）。剩餘：main.py 整合 |
 | 2026-09-30 | Step 1 · Commit 3 | 新增富途行情引擎 `engine/futu_engine.py`：OpenD setup daemon thread + `request_history_kline` 明確窗口分頁 seed + QUOTE 訂閱 `_QuoteHandler.on_recv_rsp` 實時回調聚合（pyqtSignal 跨線程 immutable snapshot）；`timeutil` 加 `parse_time_only` / `resolve_tick_datetime`（time-only tick 補 date）/ `history_window`。55 項新單測全過（全套 **116 passed**）。剩餘：全屏幕圖表 UI → main.py 整合 |
 | 2026-09-29 | Step 1 · Commit 2 | 新增蠟燭聚合引擎：`engine/timeutil.py`（naive parse + 週期 floor + bar key，時區鐵律）+ `engine/candle_aggregator.py`（tick→K 線聚合：OHLC 更新、volume delta、日 rollover reset、out-of-order guard）；50 項新單測全過（全套 61 passed）。剩餘：富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 | 2026-09-29 | Step 1 · Commit 1 | 專案初始化：`config.py` 設定模組（frozen dataclass + `.env` 唯一事實來源，11 項單測全過）；安裝並 pin PySide6 6.11.2；`requirements.txt` 經 `pip freeze` 同步。剩餘：蠟燭聚合引擎 → 富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 
-### 下一步（Step 1 未完成項）
+### Step 1 進度（✅ 全部完成）
+- [x] Commit 1：`config.py` 設定模組（frozen dataclass + `.env`，11 項單測）
 - [x] Commit 2：`engine/timeutil.py` + `engine/candle_aggregator.py`（tick→蠟燭聚合，純類單測）
 - [x] Commit 3：`engine/futu_engine.py`（OpenD setup thread + pyqtSignal + `on_recv_rsp` 回調；27 項 mock 單測）
 - [x] Commit 4：`ui/main_window.py` + `ui/candle_chart.py`（全屏幕深色主題蠟燭圖、volume subpane、crosshair、overlay hook）
-- [ ] Commit 5：`main.py` 入口 + `.env.example` + live smoke test
+- [x] Commit 5：`main.py` 入口 + `.env.example` + live smoke test
+
+### 下一步（Step 2 候選，未定範圍）
+- ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
 
 ## Features（Step 1 目標）
 
@@ -32,13 +37,13 @@
 
 ```
 D:\coding\ICT_v1\
-├─ main.py                     # [Commit 5] entry：Config → QApplication + MainWindow + FutuEngine；SIGINT reset；clean shutdown
+├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import
 ├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合）
 ├─ ui\                         # ✅ main_window / candle_chart（純 QPainter；backpressure coalesce repaint；add_overlay 擴展點）
 ├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線）；test_candle_chart.py ✅（20 項純 layout 函數單測，零 Qt app 依賴）
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
-├─ .env.example                # [Commit 5] commit 嘅配置文檔
+├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env）
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
 ```
 
@@ -75,9 +80,11 @@ Quote `data_time` 同 kline `time_key` 對 HK.HSImain 都係 **HKT naive string*
 ```bash
 python -m pip install -r requirements.txt
 copy .env.example .env    # Windows；Ubuntu: cp .env.example .env
-# 按下方表格填 FUTU_OPEND_HOST / FUTU_OPEND_PORT 等
-python main.py            # ⚠️ main.py 於 Commit 5 加入；目前可先跑單測驗證 config
+# 按下方表格填 FUTU_OPEND_HOST / FUTU_OPEND_PORT 等（全部可選，預設已可用）
+python main.py            # 全屏幕啟動；F11 切換全屏幕、Esc 關閉、Ctrl+C clean exit
 ```
+
+> 前提：本地富途 OpenD 已開（預設 `127.0.0.1:11111`）。連唔到時窗口會照開，status bar 顯示錯誤訊息。
 
 ## Tests
 

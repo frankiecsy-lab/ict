@@ -99,6 +99,8 @@
 *   **【解決/避坑方案】**：只檢查 ret code；失敗時第二返回值先至係錯誤訊息 string。
 *   **【問題/限制】**：live QUOTE push 嘅 `data_time` 係 **time-only** string `'HH:mm:ss.SSS'`（無日期）。
 *   **【解決/避坑方案】**：engine 補 date = max(anchor, today)；anchor = seed 最後一根歷史 bar 嘅日期（處理夜期跨午夜 + clock skew），見 `timeutil.resolve_tick_datetime()`。
+*   **【問題/限制】**（2026-09-30 live smoke 實測）：HK.HSImain 夜期最後一根 bar label 係 `03:00`（即交易去到 ~04:00 先收）；07:43–07:44 之間 tick 數 = 0——**非交易時段冇報價係正常現象**。
+*   **【解決/避坑方案】**：除錯「實時唔更新」時，先核對當前時間有冇喺交易時段內（日市 09:15 預開市 / 09:30 開市），唔好誤判做訂閱 bug。
 
 #### 3. 🥇 PySide6 pyqtSignal 跨線程遞送語義（2026-09-30 probe 驗證）
 *   **【問題/限制】**：由非 GUI thread emit signal → plain Python callable **唔會同步收到**（AutoConnection queue 咗，要 event loop 先 drain）。

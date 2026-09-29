@@ -17,6 +17,9 @@
 - （2026-09-30）`ui/candle_chart.py`：全屏幕深色主題蠟燭圖表（純 QPainter，零第三方圖表庫）——蠟燭 wick+body（紅漲綠跌跟 config 慣例/override）、volume subpane（plot 高度 22%）、nice-step（1/2/2.5/5×10^n）水平 grid + 右軸 price label、時間軸 label（~90px 間隔，intraday 顯示 HH:mm）、last-price dashed line + 右軸 tag、crosshair + OHLCV readout；**backpressure**：`update_bars()` 只記錄 immutable snapshot + singleShot `QTimer(30ms)` coalesce repaint（tick burst 最多 ~30fps，永遠 render 最新）；純 layout 函數（`visible_slice`/`price_range`/`volume_max`/`nice_step`/`time_label`/`fmt_price`）抽離可獨立單測；`add_overlay(fn)` 預留 ICT FVG / Order Block / Kill Zone 圖層擴展點。
 - （2026-09-30）`ui/main_window.py`：全屏幕終端主窗口——CandleChart central widget + FutuEngine signal 接線（`history_ready`/`bars_changed` → `chart.update_bars`、`status`/`error` → status bar，callback thread emit 經 Qt auto-queue 過 GUI）、深色主題 stylesheet 跟 `.env` 配色、F11 全屏幕切換 / Esc 關閉、`shutdown()` clean stop（idempotent）。
 - （2026-09-30）`tests/test_candle_chart.py`（20 項，零 Qt app 依賴）：visible_slice 右 pin/邊界、price_range 5% padding + flat fallback、volume_max 除零防護、nice_step mantissa 不變量、time_label intraday/day-week-month、fmt_price；全套 **136 passed**。
+- （2026-09-30）`main.py`：應用入口——`Config.from_env()`（未知 KLINE_TYPE → stderr 報錯 exit(1)，唔開窗口）→ QApplication + MainWindow `showFullScreen()`；SIGINT（Ctrl+C）handler 排程 `QTimer.singleShot(0, app.quit)`（行完 event loop 先收，唔喺 signal context 做重活）；`exec()` 返回後 finally `window.shutdown()`（close OpenD ctx + join setup thread）。
+- （2026-09-30）`.env.example`：全部配置鍵範本（預設值同 README 表格一致，繁中註釋），複製做 `.env` 即用。
+- （2026-09-30）**Live smoke test 實測通過**（offscreen QApplication + 真 OpenD `127.0.0.1:11111`）：連線成功 → `history_ready` 300 根（HK.HSImain K_1M，夜期數據 `2026-09-29 22:01`→`2026-09-30 03:00`）→ QUOTE 訂閱成功 → `stop()` 乾淨斷線（CallClose）。全套 **136 passed**，**Step 1 完成**。
 
 ### Next
-- Commit 5：`main.py` 整合 + `.env.example` + live smoke test
+- Step 2（候選，未定範圍）：ICT 指標 overlay——經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
