@@ -6,7 +6,8 @@ string → 一律 parse naive、floor 到週期邊界，**永遠唔好 astimezon
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import math
+from datetime import date, datetime, time as dtime, timedelta
 
 _MINUTES_PER_DAY = 24 * 60
 
@@ -69,3 +70,55 @@ def bar_key(dt: datetime, period_minutes: int) -> str:
 def is_up(open_: float, close: float) -> bool:
     """蠟燭方向：close >= open 視為漲（doji 畫作漲色）。"""
     return close >= open_
+
+
+def parse_time_only(value) -> dtime | None:
+    """解析時間-only string（futu live tick data_time 格式 'HH:mm:ss.SSS'）。失敗返回 None。"""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def resolve_tick_datetime(value, fallback_date=None) -> datetime | None:
+    """將 tick 時間解析為 naive datetime。
+
+    futu live QUOTE push 嘅 data_time 實際係 **time-only** string 'HH:mm:ss.SSS'（無日期），
+    需要由 engine 傳入 date（max(anchor, today)）補齊；完整 datetime string / datetime 對象直接經 parse_market_time。
+    """
+    if isinstance(value, datetime):
+        return parse_market_time(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if "-" in s or "T" in s:  # 含日期部分 → 完整格式
+        return parse_market_time(s)
+    t = parse_time_only(s)
+    if t is None:
+        return None
+    if fallback_date is None:
+        fallback_date = datetime.now().date()
+    return datetime.combine(fallback_date, t)
+
+
+def history_window(period_minutes: int, count: int, now=None) -> tuple[str, str]:
+    """計算 request_history_kline 嘅明確 start/end 窗口（返回 'yyyy-MM-dd HH:mm:ss' string）。
+
+    實測：no-window 請求對 HK.HSImain 返回一年前舊數據 → 必須用明確窗口；
+    且 window + max_count 返回時間序**頭 N 根**而非最近 N 根 → engine 端 page_req_key 分頁攞晒再 tail(count)。
+    窗口寬度保守估計（假設每日最少 360 分鐘交易），覆蓋港股（~375 min/日）同恒指期貨夜期（~834 min/日）。
+    """
+    if period_minutes <= 0 or count <= 0:
+        raise ValueError("period_minutes/count must be > 0")
+    now = now or datetime.now()
+    if period_minutes < _MINUTES_PER_DAY:
+        days = math.ceil(count * period_minutes / 360.0) + 2
+    else:
+        days = int(math.ceil(count * (period_minutes / _MINUTES_PER_DAY) * 1.5)) + 7
+    start = now - timedelta(days=days)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")

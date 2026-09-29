@@ -1,9 +1,17 @@
-"""timeutil 單測：時間解析、週期 floor、bar key、方向判定。"""
-from datetime import datetime
+"""timeutil 單測：時間解析、週期 floor、bar key、方向判定、tick 時間補全、歷史窗口。"""
+from datetime import date, datetime, time as dtime, timedelta
 
 import pytest
 
-from engine.timeutil import bar_key, floor_to_period, is_up, parse_market_time
+from engine.timeutil import (
+    bar_key,
+    floor_to_period,
+    history_window,
+    is_up,
+    parse_market_time,
+    parse_time_only,
+    resolve_tick_datetime,
+)
 
 
 class TestParseMarketTime:
@@ -85,3 +93,80 @@ class TestIsUp:
 
     def test_doji_counts_as_up(self):
         assert is_up(100.0, 100.0)
+
+
+class TestParseTimeOnly:
+    """futu live tick data_time 係 time-only string（實測 'HH:mm:ss.SSS'）。"""
+
+    def test_millis(self):
+        assert parse_time_only("14:30:45.123") == dtime(14, 30, 45, 123000)
+
+    def test_seconds(self):
+        assert parse_time_only("14:30:45") == dtime(14, 30, 45)
+
+    def test_minutes(self):
+        assert parse_time_only("14:30") == dtime(14, 30)
+
+    @pytest.mark.parametrize(
+        "bad", ["", "   ", "abc", "99:99", "25:00:00", "14:61:00", "14:30:45.1234567"]
+    )
+    def test_garbage_returns_none(self, bad):
+        assert parse_time_only(bad) is None
+
+    @pytest.mark.parametrize("bad", [None, 12345, dtime(14, 30)])
+    def test_non_string_returns_none(self, bad):
+        assert parse_time_only(bad) is None
+
+
+class TestResolveTickDatetime:
+    def test_datetime_passthrough_naive(self):
+        dt = resolve_tick_datetime(datetime(2026, 9, 28, 14, 30, 45))
+        assert dt == datetime(2026, 9, 28, 14, 30, 45) and dt.tzinfo is None
+
+    def test_full_string_ignores_fallback(self):
+        # 含日期部分 → 直接 parse，fallback 唔使理
+        assert resolve_tick_datetime("2026-09-28 14:30:45", date(2030, 1, 1)) == datetime(2026, 9, 28, 14, 30, 45)
+
+    def test_time_only_uses_fallback_date(self):
+        assert resolve_tick_datetime("09:30:05.500", date(2026, 9, 28)) == datetime(2026, 9, 28, 9, 30, 5, 500000)
+
+    def test_time_only_no_fallback_uses_today(self):
+        dt = resolve_tick_datetime("14:30:45")
+        assert dt.date() == date.today()
+        assert (dt.hour, dt.minute, dt.second) == (14, 30, 45)
+
+    @pytest.mark.parametrize("bad", [None, 12345, "not-a-time"])
+    def test_garbage_returns_none(self, bad):
+        assert resolve_tick_datetime(bad) is None
+
+
+class TestHistoryWindow:
+    """明確 start/end 窗口（實測：no-window 會返回一年前舊數據）。"""
+
+    NOW = datetime(2026, 9, 30, 15, 0, 0)
+
+    def test_1m_window(self):
+        # days = ceil(300*1/360)+2 = 3
+        start, end = history_window(1, 300, now=self.NOW)
+        assert end == "2026-09-30 15:00:00"
+        assert start == (self.NOW - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_5m_window(self):
+        # days = ceil(300*5/360)+2 = 7
+        start, _ = history_window(5, 300, now=self.NOW)
+        assert start == (self.NOW - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_day_period_wider(self):
+        # K_DAY: days = int(ceil(300*1.5))+7 = 457（日線要覆蓋更多自然日）
+        start, _ = history_window(24 * 60, 300, now=self.NOW)
+        assert start == (self.NOW - timedelta(days=457)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_format_is_futu_compatible(self):
+        start, end = history_window(1, 10, now=self.NOW)
+        for s in (start, end):
+            assert datetime.strptime(s, "%Y-%m-%d %H:%M:%S") is not None
+
+    @pytest.mark.parametrize("period,count", [(0, 300), (-1, 300), (1, 0), (1, -5)])
+    def test_invalid_raises(self, period, count):
+        with pytest.raises(ValueError):
+            history_window(period, count)

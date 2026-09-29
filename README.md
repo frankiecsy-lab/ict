@@ -6,12 +6,13 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 1 · Commit 3 | 新增富途行情引擎 `engine/futu_engine.py`：OpenD setup daemon thread + `request_history_kline` 明確窗口分頁 seed + QUOTE 訂閱 `_QuoteHandler.on_recv_rsp` 實時回調聚合（pyqtSignal 跨線程 immutable snapshot）；`timeutil` 加 `parse_time_only` / `resolve_tick_datetime`（time-only tick 補 date）/ `history_window`。55 項新單測全過（全套 **116 passed**）。剩餘：全屏幕圖表 UI → main.py 整合 |
 | 2026-09-29 | Step 1 · Commit 2 | 新增蠟燭聚合引擎：`engine/timeutil.py`（naive parse + 週期 floor + bar key，時區鐵律）+ `engine/candle_aggregator.py`（tick→K 線聚合：OHLC 更新、volume delta、日 rollover reset、out-of-order guard）；50 項新單測全過（全套 61 passed）。剩餘：富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 | 2026-09-29 | Step 1 · Commit 1 | 專案初始化：`config.py` 設定模組（frozen dataclass + `.env` 唯一事實來源，11 項單測全過）；安裝並 pin PySide6 6.11.2；`requirements.txt` 經 `pip freeze` 同步。剩餘：蠟燭聚合引擎 → 富途行情引擎 → 全屏幕圖表 UI → main.py 整合 |
 
 ### 下一步（Step 1 未完成項）
 - [x] Commit 2：`engine/timeutil.py` + `engine/candle_aggregator.py`（tick→蠟燭聚合，純類單測）
-- [ ] Commit 3：`engine/futu_engine.py`（OpenD setup thread + pyqtSignal + `on_recv_rsp` 回調）
+- [x] Commit 3：`engine/futu_engine.py`（OpenD setup thread + pyqtSignal + `on_recv_rsp` 回調；27 項 mock 單測）
 - [ ] Commit 4：`ui/main_window.py` + `ui/candle_chart.py`（全屏幕深色主題蠟燭圖、volume subpane、crosshair、overlay hook）
 - [ ] Commit 5：`main.py` 入口 + `.env.example` + live smoke test
 
@@ -32,9 +33,9 @@
 D:\coding\ICT_v1\
 ├─ main.py                     # [Commit 5] entry：Config → QApplication + MainWindow + FutuEngine；SIGINT reset；clean shutdown
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import
-├─ engine\                     # ✅ timeutil / candle_aggregator（純類）；futu_engine（QObject）[Commit 3]
+├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合）
 ├─ ui\                         # [Commit 4] main_window / candle_chart
-├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線）
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # [Commit 5] commit 嘅配置文檔
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
@@ -46,6 +47,13 @@ D:\coding\ICT_v1\
 - `request_history_kline` 係同步阻塞 → 放獨立 setup daemon thread（唔係 GUI thread）。
 - **聚合喺 callback thread 做**；GUI 只負責 render。跨線程傳 **immutable tuple-of-tuples snapshot**（bar = `(time_key, open, high, low, close, volume)`），經 `pyqtSignal` queued 過 GUI——無共享可變狀態、無鎖。
 - **Backpressure**：chart widget 用 dirty flag + singleShot `QTimer(30ms)` coalesce repaint → tick burst 都最多 ~30fps redraw，永遠 render 最新 snapshot。
+
+### 歷史 K 線取得（實測驗證行為）
+
+- **必須明確窗口**：`request_history_kline` 唔帶 start/end 對 HK.HSImain 會返回一年前舊數據 → `history_window()` 用 now() 計算保守窗口（覆蓋夜期 ~834 min/日）。
+- **返回頭 N 根而非最近 N 根**：window + max_count 返回時間序頭 N 根 → `page_req_key` 分頁攞晒（1000 根/頁）再 tail `history_count` 根。
+- **按欄位名提取**：DataFrame 欄位順序係 open/close/high/low（唔係 OHLC）→ 一律 `df[["time_key","open","high","low","close","volume"]]`。
+- **Live tick data_time 係 time-only**（'HH:mm:ss.SSS'，無日期）→ `resolve_tick_datetime()` 補 date = max(anchor, today)；anchor = seed 最後一根 bar 嘅日期（處理夜期跨午夜 + clock skew）。
 
 ### 時區鐵律
 

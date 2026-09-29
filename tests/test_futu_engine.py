@@ -1,0 +1,420 @@
+"""futu_engine 單測：mock OpenQuoteContext + 真 pandas DataFrame（零真實連線）。
+
+覆蓋：_fetch_history 分頁/tail/NaN skip、on_recv_rsp tick 聚合、tick_date、
+_setup 編排、start/stop lifecycle。
+"""
+from __future__ import annotations
+
+import threading
+import time as _time
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import pytest
+from futu import RET_OK, SubType, StockQuoteHandlerBase
+
+import engine.futu_engine as fe
+from config import Config
+from engine.candle_aggregator import CandleAggregator
+from engine.futu_engine import FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler
+
+
+# ---------------------------------------------------------------- fixtures / fakes
+
+def make_cfg(**overrides) -> Config:
+    base = dict(trading_code="HK.HSImain", kline_type="K_1M", history_count=300)
+    base.update(overrides)
+    return Config(**base)
+
+
+class FakeCtx:
+    """Mock OpenQuoteContext：scripted request_history_kline 回應 + lifecycle 記錄。"""
+
+    def __init__(self, pages, sub_ret=RET_OK, sub_info=None):
+        self._pages = list(pages)
+        self.kline_calls = []
+        self.handler = None
+        self.subscribed = None
+        self.closed = False
+        self.subscribe_event = threading.Event()
+        self._sub_ret = sub_ret
+        self._sub_info = sub_info
+
+    def request_history_kline(self, code, ktype=None, autype=None, start=None, end=None,
+                              max_count=None, page_req_key=None):
+        self.kline_calls.append(dict(code=code, ktype=ktype, start=start, end=end,
+                                     max_count=max_count, page_req_key=page_req_key))
+        return self._pages.pop(0)
+
+    def set_handler(self, handler):
+        self.handler = handler
+
+    def subscribe(self, codes, sub_types):
+        self.subscribed = (list(codes), list(sub_types))
+        self.subscribe_event.set()
+        return self._sub_ret, self._sub_info
+
+    def close(self):
+        self.closed = True
+
+
+def kline_df(rows) -> pd.DataFrame:
+    """rows: (time_key, open, high, low, close, volume)。
+
+    欄位順序故意用 futu 實際嘅 open/close/high/low（唔係 OHLC），
+    驗證 engine 按欄位名提取而唔係靠位置。
+    """
+    return pd.DataFrame(
+        [dict(time_key=t, open=o, close=c, high=h, low=l, volume=v) for t, o, h, l, c, v in rows]
+    )
+
+
+def quote_df(rows) -> pd.DataFrame:
+    """rows: (data_time, last_price, volume) → QUOTE push DataFrame。"""
+    return pd.DataFrame(
+        [dict(code="HK.HSImain", data_time=dt, last_price=p, volume=v) for dt, p, v in rows]
+    )
+
+
+def make_engine(**cfg_overrides) -> FutuEngine:
+    """Whitebox：直接注入 cfg + aggregator，唔行 start()（避免真實連線/線程）。"""
+    eng = FutuEngine()
+    eng._cfg = make_cfg(**cfg_overrides)
+    eng._aggregator = CandleAggregator(eng._cfg.period_minutes)
+    return eng
+
+
+def wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.01)
+    return predicate()
+
+
+# ---------------------------------------------------------------- _fetch_history
+
+class TestFetchHistory:
+    def test_single_page(self):
+        eng = make_engine()
+        rows_in = [
+            ("2026-09-30 09:30", 100.0, 101.0, 99.5, 100.5, 1000),
+            ("2026-09-30 09:31", 100.5, 102.0, 100.0, 101.0, 1200),
+        ]
+        ctx = FakeCtx([(RET_OK, kline_df(rows_in), None)])
+        out = eng._fetch_history(ctx)
+        assert out == [
+            ("2026-09-30 09:30", 100.0, 101.0, 99.5, 100.5, 1000.0),
+            ("2026-09-30 09:31", 100.5, 102.0, 100.0, 101.0, 1200.0),
+        ]
+        call = ctx.kline_calls[0]
+        assert call["code"] == "HK.HSImain"
+        assert call["ktype"] is _KLTYPE_MAP["K_1M"]
+        assert call["max_count"] == _PAGE_SIZE
+        # 明確窗口（實測：no-window 會返回一年前舊數據）
+        for s in (call["start"], call["end"]):
+            datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
+    def test_pagination_concatenates(self):
+        eng = make_engine()
+        base = datetime(2026, 9, 30, 9, 30)
+        mk = lambda i: ((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                        100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 1000.0 * (i + 1))
+        page1 = [mk(i) for i in range(3)]
+        page2 = [mk(i) for i in range(3, 6)]
+        ctx = FakeCtx([
+            (RET_OK, kline_df(page1), "k1"),
+            (RET_OK, kline_df(page2), None),
+        ])
+        out = eng._fetch_history(ctx)
+        assert [b[0] for b in out] == [r[0] for r in page1 + page2]
+        # 第二頁帶住第一頁返回嘅 page_req_key
+        assert ctx.kline_calls[1]["page_req_key"] == "k1"
+
+    def test_tail_to_history_count(self):
+        eng = make_engine(history_count=2)
+        base = datetime(2026, 9, 30, 9, 30)
+        rows = [((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                 100.0, 101.0, 99.0, 100.5, 1000.0) for i in range(5)]
+        ctx = FakeCtx([(RET_OK, kline_df(rows), None)])
+        out = eng._fetch_history(ctx)
+        assert len(out) == 2
+        assert [b[0] for b in out] == [rows[-2][0], rows[-1][0]]
+
+    def test_error_raises_with_message(self):
+        eng = make_engine()
+        ctx = FakeCtx([(-1, "connect timeout", None)])
+        with pytest.raises(RuntimeError, match="request_history_kline 失敗"):
+            eng._fetch_history(ctx)
+
+    def test_nan_rows_skipped(self):
+        eng = make_engine()
+        rows = [
+            ("2026-09-30 09:30", float("nan"), 101.0, 99.5, 100.5, 1000),   # NaN open → skip
+            ("2026-09-30 09:31", 100.5, 102.0, 100.0, float("nan"), 1200),  # NaN close → skip
+            ("2026-09-30 09:32", 101.0, 102.5, 100.5, 102.0, 1400),         # 有效
+        ]
+        ctx = FakeCtx([(RET_OK, kline_df(rows), None)])
+        out = eng._fetch_history(ctx)
+        assert len(out) == 1 and out[0][0] == "2026-09-30 09:32"
+
+    def test_page_guard_raises(self, monkeypatch):
+        monkeypatch.setattr(fe, "_MAX_PAGES", 3)
+        eng = make_engine()
+        one_row = kline_df([("2026-09-30 09:30", 1.0, 2.0, 0.5, 1.5, 10)])
+        ctx = FakeCtx([(RET_OK, one_row, "k")] * 10)  # page_key 永遠 truthy
+        with pytest.raises(RuntimeError, match="歷史分頁超過"):
+            eng._fetch_history(ctx)
+        assert len(ctx.kline_calls) == 3
+
+
+# ---------------------------------------------------------------- on_recv_rsp
+
+class TestQuoteHandler:
+    def _run(self, monkeypatch, eng, df, ret=RET_OK):
+        emitted, errors = [], []
+        eng.bars_changed.connect(emitted.append)
+        eng.error.connect(errors.append)
+        # patch SDK base class 嘅 parse 入口（我哋測自己嘅聚合邏輯，唔係 protobuf 層）
+        monkeypatch.setattr(StockQuoteHandlerBase, "on_recv_rsp", lambda self, rsp_pb: (ret, df))
+        handler = _QuoteHandler(eng)
+        ret_out, data_out = handler.on_recv_rsp(None)
+        return emitted, errors, ret_out, data_out
+
+    def test_tick_batch_updates_bar_and_emits(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)  # future anchor → tick_date 確定性（clock skew 分支）
+        df = quote_df([("09:30:45.123", 100.0, 1000), ("09:30:50.456", 101.0, 1500)])
+        emitted, errors, ret_out, data_out = self._run(monkeypatch, eng, df)
+        assert not errors and ret_out == RET_OK and data_out is df
+        assert len(emitted) == 1
+        snap = emitted[0]
+        assert isinstance(snap, tuple)  # immutable snapshot（pyqtSignal 跨線程契約）
+        (key, o, h, l, c, v), = snap
+        assert key == "2030-01-01 09:30"
+        assert (o, h, l, c) == (100.0, 101.0, 100.0, 101.0)
+        assert v == 500.0  # 首筆 delta=0（無參考點）+ 第二筆 max(0, 1500-1000)
+
+    def test_updates_seeded_bar(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
+        df = quote_df([("09:30:10.000", 100.0, 100)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert not errors and len(emitted) == 1
+        (key, o, h, l, c, v), = emitted[0]
+        # open 保留 seed 值；high=max(99.5,100)=100；low=min(98.5,100)=98.5；volume delta=0（seed 後首筆）
+        assert (key, o, h, l, c, v) == ("2030-01-01 09:30", 99.0, 100.0, 98.5, 100.0, 800.0)
+
+    def test_new_bar_after_period_rollover(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
+        df = quote_df([("09:30:10.000", 100.0, 100), ("09:31:02.000", 102.0, 500)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert not errors and len(emitted) == 1
+        bars = emitted[0]
+        assert len(bars) == 2
+        assert bars[0][0] == "2030-01-01 09:30"
+        key, o, h, l, c, v = bars[1]
+        assert key == "2030-01-01 09:31"
+        assert (o, h, l, c) == (102.0, 102.0, 102.0, 102.0)
+        assert v == 400.0  # max(0, 500-100)
+
+    def test_error_ret_emits_error(self, monkeypatch):
+        eng = make_engine()
+        emitted, errors, ret_out, data_out = self._run(monkeypatch, eng, None, ret=-1)
+        assert len(errors) == 1 and "QUOTE push" in errors[0]
+        assert not emitted and ret_out == -1
+
+    def test_none_data_emits_error(self, monkeypatch):
+        eng = make_engine()
+        emitted, errors, _, _ = self._run(monkeypatch, eng, None)
+        assert len(errors) == 1 and not emitted
+
+    def test_nan_price_row_skipped(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        df = quote_df([("09:30:05.000", float("nan"), 100), ("09:30:06.000", 100.0, 200)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert not errors and len(emitted) == 1
+        (key, o, h, l, c, v), = emitted[0]
+        assert (o, h, l, c) == (100.0, 100.0, 100.0, 100.0) and v == 0.0
+
+    def test_garbage_data_time_row_skipped(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        df = quote_df([("garbage", 100.0, 100), ("09:30:05.000", 101.0, 200)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert not errors and len(emitted) == 1
+        (key, o, h, l, c, v), = emitted[0]
+        assert key == "2030-01-01 09:30" and c == 101.0
+
+    def test_duplicate_tick_no_reemit(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        df = quote_df([("09:30:45.123", 100.0, 1000)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert len(emitted) == 1
+        # 重複 tick（同時間同價）→ idempotent no-op → 唔再 emit
+        emitted2, _, _, _ = self._run(monkeypatch, eng, df)
+        assert not emitted2
+
+    def test_out_of_order_tick_skipped(self, monkeypatch):
+        eng = make_engine()
+        eng._anchor_date = date(2030, 1, 1)
+        df = quote_df([("09:31:00.000", 100.0, 100), ("09:30:59.000", 99.0, 90)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert not errors and len(emitted) == 1
+        bars = emitted[0]
+        assert len(bars) == 1 and bars[0][0] == "2030-01-01 09:31" and bars[0][4] == 100.0
+
+
+# ---------------------------------------------------------------- tick_date
+
+class TestTickDate:
+    def test_no_anchor_uses_today(self):
+        assert make_engine().tick_date() == date.today()
+
+    def test_future_anchor_wins_over_today(self):
+        eng = make_engine()
+        eng._anchor_date = date(2031, 1, 1)
+        assert eng.tick_date() == date(2031, 1, 1)  # clock skew：跟住 seed
+
+    def test_past_anchor_uses_today(self):
+        eng = make_engine()
+        eng._anchor_date = date(2020, 1, 1)
+        assert eng.tick_date() == date.today()  # 夜期跨午夜
+
+
+# ---------------------------------------------------------------- _setup 編排（test thread 同步行）
+
+HIST_ROWS = [
+    ("2026-09-30 09:30", 100.0, 101.0, 99.5, 100.5, 1000),
+    ("2026-09-30 09:31", 100.5, 102.0, 100.0, 101.0, 1200),
+]
+
+
+class TestSetup:
+    def test_happy_path(self, monkeypatch):
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        created = {}
+
+        def fake_connect(host, port):
+            created.update(host=host, port=port)
+            return ctx
+
+        monkeypatch.setattr(fe, "OpenQuoteContext", fake_connect)
+        statuses, errors, history = [], [], []
+        eng.status.connect(statuses.append)
+        eng.error.connect(errors.append)
+        eng.history_ready.connect(history.append)
+        eng._setup()  # test thread 同步行 → signal 直接遞送
+
+        assert created == {"host": "127.0.0.1", "port": 11111}
+        assert not errors
+        assert len(history) == 1 and len(history[0]) == 2
+        assert ctx.handler is not None  # set_handler 已呼叫
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
+        assert eng._ctx is ctx
+        assert eng._anchor_date == date(2026, 9, 30)  # seed 最後一根 bar 嘅日期
+        assert statuses[-1].startswith("訂閱成功")
+
+    def test_connect_failure_emits_error(self, monkeypatch):
+        eng = make_engine()
+
+        def boom(host, port):
+            raise ConnectionRefusedError("OpenD not running")
+
+        monkeypatch.setattr(fe, "OpenQuoteContext", boom)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._setup()
+        assert len(errors) == 1 and "連唔到 OpenD" in errors[0]
+        assert eng._ctx is None
+
+    def test_subscribe_failure_closes_ctx(self, monkeypatch):
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)], sub_ret=-1, sub_info="no permission")
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._setup()
+        assert any("subscribe 失敗" in e for e in errors)
+        assert ctx.closed is True and eng._ctx is None
+
+    def test_kline_error_closes_ctx(self, monkeypatch):
+        eng = make_engine()
+        ctx = FakeCtx([(-1, "kline err", None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._setup()
+        assert any("request_history_kline" in e for e in errors)
+        assert ctx.closed is True and eng._ctx is None
+
+
+# ---------------------------------------------------------------- start/stop lifecycle（真線程 + Event 同步）
+
+class TestStartStop:
+    def test_start_stop_lifecycle(self, monkeypatch):
+        eng = FutuEngine()
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        eng.start(make_cfg(history_count=2))
+        assert ctx.subscribe_event.wait(5)  # setup thread 行到 subscribe
+        eng.stop()
+        assert ctx.closed is True
+        assert not (eng._thread and eng._thread.is_alive())
+        eng.stop()  # idempotent
+
+    def test_start_twice_noop(self, monkeypatch):
+        gate = threading.Event()
+        connected = threading.Event()
+        calls = []
+
+        class GatedCtx(FakeCtx):
+            def subscribe(self, codes, sub_types):  # gate 住令 setup thread 保持 alive
+                if not self.gate_waited:
+                    self.gate_waited = True
+                    gate.wait(timeout=10)
+                return super().subscribe(codes, sub_types)
+
+        gated = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        gated.gate_waited = False
+
+        def factory(h, p):
+            connected.set()
+            calls.append((h, p))
+            return gated
+
+        monkeypatch.setattr(fe, "OpenQuoteContext", factory)
+        eng = FutuEngine()
+        eng.start(make_cfg(history_count=2))
+        assert connected.wait(5)  # worker thread 已入 _setup（alive）
+        eng.start(make_cfg())     # 第二次 → early return
+        gate.set()                # 釋放 subscribe
+        assert gated.subscribe_event.wait(5)
+        eng.stop()
+        assert len(calls) == 1
+
+    def test_start_connect_failure_thread_exits(self, monkeypatch):
+        eng = FutuEngine()
+
+        def boom(h, p):
+            raise ConnectionRefusedError("no OpenD")
+
+        monkeypatch.setattr(fe, "OpenQuoteContext", boom)
+        eng.start(make_cfg())
+        thread = eng._thread
+        assert wait_until(lambda: not thread.is_alive())
+        assert eng._ctx is None
+
+    def test_stop_without_start_is_safe(self):
+        FutuEngine().stop()  # 唔好炸
+
+    def test_aggregator_before_start_raises(self):
+        with pytest.raises(RuntimeError, match="start"):
+            FutuEngine().aggregator

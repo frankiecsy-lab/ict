@@ -88,4 +88,18 @@
 *   **【正確資源】**：https://futunn.com
 *   **【備註說明】**：此網址**僅作為輔助參考與功能對照用途**。當開發 HKQuant 相關功能遇到邏輯不清晰（例如：搶行情權限、特定 K 線參數、到價提醒回調）時，可參閱此官方文件的底層邏輯進行代碼設計。
 
-*(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*
+#### 2. 🥇 富途 OpenD 實測行為（HK.HSImain，2026-09-30 驗證；詳見 `engine/futu_engine.py` docstring）
+*   **【問題/限制】**：`request_history_kline` 唔帶 start/end 窗口會返回**一年前舊數據**（唔係最新）。
+*   **【解決/避坑方案】**：必須用 now() 計算嘅明確 start/end 窗口（見 `timeutil.history_window()`，保守覆蓋夜期 ~834 min/日）。
+*   **【問題/限制】**：window + max_count 返回時間序**頭 N 根**（唔係最近 N 根）；單次上限 1000 根。
+*   **【解決/避坑方案】**：`page_req_key` 分頁攞晒全部，再 `tail(history_count)` 取最近 N 根；設 `_MAX_PAGES=200` 防禦死循環。
+*   **【問題/限制】**：kline DataFrame 欄位順序係 **open/close/high/low**（唔係 OHLC）。
+*   **【解決/避坑方案】**：一律按欄位名提取 `df[["time_key","open","high","low","close","volume"]]`，嚴禁靠位置。
+*   **【問題/限制】**：`subscribe()` 成功時第二個返回值係 **None**（唔係 sub info）。
+*   **【解決/避坑方案】**：只檢查 ret code；失敗時第二返回值先至係錯誤訊息 string。
+*   **【問題/限制】**：live QUOTE push 嘅 `data_time` 係 **time-only** string `'HH:mm:ss.SSS'`（無日期）。
+*   **【解決/避坑方案】**：engine 補 date = max(anchor, today)；anchor = seed 最後一根歷史 bar 嘅日期（處理夜期跨午夜 + clock skew），見 `timeutil.resolve_tick_datetime()`。
+
+#### 3. 🥇 PySide6 pyqtSignal 跨線程遞送語義（2026-09-30 probe 驗證）
+*   **【問題/限制】**：由非 GUI thread emit signal → plain Python callable **唔會同步收到**（AutoConnection queue 咗，要 event loop 先 drain）。
+*   **【解決/避坑方案】**：生產環境靠 `app.exec()` 嘅 GUI event loop auto-queue（正常）；單測若要斷言 signal，必須喺**同一 thread** emit（直接同步遞送），或者用 `threading.Event` + 狀態斷言代替 signal 斷言。
