@@ -6,7 +6,8 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
-| | 2026-09-30 | Step 2 · Commit 9 | **K 線圖多段式縮放 + 放大/縮小按鍵**（live 使用發現「只有兩段」bug）：根因係 Windows wheel 每物理 notch 報 `angleDelta.y()=±120°`，未正規化會令單 notch 變 `1.25**120 ≈ 3e13` → X 軸縮放直接 clamp 去 min(5)/max(2000) 極限（放大即跳到 5 根超大蠟燭）。修復：新增純函數 `wheel_notches()`（±120° → ±1 階）+ `wheelEvent` 改用正規化 delta——**每物理 notch / 按鍵點擊 = 一階 ×/÷1.25**；control bar 右側新增**放大/縮小按鍵**→ `CandleChart.zoom_in()/zoom_out()`（中心錨定、無數據 no-op）。踩坑：PySide6 `clicked` 有 `(bool)` 重載會令直接 connect 變 no-op → lambda 包零參數調用。14 項新單測（全套 **266 passed**） |
+| 2026-09-30 | Step 2 · Commit 10 | **last-price 水平線跟隨「真正最新一根 bar」**（live 使用發現：pan 左走後虛線顯示嘅係可見視窗最右邊嗰根 K 線嘅 close，唔係真實最新價）：`paintEvent` 由 `bars[-1]`（visible_window slice）改用 `self._bars[-1]`——無論 pan/zoom 到咩位置，虛線 + 右軸 tag 永遠顯示數據尾部真正最新一根 bar 嘅 close；加 bounds-check（同 gridline 一樣）：最新價超出當前 Y 範圍（auto-fit 只 fit 可見 bars / 手動 Y zoom/pan）→ 整條線 + tag 唔畫，避免繪製出界。2 項 pixel 級回歸單測（offscreen render + `#FFB020` 精確色計數：tag 必須喺 y(真正最新價) 而唔係 y(可見視窗最右 close)；超範圍時全圖零 last-price 像素）。全套 **268 passed** |
+| 2026-09-30 | Step 2 · Commit 9 | **K 線圖多段式縮放 + 放大/縮小按鍵**（live 使用發現「只有兩段」bug）：根因係 Windows wheel 每物理 notch 報 `angleDelta.y()=±120°`，未正規化會令單 notch 變 `1.25**120 ≈ 3e13` → X 軸縮放直接 clamp 去 min(5)/max(2000) 極限（放大即跳到 5 根超大蠟燭）。修復：新增純函數 `wheel_notches()`（±120° → ±1 階）+ `wheelEvent` 改用正規化 delta——**每物理 notch / 按鍵點擊 = 一階 ×/÷1.25**；control bar 右側新增**放大/縮小按鍵**→ `CandleChart.zoom_in()/zoom_out()`（中心錨定、無數據 no-op）。踩坑：PySide6 `clicked` 有 `(bool)` 重載會令直接 connect 變 no-op → lambda 包零參數調用。14 項新單測（全套 **266 passed**） |
 | 2026-09-30 | Step 2 · Commit 8 | **K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**：`ui/candle_chart.py` 新增互動視圖狀態（X = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live；Y = 手動價格範圍，None=auto-fit）+ 五個純函數（`visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`：游標錨定縮放、邊界 clamp、可獨立單測）。手勢：wheel = X 軸縮放（錨定游標，每 notch ×/÷1.25）、Ctrl/Shift+wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、雙擊 = `reset_view()`；切換標的自動 reset。30 項新單測（全套 **252 passed**） |
 | 2026-09-30 | Step 2 · Commit 7 | **歷史 K 線預設深度 300 → 1000 根**：`config.py` `history_count` dataclass default + `from_env()` fallback、`.env.example` `HISTORY_COUNT=1000` 同步更新；seed 分頁邏輯（page_req_key 1000 根/頁）天然支援——1000 根通常單頁即返。全套 **222 passed** |
 | 2026-09-30 | Step 2 · Commit 6 | **輸入欄 onChange guard：代碼同名稱永唔會同時入欄**（live 使用發現：popup 開住撳 Enter，completer `setCompletion()` 會喺 `activated` signal **之前**將完整 display_text「code + 名稱」寫入 TEXT FIELD）：新增 `_on_code_text_changed()`（接 `textChanged`）——欄位一出現空白（= code + 名稱混入）即刻取第一 whitespace token 剝離返純 code，`blockSignals` 避免多餘 round-trip、無空白再觸發自然 no-op 唔死循環；任何路徑（手動輸入 / dropdown Enter / activated）下欄位都只持有純編號。移除 `_do_switch()` 嘅含空白拒絕門（guard 已確保欄位永遠無空白，變死代碼）。3 項新單測（全套 **222 passed**） |
@@ -39,6 +40,7 @@
 - [x] Commit 7：歷史 K 線預設深度 **300 → 1000 根**（`config.py` default + `.env.example`）
 - [x] Commit 8：**K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**——互動視圖狀態（X=(可見根數,右偏移)、Y=手動範圍|auto-fit）+ 五個純函數 pan/zoom（游標錨定、邊界 clamp）；wheel/Ctrl+wheel/左鍵拖曳/右鍵拖曳/雙擊 reset
 - [x] Commit 9：**K 線圖多段式縮放 + 放大/縮小按鍵**——`wheel_notches()` 將 Windows ±120° wheel delta 正規化返每 notch 一階 ×/÷1.25（修「只有兩段」bug：未正規化單 notch 直跳 min/max 極限）；control bar 右側放大/縮小按鍵 → `zoom_in()/zoom_out()`（中心錨定分步縮放）
+- [x] Commit 10：**last-price 水平線跟隨真正最新一根 bar**——`paintEvent` 由可見視窗 slice 改用 `self._bars[-1]`（pan 左走後仍顯示真實最新價）+ bounds-check（最新價超出當前 Y 範圍 → 整條線 + tag 唔畫）
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -54,7 +56,7 @@
 - **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 1000 根。
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
 - **紅漲綠跌（港股慣例）**：`.env` 可切 `CONVENTION=INTL`（綠漲紅跌）或用 `COLOR_UP` / `COLOR_DOWN` 手動 override。
-- **深色主題圖表**：蠟燭 + last-price dashed line 同右軸 tag + OHLCV readout + volume subpane + crosshair。
+- **深色主題圖表**：蠟燭 + last-price dashed line 同右軸 tag（跟隨「真正最新一根 bar」`self._bars[-1]`——pan/zoom 到咩位置都顯示真實最新價，唔係可見視窗最右邊嗰根；最新價超出當前 Y 範圍時整條隱藏）+ OHLCV readout + volume subpane + crosshair。
 - **X/Y 軸縮放 + 手勢 + 左右平移**：互動視圖狀態（X = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live；Y = 手動價格範圍，None=auto-fit）。**多段式縮放**：每個物理 wheel notch / 按鍵點擊 = **一階 ×/÷1.25**（`wheel_notches()` 將 Windows ±120° `angleDelta` 正規化返 ±1 階——唔正規化會單 notch 直跳 min(5)/max(2000) 極限，表現成「只有兩段」）。手勢：**wheel = X 軸縮放**（游標錨定）、**Ctrl/Shift + wheel = Y 軸縮放**（游標錨定）、**左鍵拖曳 = 左右平移**、**右鍵拖曳 = 垂直平移**、**雙擊 = `reset_view()` 重置**；control bar 右側**放大/縮小按鍵** → `zoom_in()/zoom_out()`（中心錨定分步縮放，無數據 no-op）。所有 pan/zoom 數學喺純函數（`visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`/`wheel_notches`，邊界 clamp + 可獨立單測）；切換標的自動 reset view。
 - **Overlay 擴展點**：`CandleChart.add_overlay()` 預留俾日後 ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
 

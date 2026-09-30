@@ -397,18 +397,22 @@ class CandleChart(QWidget):
         for fn in self._overlays:
             fn(p, bars, price_r)
 
-        # --- last-price dashed line + 右軸 tag
-        last = bars[-1]
+        # --- last-price dashed line + 右軸 tag（跟隨「真正最新一根 bar」self._bars[-1]，
+        #     唔係可見視窗最右邊嗰根——pan 左走遠後仍顯示真實最新價；若最新價超出當前
+        #     Y 範圍（auto-fit 只 fit 可見 bars / 手動 Y zoom/pan）→ 整條線 + tag 唔畫，
+        #     同 gridline 一樣 bounds-check，避免繪製出界）
+        last = self._bars[-1]
         y_last = y_price(last[4])
-        lp_color = QColor(cfg.last_price_color)
-        p.setPen(QPen(lp_color, 1, Qt.DashLine))
-        p.drawLine(int(price_r.left()), int(y_last), int(price_r.right()), int(y_last))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(lp_color))
-        tag = QRectF(price_r.right() + 2, y_last - 9, _M_RIGHT - 6, 18)
-        p.drawRect(tag)
-        p.setPen(QColor("#101418"))
-        p.drawText(tag, Qt.AlignCenter, fmt_price(last[4]))
+        if price_r.top() <= y_last <= price_r.bottom():
+            lp_color = QColor(cfg.last_price_color)
+            p.setPen(QPen(lp_color, 1, Qt.DashLine))
+            p.drawLine(int(price_r.left()), int(y_last), int(price_r.right()), int(y_last))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(lp_color))
+            tag = QRectF(price_r.right() + 2, y_last - 9, _M_RIGHT - 6, 18)
+            p.drawRect(tag)
+            p.setPen(QColor("#101418"))
+            p.drawText(tag, Qt.AlignCenter, fmt_price(last[4]))
 
         # --- crosshair + OHLCV readout
         if self._mouse_pos is not None:
