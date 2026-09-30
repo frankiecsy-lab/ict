@@ -3,6 +3,11 @@
 Backpressure：update_bars() 只記錄 immutable snapshot + 起 singleShot QTimer(30ms)，
 tick burst 都最多 ~30fps repaint，永遠 render 最新 snapshot。
 
+互動視圖狀態：X 軸 = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live 數據；
+Y 軸 = 手動價格範圍（None = auto-fit）。手勢：wheel = X 軸縮放（錨定游標）、
+Ctrl/Shift + wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、
+雙擊 = reset_view() 重置。
+
 Overlay 擴展點：add_overlay(fn)；fn(painter, bars, price_rect) —— 預留俾日後
 ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
 """
@@ -32,7 +37,7 @@ def visible_slice(bars: tuple[Bar, ...], count: int) -> tuple[Bar, ...]:
     """右 pin：取最後 `count` 根；空輸入 / 非法 count → 空。"""
     if not bars or count <= 0:
         return ()
-    return bars[-count:]
+    return visible_window(bars, count, 0)
 
 
 def price_range(bars: tuple[Bar, ...]) -> tuple[float, float] | None:
@@ -76,6 +81,82 @@ def fmt_price(p: float) -> str:
     return f"{p:.2f}"
 
 
+# ---------------------------------------------------------------- X/Y 視圖狀態純函數（pan/zoom，可獨立單測）
+
+_MIN_X_BARS = 5       # X 軸縮放下限（可見根數）
+_MAX_X_BARS = 2000    # X 軸縮放上限
+_Y_ZOOM_FLOOR = 1e-4  # Y 軸 span 下限（相對於當前 span，防退化範圍 / 除零爆炸）
+
+
+def _clamp_offset(off: float, total_bars: int, count: int) -> float:
+    """右偏移 clamp 到 [0, max(0, total − count)]——唔可以越過最舊一根 bar。"""
+    if total_bars <= 0 or count <= 0:
+        return 0.0
+    return max(0.0, min(float(off), float(total_bars - count)))
+
+
+def visible_window(bars: tuple[Bar, ...], count: int, right_offset: float) -> tuple[Bar, ...]:
+    """可見視窗（X 軸 pan/zoom 狀態 → slice）。
+
+    count = 可見根數；right_offset = 距數據尾部嘅 bar 數（0 = 右 pin 跟隨 live）。
+    Clamp 到數據邊界：左邊唔夠數據 → 視窗收窄（右側留白，唔會繞圈）；小數偏移四捨五入到整根。
+    """
+    if not bars or count <= 0:
+        return ()
+    n = len(bars)
+    off = int(round(_clamp_offset(right_offset, n, count)))
+    end = n - off
+    start = max(0, end - count)
+    return bars[start:end]
+
+
+def zoom_x(count: int, right_offset: float, total_bars: int, anchor_frac: float, delta: float):
+    """X 軸 wheel 縮放（游標錨定）→ 新 (可見根數, 右偏移)。
+
+    delta > 0 = 放大（少啲 bar）、< 0 = 縮細；每 notch ×/÷ 1.25（支持小數 notch）。
+    anchor_frac：游標喺 plot 區嘅相對橫向位置 [0,1]——縮放後游標下面嗰根 bar 保持同一屏幕位置。
+    """
+    if delta == 0 or count <= 0 or total_bars <= 0:
+        return int(count), _clamp_offset(right_offset, total_bars, count)
+    new_count = max(_MIN_X_BARS, min(_MAX_X_BARS, round(count * (1.25 ** (-delta)))))
+    f = max(0.0, min(1.0, float(anchor_frac)))
+    off = _clamp_offset(right_offset, total_bars, count)
+    end = total_bars - int(round(off))
+    start = max(0, end - count)
+    g = start + f * (end - start)  # 游標下面嘅 global index（float）
+    new_off = float(total_bars) - (g + (1.0 - f) * new_count)
+    return new_count, _clamp_offset(new_off, total_bars, new_count)
+
+
+def pan_x(count: int, right_offset: float, total_bars: int, delta_bars: float):
+    """X 軸拖曳平移 → 新 (可見根數, 右偏移)。
+
+    delta_bars > 0 = 視窗移向舊數據（offset 增加）；< 0 = 移向新數據。邊界由 _clamp_offset 兜底。
+    """
+    return int(count), _clamp_offset(right_offset + delta_bars, total_bars, count)
+
+
+def zoom_y(lo: float, hi: float, anchor_frac: float, delta: float):
+    """Y 軸 wheel 縮放（游標錨定）→ 新價格範圍 (lo, hi)。
+
+    delta > 0 = 放大；anchor_frac = 游標喺 price 區嘅相對垂直位置 [0,1]（0=頂部=hi 側），
+    縮放後游標下面嗰個價保持同一屏幕位置。span 下限 = 當前 span × _Y_ZOOM_FLOOR。
+    """
+    if delta == 0 or hi <= lo:
+        return float(lo), float(hi)
+    f = max(0.0, min(1.0, float(anchor_frac)))
+    span = hi - lo
+    new_span = max(span * (1.25 ** (-delta)), span * _Y_ZOOM_FLOOR)
+    p = hi - f * span  # 游標下面嘅價
+    new_lo = p - (1.0 - f) * new_span
+    return new_lo, new_lo + new_span
+
+
+def pan_y(lo: float, hi: float, delta_price: float):
+    """Y 軸拖曳平移 → 範圍整體位移 delta_price（正 = 視窗移向更高價）。"""
+    return lo + delta_price, hi + delta_price
+
+
 # ---------------------------------------------------------------- widget
 
 class CandleChart(QWidget):
@@ -87,6 +168,12 @@ class CandleChart(QWidget):
         self._bars: tuple[Bar, ...] = ()
         self._mouse_pos: QPointF | None = None
         self._overlays: list[Callable[[QPainter, tuple[Bar, ...], QRectF], None]] = []
+        # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
+        self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
+        self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
+        self._y_range: tuple[float, float] | None = None  # Y 手動範圍；None=auto-fit
+        self._drag_mode: str | None = None                # 'x'/'y'/None
+        self._last_drag_pos: QPointF | None = None
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setSingleShot(True)
         self._repaint_timer.setInterval(30)  # backpressure：coalesce tick burst
@@ -103,6 +190,13 @@ class CandleChart(QWidget):
     def add_overlay(self, fn: Callable[[QPainter, tuple[Bar, ...], QRectF], None]) -> None:
         """註冊 overlay 繪製函數（喺蠟燭之後、crosshair 之前畫）。"""
         self._overlays.append(fn)
+
+    def reset_view(self) -> None:
+        """重置視圖狀態返預設（右 pin + auto-fit Y）；雙擊觸發，main_window 喺切換標的時亦調用。"""
+        self._view_count = max(1, int(self._cfg.visible_bars))
+        self._right_offset = 0.0
+        self._y_range = None
+        self.update()
 
     # ------------------------------------------------------------- geometry helpers
 
@@ -126,9 +220,63 @@ class CandleChart(QWidget):
 
     # ------------------------------------------------------------- events
 
-    def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
-        self._mouse_pos = event.position()
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        if not self._bars:
+            return
+        plot, price_r, _vol = self._panes()
+        pos = event.position()
+        delta = event.angleDelta().y()
+        if event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+            # Y 軸縮放（游標錨定）：Ctrl/Shift + wheel
+            rng = self._y_range or price_range(visible_window(self._bars, self._view_count, self._right_offset)) or (0.0, 1.0)
+            f = (pos.y() - price_r.top()) / max(1e-9, price_r.height()) if price_r.contains(pos) else 0.5
+            self._y_range = zoom_y(rng[0], rng[1], f, delta)
+        else:
+            # X 軸縮放（游標錨定）：plain wheel
+            f = (pos.x() - plot.left()) / max(1e-9, plot.width()) if plot.contains(pos) else 0.5
+            self._view_count, self._right_offset = zoom_x(self._view_count, self._right_offset, len(self._bars), f, delta)
         self.update()
+
+    def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
+        if not self._bars:
+            return
+        if event.button() == Qt.LeftButton:
+            self._drag_mode = 'x'
+            self._last_drag_pos = event.position()
+        elif event.button() == Qt.RightButton:
+            self._drag_mode = 'y'
+            self._last_drag_pos = event.position()
+
+    def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
+        pos = event.position()
+        if self._drag_mode and self._last_drag_pos is not None and self._bars:
+            plot, price_r, _vol = self._panes()
+            dx = pos.x() - self._last_drag_pos.x()
+            dy = pos.y() - self._last_drag_pos.y()
+            if self._drag_mode == 'x':
+                slot = self._bar_slot(len(visible_window(self._bars, self._view_count, self._right_offset)), plot)
+                # 拖右（dx>0）→ 視窗移向舊數據（offset 增加）
+                self._view_count, self._right_offset = pan_x(self._view_count, self._right_offset, len(self._bars), dx / max(1e-9, slot))
+            else:
+                rng = self._y_range or price_range(visible_window(self._bars, self._view_count, self._right_offset)) or (0.0, 1.0)
+                span = max(1e-9, rng[1] - rng[0])
+                # 拖下（dy>0）→ 範圍移向更高價
+                self._y_range = pan_y(rng[0], rng[1], dy * span / max(1e-9, price_r.height()))
+            self._last_drag_pos = pos
+        self._mouse_pos = pos
+        self.update()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 (Qt naming)
+        if event.button() in (Qt.LeftButton, Qt.RightButton):
+            self._drag_mode = None
+            self._last_drag_pos = None
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 (Qt naming)
+        if event.button() == Qt.LeftButton:
+            self.reset_view()
+
+    def contextMenuEvent(self, event):  # noqa: N802 (Qt naming)
+        event.ignore()  # 右鍵保留俾垂直平移，唔彈出系統選單
 
     def mouseLeaveEvent(self, event):  # noqa: N802 (Qt naming)
         self._mouse_pos = None
@@ -150,10 +298,10 @@ class CandleChart(QWidget):
             p.drawText(self.rect(), Qt.AlignCenter, "等待行情數據…")
             return
 
-        bars = visible_slice(self._bars, cfg.visible_bars)
+        bars = visible_window(self._bars, self._view_count, self._right_offset)
         n = len(bars)
         plot, price_r, vol_r = self._panes()
-        rng = price_range(bars) or (0.0, 1.0)
+        rng = self._y_range or price_range(bars) or (0.0, 1.0)
         lo, hi = rng
 
         def y_price(v: float) -> float:

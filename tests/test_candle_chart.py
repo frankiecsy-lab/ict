@@ -6,15 +6,159 @@ import pytest
 from ui.candle_chart import (
     fmt_price,
     nice_step,
+    pan_x,
+    pan_y,
     price_range,
     time_label,
     visible_slice,
+    visible_window,
     volume_max,
+    zoom_x,
+    zoom_y,
 )
 
 
 def _bar(key="2026-09-30 09:30", o=100.0, h=101.0, l=99.5, c=100.5, v=1000.0):
     return (key, o, h, l, c, v)
+
+
+def _bars(n: int) -> tuple:
+    """n 根連續 bar，key = '2026-09-30 09:{i:02d}'（方便斷言邊界）。"""
+    return tuple(_bar(f"2026-09-30 09:{i:02d}") for i in range(n))
+
+
+class TestVisibleWindow:
+    def test_offset_zero_equals_visible_slice(self):
+        bars = _bars(10)
+        assert visible_window(bars, 4, 0) == visible_slice(bars, 4)
+
+    def test_positive_offset_shifts_toward_older(self):
+        # 10 根、count=4、off=2 → end=8, start=4 → bars[4:8]（09:04..09:07）
+        out = visible_window(_bars(10), 4, 2)
+        assert len(out) == 4 and out[0][0].endswith("09:04") and out[-1][0].endswith("09:07")
+
+    def test_offset_clamped_to_oldest(self):
+        # off=100 → clamp 到 n-count=6 → end=4, start=0 → bars[0:4]
+        assert visible_window(_bars(10), 4, 100) == _bars(10)[:4]
+
+    def test_negative_offset_clamped_to_zero(self):
+        assert visible_window(_bars(10), 4, -5) == visible_slice(_bars(10), 4)
+
+    def test_count_larger_than_available_returns_all(self):
+        # count=20 > n=10 → offset clamp 到 0、視窗收窄到全部 10 根（唔會繞圈）
+        out = visible_window(_bars(10), 20, 5)
+        assert len(out) == 10 and out[0][0].endswith("09:00") and out[-1][0].endswith("09:09")
+
+    def test_fractional_offset_rounds_to_whole_bar(self):
+        # off=2.6 → round→3；off=2.4 → round→2
+        assert visible_window(_bars(10), 4, 2.6) == visible_window(_bars(10), 4, 3)
+        assert visible_window(_bars(10), 4, 2.4) == visible_window(_bars(10), 4, 2)
+
+    @pytest.mark.parametrize("count", [0, -5])
+    def test_invalid_count_returns_empty(self, count):
+        assert visible_window(_bars(10), count, 0) == ()
+
+    def test_empty_bars(self):
+        assert visible_window((), 4, 0) == ()
+
+
+class TestZoomX:
+    def test_zoom_in_reduces_count_by_1_25(self):
+        new_count, _off = zoom_x(100, 0.0, 1000, 0.5, 1)
+        assert new_count == 80  # round(100 / 1.25)
+
+    def test_zoom_out_increases_count_by_1_25(self):
+        new_count, _off = zoom_x(80, 0.0, 1000, 0.5, -1)
+        assert new_count == 100  # round(80 * 1.25)
+
+    def test_cursor_anchor_keeps_bar_under_cursor(self):
+        # total=100、count=100（全顯示）、游標 f=0.5 → global index 50。
+        # zoom in delta=1 → count=80；global 50 應保持喺新視窗 f=0.5 位置。
+        new_count, off = zoom_x(100, 0.0, 100, 0.5, 1)
+        assert new_count == 80
+        win = visible_window(_bars(100), new_count, off)
+        # global index 50 喺視窗內嘅 local position：(g − start)/count
+        start = len(_bars(100)) - int(round(off)) - len(win)
+        assert (50 - start) / new_count == pytest.approx(0.5)
+
+    def test_zoom_in_clamped_to_min_5_bars(self):
+        new_count, _off = zoom_x(5, 0.0, 1000, 0.5, 10)
+        assert new_count == 5
+
+    def test_zoom_out_clamped_to_max_2000(self):
+        new_count, _off = zoom_x(2000, 0.0, 100000, 0.5, -1)
+        assert new_count == 2000
+
+    def test_zero_delta_no_change(self):
+        assert zoom_x(120, 30.0, 1000, 0.7, 0) == (120, 30.0)
+
+
+class TestPanX:
+    def test_pan_toward_older_increases_offset(self):
+        _c, off = pan_x(4, 0.0, 100, +10)
+        assert off == 10.0
+
+    def test_pan_toward_newer_decreases_offset(self):
+        _c, off = pan_x(4, 20.0, 100, -5)
+        assert off == 15.0
+
+    def test_clamped_at_zero(self):
+        _c, off = pan_x(4, 0.0, 100, -5)
+        assert off == 0.0
+
+    def test_clamped_at_oldest_boundary(self):
+        # max offset = total-count = 80；off=75 + 10 → clamp 到 80
+        _c, off = pan_x(20, 75.0, 100, +10)
+        assert off == 80.0
+
+    def test_count_unchanged(self):
+        c, _off = pan_x(42, 0.0, 100, 3)
+        assert c == 42
+
+
+class TestZoomY:
+    def test_zoom_in_shrinks_span_by_1_25(self):
+        lo, hi = zoom_y(100.0, 110.0, 0.5, 1)
+        assert (hi - lo) == pytest.approx(8.0)  # 10 / 1.25
+
+    def test_cursor_anchor_keeps_price_under_cursor(self):
+        # span=10、f=0.5 → 游標價 p = hi - f*span = 105。zoom in 後 105 應保持喺 f=0.5。
+        lo, hi = zoom_y(100.0, 110.0, 0.5, 1)
+        assert (hi - 105.0) / (hi - lo) == pytest.approx(0.5)
+
+    def test_zoom_out_grows_span(self):
+        lo, hi = zoom_y(100.0, 110.0, 0.5, -1)
+        assert (hi - lo) == pytest.approx(12.5)  # 10 * 1.25
+
+    def test_anchor_at_top(self):
+        # f=0（頂部）→ 游標價 = hi；縮放後 hi 側保持。
+        lo, hi = zoom_y(100.0, 110.0, 0.0, 1)
+        assert (hi - 110.0) / (hi - lo) == pytest.approx(0.0)
+
+    def test_span_floor_prevents_degenerate_range(self):
+        # delta=100 → 1.25^-100 極小 → span clamp 到 10 * 1e-4 = 0.001
+        lo, hi = zoom_y(100.0, 110.0, 0.5, 100)
+        assert (hi - lo) == pytest.approx(0.001)
+
+    def test_zero_delta_no_change(self):
+        assert zoom_y(100.0, 110.0, 0.3, 0) == (100.0, 110.0)
+
+    def test_invalid_range_returns_unchanged(self):
+        assert zoom_y(110.0, 100.0, 0.5, 1) == (110.0, 100.0)
+
+
+class TestPanY:
+    def test_shift_up_positive_delta(self):
+        lo, hi = pan_y(100.0, 110.0, +5.0)
+        assert (lo, hi) == (105.0, 115.0)
+
+    def test_shift_down_negative_delta(self):
+        lo, hi = pan_y(100.0, 110.0, -3.0)
+        assert (lo, hi) == (97.0, 107.0)
+
+    def test_span_preserved(self):
+        lo, hi = pan_y(25340.0, 25400.0, 123.456)
+        assert (hi - lo) == pytest.approx(60.0)
 
 
 class TestVisibleSlice:

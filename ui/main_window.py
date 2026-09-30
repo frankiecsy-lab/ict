@@ -156,6 +156,8 @@ class MainWindow(QMainWindow):
             code = raw.strip()
         self.code_edit.setText(code)
         self._update_name_label(code)
+        # 切換標的/週期 → 重置視圖（舊 Y 範圍 / pan offset 對新數據無意義）
+        self.chart.reset_view()
         self._engine.switch(code=code, kline_type=self.current_period())
 
     def _on_code_text_changed(self, text: str) -> None:
@@ -194,6 +196,8 @@ class MainWindow(QMainWindow):
             return
         self.code_edit.setText(code)
         self._update_name_label(code)
+        # 切換標的/週期 → 重置視圖（舊 Y 範圍 / pan offset 對新數據無意義）
+        self.chart.reset_view()
         self._engine.switch(code=code, kline_type=self.current_period())
 
     def _update_name_label(self, raw_code: str | None) -> None:

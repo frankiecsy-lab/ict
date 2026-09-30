@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 8 | **K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**：`ui/candle_chart.py` 新增互動視圖狀態（X = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live；Y = 手動價格範圍，None=auto-fit）+ 五個純函數（`visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`：游標錨定縮放、邊界 clamp、可獨立單測）。手勢：wheel = X 軸縮放（錨定游標，每 notch ×/÷1.25）、Ctrl/Shift+wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、雙擊 = `reset_view()`；切換標的自動 reset。30 項新單測（全套 **252 passed**） |
 | 2026-09-30 | Step 2 · Commit 7 | **歷史 K 線預設深度 300 → 1000 根**：`config.py` `history_count` dataclass default + `from_env()` fallback、`.env.example` `HISTORY_COUNT=1000` 同步更新；seed 分頁邏輯（page_req_key 1000 根/頁）天然支援——1000 根通常單頁即返。全套 **222 passed** |
 | 2026-09-30 | Step 2 · Commit 6 | **輸入欄 onChange guard：代碼同名稱永唔會同時入欄**（live 使用發現：popup 開住撳 Enter，completer `setCompletion()` 會喺 `activated` signal **之前**將完整 display_text「code + 名稱」寫入 TEXT FIELD）：新增 `_on_code_text_changed()`（接 `textChanged`）——欄位一出現空白（= code + 名稱混入）即刻取第一 whitespace token 剝離返純 code，`blockSignals` 避免多餘 round-trip、無空白再觸發自然 no-op 唔死循環；任何路徑（手動輸入 / dropdown Enter / activated）下欄位都只持有純編號。移除 `_do_switch()` 嘅含空白拒絕門（guard 已確保欄位永遠無空白，變死代碼）。3 項新單測（全套 **222 passed**） |
 | 2026-09-30 | Step 2 · Commit 5 | **輸入欄只收純編號 + 存在性驗證 + 獨立名稱 LABEL**：(1) `_do_switch()` 新增兩道門——含空白（混入股票名稱，例「HK.00700 騰訊」）即拒絕；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號 → status bar 報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。(2) control bar 新增獨立 `QLabel` 名稱欄——經新純函數 `engine/stock_catalog.py::name_text()`（中文名 + 英文名，空欄位略過）顯示當前標的嘅中英文名，目錄載入 / dropdown 選中 / 手動切換時同步更新；**名稱永不入 TEXT FIELD**。12 項新單測（`test_main_window.py` offscreen Qt + fake engine、`name_text` ×4、`StockCompleter.catalog()` accessor）全套 **219 passed** |
@@ -35,6 +36,7 @@
 - [x] Commit 5：輸入欄**只收純編號 + 存在性驗證**（含空白/名稱即拒絕；目錄載入後 `canonical_code()` 驗證存在 + 正規化大小寫，未知編號報錯唔切換）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名，名稱永不入輸入欄）
 - [x] Commit 6：輸入欄 **onChange guard**——`textChanged` handler 即刻剝離「code + 名稱」返純 code（completer `setCompletion()` 喺 activated 前寫完整 display_text 嘅路徑），代碼同名稱永唔會同時入欄
 - [x] Commit 7：歷史 K 線預設深度 **300 → 1000 根**（`config.py` default + `.env.example`）
+- [x] Commit 8：**K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**——互動視圖狀態（X=(可見根數,右偏移)、Y=手動範圍|auto-fit）+ 五個純函數 pan/zoom（游標錨定、邊界 clamp）；wheel/Ctrl+wheel/左鍵拖曳/右鍵拖曳/雙擊 reset
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -51,6 +53,7 @@
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
 - **紅漲綠跌（港股慣例）**：`.env` 可切 `CONVENTION=INTL`（綠漲紅跌）或用 `COLOR_UP` / `COLOR_DOWN` 手動 override。
 - **深色主題圖表**：蠟燭 + last-price dashed line 同右軸 tag + OHLCV readout + volume subpane + crosshair。
+- **X/Y 軸縮放 + 手勢 + 左右平移**：互動視圖狀態（X = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live；Y = 手動價格範圍，None=auto-fit）。手勢：**wheel = X 軸縮放**（游標錨定、每 notch ×/÷1.25）、**Ctrl/Shift + wheel = Y 軸縮放**（游標錨定）、**左鍵拖曳 = 左右平移**、**右鍵拖曳 = 垂直平移**、**雙擊 = `reset_view()` 重置**。所有 pan/zoom 數學喺純函數（`visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`，邊界 clamp + 可獨立單測）；切換標的自動 reset view。
 - **Overlay 擴展點**：`CandleChart.add_overlay()` 預留俾日後 ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
 
 ## Architecture
@@ -62,7 +65,7 @@ D:\coding\ICT_v1\
 ├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()
 ├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換；`display_text()` dropdown 行、`name_text()` 名稱 LABEL、`canonical_code()` 存在性驗證）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch）
-├─ ui\                         # ✅ main_window（control bar：標的輸入欄（**只收純編號**——onChange guard `textChanged` 剝離「code + 名稱」、`canonical_code()` 驗證存在 + 正規化大小寫，fuzzy autocomplete dropdown 選中後只留 code）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code + `catalog()` accessor）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；add_overlay 擴展點）
+├─ ui\                         # ✅ main_window（control bar：標的輸入欄（**只收純編號**——onChange guard `textChanged` 剝離「code + 名稱」、`canonical_code()` 驗證存在 + 正規化大小寫，fuzzy autocomplete dropdown 選中後只留 code）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code + `catalog()` accessor）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；**互動視圖狀態 X=(可見根數,右偏移)/Y=手動範圍 + 五個 pan/zoom 純函數（wheel/Ctrl+wheel/拖曳/雙擊 reset）**；add_overlay 擴展點）
 ├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：onChange guard 剝離 code+名稱 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env）
@@ -136,7 +139,7 @@ python -m pytest tests/ -q
 | `TRADING_CODE` | `HK.HSImain` | 交易標的（富途代碼格式） |
 | `KLINE_TYPE` | `K_1M` | K 線週期：`K_1M/K_3M/K_5M/K_15M/K_30M/K_60M/K_DAY/K_WEEK/K_MON`；未知值啟動時報錯 |
 | `HISTORY_COUNT` | `1000` | 歷史 K 線根數（≥1） |
-| `VISIBLE_BARS` | `120` | 圖表右 pin 顯示嘅蠟燭數（≥1） |
+| `VISIBLE_BARS` | `120` | 圖表初始/預設可見蠟燭數（≥1；wheel 縮放可即時改，雙擊 reset 返呢個值） |
 | `CONVENTION` | `HK` | 蠟燭顏色慣例：`HK`=紅漲綠跌 / `INTL`=綠漲紅跌；未知值回落 HK |
 | `COLOR_UP` / `COLOR_DOWN` | （空=跟隨慣例） | 手動 override 色值，如 `#FF4D4F` |
 | `BG_COLOR` / `GRID_COLOR` / `TEXT_COLOR` / `AXIS_TEXT_COLOR` / `LAST_PRICE_COLOR` | 深色主題預設 | 圖表配色，可覆蓋 |

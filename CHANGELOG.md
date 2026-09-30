@@ -3,6 +3,7 @@
 ## [Unreleased] Step 2（2026-09-30）——運行時切換標的與 K 線週期 + 股票編號模糊自動補全
 
 ### Added
+- （2026-09-30）**K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**：`ui/candle_chart.py` 新增互動視圖狀態——X = (可見根數, 右偏移)（右偏移 0 = 右 pin 跟隨 live）、Y = 手動價格範圍（None=auto-fit）；五個純函數 `visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`（游標錨定縮放、邊界 clamp `_clamp_offset`、span floor 防退化，可獨立單測）。手勢：wheel = X 軸縮放（每 notch ×/÷1.25）、Ctrl/Shift+wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、雙擊 = `reset_view()`；`main_window._do_switch()` / `_on_code_activated()` 切換標的時自動 reset view。30 項新單測（全套 **252 passed**）。
 - （2026-09-30）**歷史 K 線預設深度 300 → 1000 根**：`config.py` `history_count` dataclass default + `from_env()` fallback、`.env.example` `HISTORY_COUNT=1000` 同步更新。seed 分頁邏輯（page_req_key 1000 根/頁）天然支援——1000 根通常單頁即返；`test_config.py::test_defaults` 斷言同步。全套 **222 passed**。
 - （2026-09-30）`engine/futu_engine.py` 重構為 **immutable `_State(aggregator, code, kline_type, anchor_date)` reference**：engine 只持一個 state reference，切換 = atomic swap。新增 `switch(code, kline_type)`（校驗 code 格式 `^(HK|US)\.\w+$` + 週期名、guard setup/switch 進行中 → reject）+ `_reconfigure()` worker thread（unsubscribe 舊 → fetch+seed 新 → subscribe 新，**全部驗證通過先 swap**；任何失敗 `_rollback()` resubscribe 舊標的 + error signal，圖表保持 live）。
 - （2026-09-30）handler 切換一致性：每 batch load 一次 state + per-row `row.code != state.code → skip`（unsubscribe 唔係硬停——OpenD 實測訂閱未滿 1 分鐘 unsubscribe 會失敗「Basic訂閱時間過短」，殘留 push 由 code filter 兜底）+ emit 前 identity check（batch 中途 swap → 呢批 discard）。
