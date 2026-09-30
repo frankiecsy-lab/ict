@@ -103,6 +103,8 @@
 *   **【解決/避坑方案】**：除錯「實時唔更新」時，先核對當前時間有冇喺交易時段內（日市 09:15 預開市 / 09:30 開市），唔好誤判做訂閱 bug。
 *   **【問題/限制】**（2026-09-30 live smoke 實測）：`unsubscribe()` 喺**訂閱後未滿 1 分鐘**會失敗，錯誤訊息「Basic訂閱時間過短，至少需要订阅1分钟」——快速連續切換標的必中。
 *   **【解決/避坑方案】**：unsubscribe 失敗**唔好阻切換**（log warning 繼續行）；舊標的嘅 in-flight / 殘留 push 由 handler per-row code filter（`row.code != state.code → skip`）兜底，見 `engine/futu_engine.py` `_reconfigure()`。
+*   **【問題/限制】**（2026-09-30 live 使用實測）：Futu 代碼**大小寫敏感**——主力連續合約 `HK.HSImain` 必須保留原 casing，upper 做 `HSIMAIN` OpenD 報「未知股票 HSIMAIN」。
+*   **【解決/避坑方案】**：`.strip().upper()` normalize 後經 `_CODE_ALIASES` 映返正規形式（見 `engine/futu_engine.py` `_normalize_code()`）；日後遇到其他大小寫敏感代碼直接加呢張表。
 
 #### 3. 🥇 PySide6 pyqtSignal 跨線程遞送語義（2026-09-30 probe 驗證）
 *   **【問題/限制】**：由非 GUI thread emit signal → plain Python callable **唔會同步收到**（AutoConnection queue 咗，要 event loop 先 drain）。

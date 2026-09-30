@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Fix | **主力連續合約代碼大小寫敏感 bug**（live 使用發現）：`switch()` 嘅 `.strip().upper()` 會將 `hk.hsimain` 變 `HK.HSIMAIN`，OpenD 拒收（「未知股票 HSIMAIN」）→ 新增 `_CODE_ALIASES` + `_normalize_code()`（upper 後映返正規形式），switch 路徑同啟動 `.env` code 路徑一致應用；5 項新單測（全套 **165 passed**） |
 | 2026-09-30 | Step 2 · Commit 1 | **運行時切換標的與 K 線週期**：頂部 control bar（標的編號輸入欄 `HK.XXXXX`/`US.XXX` + 週期 combo，returnPressed / activated → `engine.switch()`）；engine 重構為 immutable `_State(agg, code, kline_type, anchor)` reference——switch worker thread 做 unsubscribe → fetch+seed → subscribe，**全部驗證通過先 atomic swap**，任何失敗 rollback（resubscribe 舊標的、圖表保持 live）；handler per-row code filter + emit 前 identity check 兜底 in-flight push；time-only tick fallback date 改用**市場時區**（zoneinfo：HK=Asia/Hong_Kong / US=America/New_York——美股喺 HKT 機上「今日」差一日）；`config.py` 公開 `KLINE_TYPES` + `kline_period_minutes()`。24 項新/改單測（全套 **160 passed**）+ live smoke：真 OpenD 實切 HK.HSImain K_1M → hk.00700 K_5M（小寫自動 normalize）成功、300 bars、乾淨斷線；實測發現 `unsubscribe()` 訂閱未滿 1 分鐘會失敗→已入 AGENTS.md 知識庫 |
 | 2026-09-30 | Step 1 · Commit 5（**Step 1 完成**） | 新增 `main.py` 入口：`Config.from_env()`（未知 KLINE_TYPE → stderr 報錯 exit(1)）→ QApplication + MainWindow `showFullScreen()`；SIGINT（Ctrl+C）排程 `app.quit()` 行完 event loop 先收；`exec()` 返回後 finally `window.shutdown()` clean stop。新增 `.env.example` 配置範本。**Live smoke test 實測通過**：offscreen 連真 OpenD → `history_ready` 300 根（夜期數據至 2026-09-30 03:00）→ QUOTE 訂閱成功 → close 乾淨斷線。全套 **136 passed** |
 | 2026-09-30 | Step 1 · Commit 4 | 新增全屏幕深色主題蠟燭圖表 UI：`ui/candle_chart.py`（純 QPainter、零第三方圖表庫——蠟燭 + volume subpane + nice-step grid/右軸 price label + last-price dashed line 同右軸 tag + crosshair OHLCV readout；backpressure = immutable snapshot + singleShot `QTimer(30ms)` coalesce repaint，tick burst 最多 ~30fps；`add_overlay()` 預留 ICT FVG / Order Block / Kill Zone 擴展點）+ `ui/main_window.py`（F11 全屏幕切換 / Esc 關閉、engine signal → chart 接線、深色主題跟 `.env` 配色）。20 項新單測全過（全套 **136 passed**）。剩餘：main.py 整合 |
@@ -30,7 +31,7 @@
 ## Features（Step 1 + Step 2）
 
 - **全屏幕終端**：PySide6/Qt6 全屏幕窗口，F11 切換全屏幕，Esc 關閉。
-- **運行時切換標的與週期**：頂部 control bar 輸入股票編號（`HK.XXXXX` / `US.XXX`，格式校驗 + 自動 upper）+ K 線週期 combo（9 種），Enter / 選單即切——engine worker thread 做 unsubscribe → fetch+seed → subscribe，全部驗證通過先 swap；失敗自動 rollback 返舊標的（圖表唔會斷）。
+- **運行時切換標的與週期**：頂部 control bar 輸入股票編號（`HK.XXXXX` / `US.XXX`，格式校驗 + 自動 uppercase；大小寫敏感特例如 `HK.HSImain` 經 `_CODE_ALIASES` 自動映返正規形式）+ K 線週期 combo（9 種），Enter / 選單即切——engine worker thread 做 unsubscribe → fetch+seed → subscribe，全部驗證通過先 swap；失敗自動 rollback 返舊標的（圖表唔會斷）。
 - **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 300 根。
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
 - **紅漲綠跌（港股慣例）**：`.env` 可切 `CONVENTION=INTL`（綠漲紅跌）或用 `COLOR_UP` / `COLOR_DOWN` 手動 override。
@@ -68,7 +69,7 @@ Engine 只持一個 immutable `_State(aggregator, code, kline_type, anchor_date)
 1. worker **先驗證後 swap**：fetch 失敗 / seed 0 根 / subscribe 失敗 → rollback（resubscribe 舊標的 + error signal），state 保持唔變、圖表繼續 live。
 2. handler 每 batch load 一次 state + per-row `row.code != state.code → skip`——unsubscribe **唔係硬停**（OpenD 實測：訂閱未滿 1 分鐘 unsubscribe 會失敗），in-flight / 殘留 push 一律 filter 掉。
 3. emit 前 identity check（`state is eng._state`）→ batch 中途 state 被 swap 走，呢批 discard，唔會用舊 aggregator 嘅 snapshot 覆蓋新圖。
-4. `switch()` guard：setup/switch 進行中 → reject + status 提示；校驗（code 格式 `^(HK|US)\.\w+$`、週期名）失敗 → error signal。
+4. `switch()` guard：setup/switch 進行中 → reject + status 提示；校驗（code 格式 `^(HK|US)\.\w+$`、週期名）失敗 → error signal。Code 經 `_normalize_code()` normalize（strip + uppercase，再將大小寫敏感特例如 `HK.HSImain` 經 `_CODE_ALIASES` 映返正規形式——OpenD 拒收全 upper 嘅 `HSIMAIN`）。
 
 ### 歷史 K 線取得（實測驗證行為）
 

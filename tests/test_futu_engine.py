@@ -19,7 +19,7 @@ import engine.futu_engine as fe
 from config import Config
 from engine.candle_aggregator import CandleAggregator
 from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
-                                _State, _fallback_date)
+                                _State, _fallback_date, _normalize_code)
 
 
 # ---------------------------------------------------------------- fixtures / fakes
@@ -458,6 +458,20 @@ class TestSetup:
         assert (eng.state.code, eng.state.kline_type) == ("HK.HSImain", "K_1M")
         assert statuses[-1].startswith("訂閱成功")
 
+    def test_env_lowercase_hsimain_normalized(self, monkeypatch):
+        """.env 小寫 hk.hsimain → fetch/subscribe/state 全部用正規形式 HK.HSImain。"""
+        eng = make_engine(history_count=2, trading_code="hk.hsimain")
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._setup()
+
+        assert not errors
+        assert ctx.kline_calls[0]["code"] == "HK.HSImain"
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
+        assert eng.state.code == "HK.HSImain"
+
     def test_connect_failure_emits_error(self, monkeypatch):
         eng = make_engine()
 
@@ -490,6 +504,21 @@ class TestSetup:
         eng._setup()
         assert any("request_history_kline" in e for e in errors)
         assert ctx.closed is True and eng._ctx is None
+
+
+# ---------------------------------------------------------------- _normalize_code（大小寫敏感特例）
+
+class TestNormalizeCode:
+    def test_hsimain_case_sensitive_alias(self):
+        # Futu 主力連續合約代碼大小寫敏感：OpenD 拒收 HSIMAIN（實測「未知股票 HSIMAIN」）
+        assert _normalize_code("hk.hsimain") == "HK.HSImain"
+        assert _normalize_code("HK.HSIMAIN") == "HK.HSImain"
+
+    def test_strip_and_upper(self):
+        assert _normalize_code("  hk.00700 ") == "HK.00700"
+
+    def test_us_ticker_unchanged(self):
+        assert _normalize_code("us.aapl") == "US.AAPL"
 
 
 # ---------------------------------------------------------------- switch 校驗（test thread 同步行）
@@ -666,6 +695,21 @@ class TestSwitchThreaded:
         assert wait_until(lambda: not eng._switching)
         assert (eng.state.code, eng.state.kline_type) == ("HK.00700", "K_5M")
         assert ctx.subscribed == (["HK.00700"], [SubType.QUOTE])
+        eng.stop()
+
+    def test_hsimain_alias_flows_through_switch(self):
+        """小寫 hk.hsimain → 正規形式 HK.HSImain（fetch/subscribe/state 全部用 alias）。"""
+        eng = make_engine(history_count=2)
+        ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx
+
+        eng.switch(code="hk.hsimain", kline_type="K_1M")
+        assert wait_until(lambda: ctx.gate_waited)
+        ctx.gate.set()
+        assert wait_until(lambda: not eng._switching)
+        assert eng.state.code == "HK.HSImain"
+        assert ctx.kline_calls[0]["code"] == "HK.HSImain"
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
         eng.stop()
 
     def test_switch_rejected_while_setup_running(self, monkeypatch):

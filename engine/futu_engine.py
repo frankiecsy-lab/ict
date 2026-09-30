@@ -17,6 +17,8 @@ in-flight push 會喺 swap 後先至到）+ emit 前確認 `state is eng._state`
 4. subscribe 成功時第二個返回值係 None → 只檢查 ret code；
 5. live tick data_time 係 time-only 'HH:mm:ss.SSS' → 補 date = max(anchor, market_today)；
    market_today 用市場自己時區（zoneinfo）計算——美股喺 HKT 機上「今日」會同 machine-local 差一日。
+6. 代碼大小寫敏感：HK.HSImain 等主力連續合約必須保留原 casing，upper 做 HSIMAIN OpenD 報「未知股票」
+   → _normalize_code() upper 後經 _CODE_ALIASES 映返正規形式。
 """
 from __future__ import annotations
 
@@ -62,6 +64,17 @@ _MAX_PAGES = 200           # 防禦上限：防 page_req_key 永遠唔係 None �
 
 # 股票編號格式（Step 2 支持美港股；futu 原生 code 格式）
 _CODE_RE = re.compile(r"^(HK|US)\.\w+$", re.IGNORECASE)
+
+# Futu 代碼大小寫敏感特例（主力連續合約）：OpenD 拒收全 upper 形式（實測「未知股票 HSIMAIN」）
+_CODE_ALIASES = {
+    "HK.HSIMAIN": "HK.HSImain",  # 恒指期貨主連
+}
+
+
+def _normalize_code(raw: str) -> str:
+    """strip + uppercase，再將大小寫敏感特例映返正規形式。"""
+    code = raw.strip().upper()
+    return _CODE_ALIASES.get(code, code)
 
 # time-only tick 補 fallback date 用嘅市場時區（只影響日曆日期推斷，永遠唔轉換數據 timestamp——時區鐵律不變）
 _MARKET_TZ: dict[str, str] = {
@@ -192,7 +205,7 @@ class FutuEngine(QObject):
             self._closed = False
             self._cfg = cfg
             self._state = _State(CandleAggregator(cfg.period_minutes),
-                                 cfg.trading_code, cfg.kline_type, None)
+                                 _normalize_code(cfg.trading_code), cfg.kline_type, None)
             thread = threading.Thread(target=self._setup, name="futu-setup", daemon=True)
             self._thread = thread
         thread.start()
@@ -222,7 +235,7 @@ class FutuEngine(QObject):
             if self._closed or self._ctx is None:
                 return
             cur = self._state
-        new_code = code.strip().upper() if code else (cur.code if cur else None)
+        new_code = _normalize_code(code) if code else (cur.code if cur else None)
         new_ktype = kline_type.strip().upper() if kline_type else (cur.kline_type if cur else None)
         if new_code is None or new_ktype is None:
             return  # start() 未行過 / 無當前狀態 → 冇嘢可以切
@@ -368,7 +381,8 @@ class FutuEngine(QObject):
         try:
             self.status.emit("OpenD 連線成功")
 
-            rows = self._fetch_history(ctx, cfg.trading_code, cfg.kline_type)
+            code = _normalize_code(cfg.trading_code)  # .env 小寫/全 upper 輸入都映返正規形式
+            rows = self._fetch_history(ctx, code, cfg.kline_type)
             cur_state = self._state
             n = cur_state.aggregator.seed_from_history(rows)
             anchor = None
@@ -377,13 +391,13 @@ class FutuEngine(QObject):
                 if last_dt is not None:
                     anchor = last_dt.date()
             # seed 完成先 swap state（anchor 一齊入，無 None window）
-            self._state = _State(cur_state.aggregator, cfg.trading_code, cfg.kline_type, anchor)
+            self._state = _State(cur_state.aggregator, code, cfg.kline_type, anchor)
             if not self._closed:
                 self.history_ready.emit(self._state.aggregator.bars())
 
             ctx.set_handler(_QuoteHandler(self))
-            self.status.emit(f"訂閱 {cfg.trading_code} QUOTE 中…")
-            ret, sub_info = ctx.subscribe([cfg.trading_code], [SubType.QUOTE])
+            self.status.emit(f"訂閱 {code} QUOTE 中…")
+            ret, sub_info = ctx.subscribe([code], [SubType.QUOTE])
             if ret != RET_OK:
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
             self.status.emit(f"訂閱成功 · 歷史 {n} 根 · 等待實時報價")

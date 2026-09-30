@@ -11,6 +11,9 @@
 - （2026-09-30）`tests/test_futu_engine.py` 遷移到 `_State` 架構 + 新增覆蓋：code filter（in-flight 舊標的 skip / mid-batch swap discard / state None 靜默）、`_fallback_date` 市場時區 7 項（含 NY 前一日 instant-based fake clock、tzdata 缺失 fallback）、switch 校驗 4 項、`_reconfigure` happy path + 3 種 rollback + unsubscribe 失敗唔阻擋 + closed 抑制 emit、真線程 guard（concurrent reject / 小寫 normalize / setup 進行中 reject）；全套 **160 passed**（+24）。
 - （2026-09-30）**Live smoke test 實測通過**（offscreen + 真 OpenD `127.0.0.1:11111`）：HK.HSImain K_1M → `hk.00700` K_5M（小寫輸入自動 upper normalize）運行時切換成功——state swap、anchor=2026-09-30、300 bars；格式錯誤校驗（`AAPL` → error signal）正確；`stop()` 乾淨斷線（CallClose）。實測發現 `unsubscribe()` 訂閱未滿 1 分鐘失敗限制 → 已入 AGENTS.md 知識庫。
 
+### Fixed
+- （2026-09-30）**主力連續合約代碼大小寫敏感 bug**（live 使用發現）：`switch()` 嘅 `.strip().upper()` 會將 `hk.hsimain` 變 `HK.HSIMAIN`，OpenD 拒收（「未知股票 HSIMAIN」）→ 新增 `_CODE_ALIASES` + `_normalize_code()`（upper 後映返正規形式），switch 路徑同啟動 `.env` code 路徑一致應用；5 項新單測（全套 **165 passed**）。限制已入 AGENTS.md 知識庫。
+
 ### Next
 - Step 2 後續候選：ICT 指標 overlay（FVG / Order Block / Kill Zone）、切換歷史記錄、多標的並排顯示
 
