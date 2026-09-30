@@ -1,7 +1,10 @@
 """全屏幕終端主窗口：control bar + CandleChart + FutuEngine 接線 + 狀態列。
 
-- 頂部 control bar：標的編號輸入欄（**只收純編號**——含空白即拒絕；目錄載入後經
-  `StockCatalog.canonical_code()` 驗證存在並正規化大小寫，未知編號 → status bar 報錯唔切換）
+- 頂部 control bar：標的編號輸入欄（**只收純編號**——onChange guard `textChanged` 即刻剝離
+  「code + 名稱」，目錄載入後經 `StockCatalog.canonical_code()` 驗證存在並正規化大小寫，
+  未知編號 → status bar 報錯唔切換）
+  + **onChange guard**（`textChanged`：completer `setCompletion()` 會喺 activated 前將完整
+    display_text「code + 名稱」寫入欄位 → handler 即刻剝離返純 code，欄位永不同時持有代碼同名稱）
   + 獨立名稱 LABEL（`name_text()`：中英文名顯示喺輸入欄外，名稱永不入 TEXT FIELD）+
   K 線週期按鍵組（checkable + autoExclusive），returnPressed / 按鍵點擊 →
   engine.switch(code, kline_type) 運行時切換。
@@ -95,6 +98,9 @@ class MainWindow(QMainWindow):
         self._code_by_text: dict[str, str] = {}
         self._completer.activated.connect(self._on_code_activated)
         self.code_edit.setCompleter(self._completer)
+        # onChange (textChanged) guard：completer setCompletion() 會喺 activated 前將完整
+        # display_text（code + 名稱）寫入輸入欄 → 即刻剝離返純 code
+        self.code_edit.textChanged.connect(self._on_code_text_changed)
         h.addWidget(self.code_edit)
 
         # 獨立名稱 LABEL：顯示當前標的嘅中英文名（名稱唔入輸入欄）；目錄載入後初始化
@@ -129,14 +135,13 @@ class MainWindow(QMainWindow):
         return btn.text() if btn else KLINE_TYPES[0]
 
     def _do_switch(self):
-        """ReturnPressed / 週期按鍵 → 驗證輸入欄純編號存在先 switch（名稱唔入輸入欄）。"""
+        """ReturnPressed / 週期按鍵 → 驗證輸入欄純編號存在先 switch（名稱唔入輸入欄）。
+
+        onChange guard（`_on_code_text_changed`）已確保欄位永遠無空白，呢度只需處理空欄。
+        """
         raw = self.code_edit.text()
         if not raw.strip():
             self.statusBar().showMessage("請輸入股票編號", 8000)
-            return
-        # 含空白 = 混入咗名稱（例：「HK.00700 騰訊」）→ 拒絕，只收純編號
-        if any(ch.isspace() for ch in raw):
-            self.statusBar().showMessage("輸入欄只可填純編號（唔好包含股票名稱）", 8000)
             return
         catalog = self._completer.catalog()
         code = None
@@ -152,6 +157,24 @@ class MainWindow(QMainWindow):
         self.code_edit.setText(code)
         self._update_name_label(code)
         self._engine.switch(code=code, kline_type=self.current_period())
+
+    def _on_code_text_changed(self, text: str) -> None:
+        """onChange guard：欄位出現「code + 名稱」（含空白）→ 即刻剝離返純 code。
+
+        QCompleter `setCompletion()` 會喺 `activated` signal 之前將完整 display_text
+        （例「HK.HSImain 恒指期货主连」）寫入輸入欄——呢度確保任何路徑下欄位都唔會
+        同時持有代碼同名稱。剝離後無空白 → 再觸發嘅 textChanged 自然 no-op，唔死循環；
+        blockSignals 避免多餘 signal round-trip。
+        """
+        if not any(ch.isspace() for ch in text):
+            return
+        tokens = [t for t in text.split() if t]
+        code = tokens[0] if tokens else ""
+        self.code_edit.blockSignals(True)
+        try:
+            self.code_edit.setText(code)
+        finally:
+            self.code_edit.blockSignals(False)
 
     def _on_catalog_ready(self, entries) -> None:
         """Engine setup thread fetch 完 HK+US 目錄 → rebuild completer model（GUI thread）。"""

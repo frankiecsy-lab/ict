@@ -1,8 +1,9 @@
 """MainWindow control bar 驗證邏輯單測（offscreen Qt + fake engine，零真實 OpenD 連線）。
 
-覆蓋：輸入欄**只收純編號**（含空白/名稱 → 拒絕）、目錄載入後 `canonical_code()` 驗證存在
-+ 正規化大小寫、未知編號 → status bar 報錯唔切換、獨立名稱 LABEL（`name_text()`）顯示、
-dropdown activated 路徑（code + 名稱同步更新）。
+覆蓋：**onChange guard**（textChanged：欄位出現「code + 名稱」即刻剝離返純 code——
+completer setCompletion() 喺 activated 前寫入完整 display_text 嘅路徑）、目錄載入後
+`canonical_code()` 驗證存在 + 正規化大小寫、未知編號 → status bar 報錯唔切換、
+獨立名稱 LABEL（`name_text()`）顯示、dropdown activated 路徑（code + 名稱同步更新）。
 """
 from __future__ import annotations
 
@@ -60,12 +61,14 @@ def _make_window(monkeypatch) -> tuple[MainWindow, FakeEngine]:
 
 
 def test_do_switch_rejects_name_in_field(monkeypatch):
-    """輸入欄含名稱（空白分隔）→ 拒絕切換，status bar 提示。"""
+    """輸入欄含名稱（空白分隔）→ onChange guard 即刻剝離返純 code，_do_switch 對純 code 正常切換。"""
     win, engine = _make_window(monkeypatch)
     win._on_catalog_ready(_entries())
     win.code_edit.setText("HK.00700 腾讯控股")
+    # guard 已將欄位剝離返純 code（名稱唔會殘留）
+    assert win.code_edit.text() == "HK.00700"
     win._do_switch()
-    assert engine.switch_calls == []
+    assert engine.switch_calls == [("HK.00700", "K_1M")]
 
 
 def test_do_switch_rejects_empty_field(monkeypatch):
@@ -121,3 +124,27 @@ def test_on_code_activated_sets_code_and_name(monkeypatch):
     assert win.code_edit.text() == "US.AAPL"  # 名稱唔入輸入欄
     assert engine.switch_calls == [("US.AAPL", "K_1M")]
     assert win.name_label.text() == name_text(aapl)
+
+
+def test_text_changed_guard_strips_name_on_change(monkeypatch):
+    """onChange guard：completer setCompletion() 寫入完整 display_text（code + 名稱）→
+    textChanged handler 即刻剝離返純 code，欄位唔會同時持有代碼同名稱。"""
+    win, _engine = _make_window(monkeypatch)
+    win._on_catalog_ready(_entries())
+    # 模擬 popup 開住撳 Enter：setCompletion() 喺 activated 前寫入完整 display_text（雙空格）
+    win.code_edit.setText("HK.HSImain  恒指期货主连")
+    assert win.code_edit.text() == "HK.HSImain"
+
+
+def test_text_changed_guard_noop_for_pure_code(monkeypatch):
+    """純編號輸入（無空白）→ guard no-op，唔改動欄位。"""
+    win, _engine = _make_window(monkeypatch)
+    win.code_edit.setText("hk.00700")
+    assert win.code_edit.text() == "hk.00700"
+
+
+def test_text_changed_guard_strips_name_before_catalog(monkeypatch):
+    """目錄未載入時 guard 一樣生效（唔依賴 catalog）。"""
+    win, _engine = _make_window(monkeypatch)
+    win.code_edit.setText("US.AAPL  Apple Inc.")
+    assert win.code_edit.text() == "US.AAPL"

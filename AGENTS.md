@@ -111,4 +111,9 @@
 *   **【正確資源】**：PySide6 / Qt `QStandardItemModel` 官方文檔（role 機制）；本專案實測 probe（offscreen）。
 *   **【解決/避坑方案】**：要「dropdown 顯示 A、輸入欄寫入 B」時，**唔好靠 model role**——model item 用完整顯示字串（dropdown 顯示），喺 `QCompleter.activated` handler 內用純函數還原目標字串後 `setText()` 強制覆蓋。本專案即係 `ui/stock_completer.py::code_from_completion(text, mapping)`：mapping hit → canonical code、miss → 取 display_text 第一 whitespace token（code 永遠係第一 token）兜底，`_on_code_activated` 一律 `setText(code)`。另注意：offscreen QPA **無法驅動 completer popup 嘅鍵盤/滑鼠選中**（`setCompletion()` 喺 PySide6 未 expose、`activated.overloads()` 亦唔可用），所以「選中後寫入輸入欄」呢條路徑只能靠純邏輯 + handler 強制覆蓋保證，唔好期望 offscreen 實測到。
 
+#### 3. 🥉 PySide6/Qt：QCompleter `setCompletion()` 喺 `activated` **之前**將完整 display_text 寫入輸入欄
+*   **【問題/限制】**：popup 開住撳 Enter（或 mouse click 選中）時，Qt 內部 `QCompleter::complete()` / `setCompletion()` 會**先**將選中 item 嘅完整文字（本專案 = `display_text`「code + 中文名 + 英文名」雙空格 join）寫入 QLineEdit，**然後**先 emit `activated` signal。即係話：淨係靠 `activated` handler 做 `setText(code)` 強制覆蓋，喺 signal 觸發前嗰一瞬間輸入欄會短暫持有「code + 名稱」——live 使用時肉眼可見（欄位閃一下完整字串先變返 code）。
+*   **【正確資源】**：Qt `QCompleter` 官方文檔（completion flow）；本專案 live 實測。
+*   **【解決/避坑方案】**：**加 onChange guard**——接 QLineEdit `textChanged`，欄位一出現空白字符（= code + 名稱混入）即刻取第一 whitespace token 剝離返純 code。本專案即係 `ui/main_window.py::_on_code_text_changed()`：`blockSignals(True)` 包 `setText(code)` 避免多餘 round-trip；剝離後無空白 → 再觸發嘅 textChanged 自然 no-op，**唔會死循環**。呢個 guard 兜晒所有寫入路徑（手動輸入 / dropdown Enter / activated），比淨係靠 activated handler 強制覆蓋更穩。注意：guard 用 `textChanged`（唔係 `textEdited`）——`textEdited` 只捕獲用戶鍵盤輸入，捕唔到 completer 程序化 `setText()`；要攔截 completer 寫入必須用 `textChanged`。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*
