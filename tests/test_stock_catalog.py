@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from engine.stock_catalog import (StockCatalog, StockEntry, display_text,
+from engine.stock_catalog import (StockCatalog, StockEntry, display_text, name_text,
                                   register_code_aliases, to_simplified)
 
 
@@ -39,6 +39,23 @@ def test_display_text_both_names():
 
 def test_display_text_code_only():
     assert display_text(StockEntry("HK.HSImain")) == "HK.HSImain"
+
+
+def test_name_text_both_names():
+    e = StockEntry("US.AAPL", "苹果", "Apple Inc.")
+    assert name_text(e) == "苹果 Apple Inc."
+
+
+def test_name_text_cn_only():
+    assert name_text(StockEntry("HK.00700", "腾讯控股", "")) == "腾讯控股"
+
+
+def test_name_text_en_only():
+    assert name_text(StockEntry("US.MSFT", "", "Microsoft Corp.")) == "Microsoft Corp."
+
+
+def test_name_text_no_names_empty():
+    assert name_text(StockEntry("HK.HSImain")) == ""
 
 
 # ---------------------------------------------------------------- to_simplified

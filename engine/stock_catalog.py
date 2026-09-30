@@ -62,6 +62,11 @@ def display_text(e: StockEntry) -> str:
     return "  ".join(parts)
 
 
+def name_text(e: StockEntry) -> str:
+    """名稱部分（獨立 LABEL 顯示用，輸入欄只留 code）：`中文名 英文名`（空欄位略過、全缺 → 空字串）。"""
+    return " ".join(p for p in (e.name_cn, e.name_en) if p)
+
+
 def register_code_aliases(entries, alias_map: dict[str, str]) -> int:
     """將大小寫敏感嘅正規 code 註冊入 alias table（upper form → canonical）。
 

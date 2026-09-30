@@ -55,6 +55,22 @@ def test_empty_catalog_no_matches():
     assert c.completionMatches("aapl") == []
 
 
+def test_catalog_accessor_exposes_snapshot():
+    """catalog() 暴露內部 StockCatalog——main_window 驗證編號存在 / canonical_code 用。"""
+    entries = _entries()
+    c = StockCompleter()
+    # set_catalog 前：空目錄
+    assert len(c.catalog()) == 0
+    assert c.catalog().canonical_code("HK.00700") is None
+    c.set_catalog(entries)
+    cat = c.catalog()
+    assert len(cat) == len(entries)
+    # case-insensitive exact → 嚴格大小寫 canonical（hk.hsimain → HK.HSImain）
+    assert cat.canonical_code("hk.hsimain") == "HK.HSImain"
+    assert cat.canonical_code("US.AAPL") == "US.AAPL"
+    assert cat.canonical_code("NOPE.XXX") is None
+
+
 def test_model_item_display_role_is_full_text():
     """Dropdown popup 顯示完整 display_text（code + 中英文名）——名稱要留喺 dropdown。
 

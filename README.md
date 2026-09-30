@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 5 | **輸入欄只收純編號 + 存在性驗證 + 獨立名稱 LABEL**：(1) `_do_switch()` 新增兩道門——含空白（混入股票名稱，例「HK.00700 騰訊」）即拒絕；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號 → status bar 報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。(2) control bar 新增獨立 `QLabel` 名稱欄——經新純函數 `engine/stock_catalog.py::name_text()`（中文名 + 英文名，空欄位略過）顯示當前標的嘅中英文名，目錄載入 / dropdown 選中 / 手動切換時同步更新；**名稱永不入 TEXT FIELD**。12 項新單測（`test_main_window.py` offscreen Qt + fake engine、`name_text` ×4、`StockCompleter.catalog()` accessor）全套 **219 passed** |
 | 2026-09-30 | Step 2 · Commit 4 | **輸入欄 TEXT FIELD 只留 code（名稱唔入輸入欄）**：dropdown popup 繼續顯示完整 `display_text`（code + 中英文名），選中後經新增純函數 `ui/stock_completer.py::code_from_completion()` 還原嚴格大小寫 canonical code——mapping hit → canonical、miss → 取 display_text 第一 whitespace token（code 永遠係第一 token）兜底；`_on_code_activated` 一律 `setText(code)` 強制覆蓋，確保任何路徑下輸入欄都只出現 code。實測發現 QStandardItem 喺呢個 PySide6/Qt 版本 **Display/Edit role 耦合**（設 EditRole 會連帶改 DisplayRole）→ 無法用雙 role 分開 dropdown 顯示同輸入欄字串，故改用 handler 強制覆蓋方案。2 項新單測（全套 **207 passed**） |
 | 2026-09-30 | Step 2 · Commit 3 | **K 線週期按鍵組 + volume 矩形 + seed 擴充**：(1) K 線週期由 QComboBox 換做 checkable QPushButton group（QButtonGroup exclusive，`:checked` 用 `cfg.last_price_color` 背景 + bold），`current_period()` / `_do_switch()` 一次傳齊 code+period → `engine.switch()`；(2) volume subpane 由細線改成同蠟燭 body 一樣寬嘅填充矩形（`body_w = slot * 0.7`，紅漲綠跌跟 config）；(3) `_SEED_ENTRIES` 擴充至三隻 HK 指數期貨主連（HSImain/HHImain/MHImain），`_CODE_ALIASES` 加對應 upper→canonical 映射。全套 **205 passed** |
 | 2026-09-30 | Step 2 · Commit 2 | **股票編號模糊輸入自動補全**（中英文名 + 簡體/繁體）：新增 `engine/stock_catalog.py`——`StockEntry(code, name_cn, name_en)` + `StockCatalog.search()` rank-based 兩段評分（code 精確 → suffix → prefix → 英文名 → 中文名（OpenCC t2s 簡繁正規化）→ substring → difflib typo fuzzy ≥0.8，query 每 keystroke 轉簡體、entry 名 index build 時預計算）；`engine/futu_engine.py::_fetch_catalog()` 經 `get_stock_basicinfo` fetch HK+US（per-market try/except + dedup），**live 實測 API 冇 `english_name` 欄位同唔含主力連續合約** → `_SEED_ENTRIES` seed 補返 `HK.HSImain`；subscribe 成功後 emit `catalog_ready`，mixed-case code 自動註冊入 `_CODE_ALIASES`；新增 `ui/stock_completer.py`（`StockCompleter`：UnfilteredPopupCompletion、matching 全委派 catalog）+ control bar 輸入欄 dropdown。Live smoke：HK 3798 / US 13111 隻；新單測（全套 **205 passed**） |
@@ -29,6 +30,7 @@
 - [x] Commit 2：股票目錄 fuzzy autocomplete（`stock_catalog.py` rank-based 搜尋 + OpenCC 簡繁轉換、`get_stock_basicinfo` fetch + seed、`StockCompleter` dropdown）
 - [x] Commit 3：K 線週期按鍵組（checkable QButtonGroup exclusive）+ volume subpane 填充矩形 + `_SEED_ENTRIES` 擴充三隻 HK 指數期貨主連
 - [x] Commit 4：輸入欄 TEXT FIELD 只留 code——dropdown 顯示完整 `display_text`，選中後經 `code_from_completion()` 還原 canonical code 強制覆蓋（QStandardItem Display/Edit role 耦合 → 無法雙 role）
+- [x] Commit 5：輸入欄**只收純編號 + 存在性驗證**（含空白/名稱即拒絕；目錄載入後 `canonical_code()` 驗證存在 + 正規化大小寫，未知編號報錯唔切換）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名，名稱永不入輸入欄）
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -38,6 +40,8 @@
 
 - **全屏幕終端**：PySide6/Qt6 全屏幕窗口，F11 切換全屏幕，Esc 關閉。
 - **運行時切換標的與週期**：頂部 control bar 輸入股票編號（`HK.XXXXX` / `US.XXX`，格式校驗 + 自動 uppercase；大小寫敏感特例如 `HK.HSImain` 經 `_CODE_ALIASES` 自動映返正規形式）+ K 線週期按鍵組（9 個 checkable button，QButtonGroup exclusive），點擊即切——engine worker thread 做 unsubscribe → fetch+seed → subscribe，全部驗證通過先 swap；失敗自動 rollback 返舊標的（圖表唔會斷）。
+- **輸入欄只收純編號 + 存在性驗證**：TEXT FIELD 只接受純編號——含空白（混入股票名稱）即拒絕並 status bar 提示；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號直接報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。
+- **獨立名稱 LABEL**：control bar 輸入欄旁嘅 `QLabel` 顯示當前標的嘅中英文名（新純函數 `name_text()`），目錄載入 / dropdown 選中 / 手動切換時同步更新——名稱永遠唔會入 TEXT FIELD。
 - **模糊輸入自動補全**：股票編號欄支持中英文名 + 簡體/繁體中文模糊匹配（例：`騰訊`、`AAPL`、`hsimain`），dropdown 結果 rank-based（精確 > prefix > substring > typo fuzzy）；**dropdown popup 顯示完整 `display_text`（code + 中英文名）**，選中後輸入欄 TEXT FIELD **只留 code**——經 `code_from_completion()` 還原嚴格大小寫 canonical code（mapping hit → canonical、miss → 第一 token 兜底），名稱唔會入輸入欄。目錄由 `get_stock_basicinfo`（HK+US，~17k 隻）載入，主力連續合約經 seed 補返。
 - **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 300 根。
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
@@ -53,9 +57,9 @@
 D:\coding\ICT_v1\
 ├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()
-├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch）
-├─ ui\                         # ✅ main_window（control bar：標的輸入欄（fuzzy autocomplete dropdown，選中後只留 code）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；add_overlay 擴展點）
-├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（24 項 fuzzy 搜尋）；test_stock_completer.py ✅（offscreen Qt）；test_candle_chart.py ✅
+├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換；`display_text()` dropdown 行、`name_text()` 名稱 LABEL、`canonical_code()` 存在性驗證）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch）
+├─ ui\                         # ✅ main_window（control bar：標的輸入欄（**只收純編號**——含名稱即拒絕、`canonical_code()` 驗證存在 + 正規化大小寫，fuzzy autocomplete dropdown 選中後只留 code）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code + `catalog()` accessor）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；add_overlay 擴展點）
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：純編號驗證 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env）
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）

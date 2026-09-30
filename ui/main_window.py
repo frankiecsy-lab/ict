@@ -1,12 +1,14 @@
 """全屏幕終端主窗口：control bar + CandleChart + FutuEngine 接線 + 狀態列。
 
-- 頂部 control bar：標的編號輸入欄（fuzzy autocomplete：編號 / 中英文名、簡繁兼容，
-  目錄由 engine `catalog_ready` 一次性載入）+ K 線週期按鍵組（checkable + autoExclusive），
-  returnPressed / 按鍵點擊 → engine.switch(code, kline_type) 運行時切換。
+- 頂部 control bar：標的編號輸入欄（**只收純編號**——含空白即拒絕；目錄載入後經
+  `StockCatalog.canonical_code()` 驗證存在並正規化大小寫，未知編號 → status bar 報錯唔切換）
+  + 獨立名稱 LABEL（`name_text()`：中英文名顯示喺輸入欄外，名稱永不入 TEXT FIELD）+
+  K 線週期按鍵組（checkable + autoExclusive），returnPressed / 按鍵點擊 →
+  engine.switch(code, kline_type) 運行時切換。
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
   history_ready / bars_changed → chart.update_bars；status / error → status bar；
-  catalog_ready → completer model rebuild。
+  catalog_ready → completer model rebuild + 名稱 LABEL 初始化。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineE
 
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
+from engine.stock_catalog import name_text
 from .candle_chart import CandleChart
 from .stock_completer import StockCompleter, code_from_completion
 
@@ -84,15 +87,20 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("標的"))
 
         self.code_edit = QLineEdit()
-        self.code_edit.setPlaceholderText("編號 / 中英文名（模糊匹配，例：騰訊、AAPL、hsimain）")
+        self.code_edit.setPlaceholderText("純編號（例：HK.00700 / US.AAPL）")
         self.code_edit.setText(cfg.trading_code)
-        self.code_edit.setFixedWidth(340)
+        self.code_edit.setFixedWidth(240)
         # Fuzzy autocomplete：目錄由 engine catalog_ready 載入；activated → 用 canonical code switch
         self._completer = StockCompleter(self)
         self._code_by_text: dict[str, str] = {}
         self._completer.activated.connect(self._on_code_activated)
         self.code_edit.setCompleter(self._completer)
         h.addWidget(self.code_edit)
+
+        # 獨立名稱 LABEL：顯示當前標的嘅中英文名（名稱唔入輸入欄）；目錄載入後初始化
+        self.name_label = QLabel("")
+        self.name_label.setMinimumWidth(200)
+        h.addWidget(self.name_label)
 
         h.addSpacing(16)
         h.addWidget(QLabel("週期"))
@@ -121,12 +129,35 @@ class MainWindow(QMainWindow):
         return btn.text() if btn else KLINE_TYPES[0]
 
     def _do_switch(self):
-        # 一次 action 傳齊兩個值（避免連續兩次 switch）
-        self._engine.switch(code=self.code_edit.text(), kline_type=self.current_period())
+        """ReturnPressed / 週期按鍵 → 驗證輸入欄純編號存在先 switch（名稱唔入輸入欄）。"""
+        raw = self.code_edit.text()
+        if not raw.strip():
+            self.statusBar().showMessage("請輸入股票編號", 8000)
+            return
+        # 含空白 = 混入咗名稱（例：「HK.00700 騰訊」）→ 拒絕，只收純編號
+        if any(ch.isspace() for ch in raw):
+            self.statusBar().showMessage("輸入欄只可填純編號（唔好包含股票名稱）", 8000)
+            return
+        catalog = self._completer.catalog()
+        code = None
+        if len(catalog):
+            # 目錄已載入 → 驗證存在 + 正規化嚴格大小寫（例：hk.00700 → HK.00700）
+            code = catalog.canonical_code(raw)
+            if code is None:
+                self.statusBar().showMessage(f"股票編號唔存在：{raw.strip()}", 8000)
+                return
+        else:
+            # 目錄未載入（catalog fetch 失敗等）→ 放行俾 engine/OpenD 最終校驗
+            code = raw.strip()
+        self.code_edit.setText(code)
+        self._update_name_label(code)
+        self._engine.switch(code=code, kline_type=self.current_period())
 
     def _on_catalog_ready(self, entries) -> None:
         """Engine setup thread fetch 完 HK+US 目錄 → rebuild completer model（GUI thread）。"""
         self._code_by_text = self._completer.set_catalog(tuple(entries))
+        # 目錄到手 → 用當前輸入欄 code 初始化名稱 LABEL
+        self._update_name_label(self.code_edit.text())
 
     def _on_code_activated(self, text: str) -> None:
         """Dropdown 選中一行 → 輸入欄只留 code（名稱唔入 TEXT FIELD）→ switch。
@@ -139,7 +170,15 @@ class MainWindow(QMainWindow):
         if not code:
             return
         self.code_edit.setText(code)
+        self._update_name_label(code)
         self._engine.switch(code=code, kline_type=self.current_period())
+
+    def _update_name_label(self, raw_code: str | None) -> None:
+        """獨立 LABEL 顯示當前標的嘅中英文名（`name_text()`）；目錄未載入/未知 code → 清空。"""
+        catalog = self._completer.catalog()
+        code = catalog.canonical_code(raw_code) if len(catalog) and raw_code else None
+        entry = next((e for e in catalog.entries if e.code == code), None)
+        self.name_label.setText(name_text(entry) if entry else "")
 
     def _on_error(self, msg: str) -> None:
         label = QLabel(f"⚠ {msg}")

@@ -9,6 +9,8 @@
   顯示同輸入欄字串。）
 - `set_catalog(entries)` 喺 engine `catalog_ready` 時呼叫：rebuild QStandardItemModel +
   返回 display_text → canonical code 映射（activated 時 main_window 用嚟搵返嚴格大小寫 code）。
+- `catalog()` 暴露內部 StockCatalog snapshot——main_window `_do_switch()` 驗證輸入編號存在
+  （`canonical_code()`）同更新名稱 LABEL（`name_text()`）用。
 """
 from __future__ import annotations
 
@@ -39,6 +41,10 @@ class StockCompleter(QCompleter):
             mapping[text] = e.code
         self.setModel(model)
         return mapping
+
+    def catalog(self) -> StockCatalog:
+        """內部目錄 snapshot（main_window 驗證輸入編號存在 / 還原 canonical code 用）。"""
+        return self._catalog
 
     def completionMatches(self, prefix: str):  # noqa: N802 (Qt naming)
         """每次 keystroke 由 StockCatalog.search() 提供 rank-based 結果（O(n) 單遍）。"""
