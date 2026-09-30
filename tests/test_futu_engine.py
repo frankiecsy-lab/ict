@@ -1,10 +1,12 @@
 """futu_engine 單測：mock OpenQuoteContext + 真 pandas DataFrame（零真實連線）。
 
-覆蓋：_fetch_history 分頁/tail/NaN skip、on_recv_rsp tick 聚合、tick_date、
-_setup 編排、start/stop lifecycle。
+覆蓋：_fetch_history 分頁/tail/NaN skip、on_recv_rsp tick 聚合（含 code filter）、
+tick_date / _fallback_date（市場時區）、_setup 編排、switch/_reconfigure 運行時切換
++ rollback、start/stop lifecycle。
 """
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time as _time
 from datetime import date, datetime, timedelta
@@ -16,7 +18,8 @@ from futu import RET_OK, SubType, StockQuoteHandlerBase
 import engine.futu_engine as fe
 from config import Config
 from engine.candle_aggregator import CandleAggregator
-from engine.futu_engine import FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler
+from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
+                                _State, _fallback_date)
 
 
 # ---------------------------------------------------------------- fixtures / fakes
@@ -35,6 +38,7 @@ class FakeCtx:
         self.kline_calls = []
         self.handler = None
         self.subscribed = None
+        self.unsubscribed = None
         self.closed = False
         self.subscribe_event = threading.Event()
         self._sub_ret = sub_ret
@@ -54,8 +58,27 @@ class FakeCtx:
         self.subscribe_event.set()
         return self._sub_ret, self._sub_info
 
+    def unsubscribe(self, codes, sub_types):
+        self.unsubscribed = (list(codes), list(sub_types))
+        return RET_OK, None
+
     def close(self):
         self.closed = True
+
+
+class GatedCtx(FakeCtx):
+    """subscribe 前 gate 住 → worker thread 保持 alive（測 switch guard / lifecycle）。"""
+
+    def __init__(self, pages, **kw):
+        super().__init__(pages, **kw)
+        self.gate = threading.Event()
+        self.gate_waited = False
+
+    def subscribe(self, codes, sub_types):
+        if not self.gate_waited:
+            self.gate_waited = True
+            self.gate.wait(timeout=10)
+        return super().subscribe(codes, sub_types)
 
 
 def kline_df(rows) -> pd.DataFrame:
@@ -69,18 +92,27 @@ def kline_df(rows) -> pd.DataFrame:
     )
 
 
-def quote_df(rows) -> pd.DataFrame:
+def quote_df(rows, code="HK.HSImain") -> pd.DataFrame:
     """rows: (data_time, last_price, volume) → QUOTE push DataFrame。"""
     return pd.DataFrame(
-        [dict(code="HK.HSImain", data_time=dt, last_price=p, volume=v) for dt, p, v in rows]
+        [dict(code=code, data_time=dt, last_price=p, volume=v) for dt, p, v in rows]
     )
 
 
 def make_engine(**cfg_overrides) -> FutuEngine:
-    """Whitebox：直接注入 cfg + aggregator，唔行 start()（避免真實連線/線程）。"""
+    """Whitebox：直接注入 cfg + _State，唔行 start()（避免真實連線/線程）。"""
     eng = FutuEngine()
-    eng._cfg = make_cfg(**cfg_overrides)
-    eng._aggregator = CandleAggregator(eng._cfg.period_minutes)
+    cfg = make_cfg(**cfg_overrides)
+    eng._cfg = cfg
+    eng._state = _State(CandleAggregator(cfg.period_minutes),
+                        cfg.trading_code, cfg.kline_type, None)
+    return eng
+
+
+def set_anchor(eng: FutuEngine, d: date | None) -> FutuEngine:
+    """替換 state 嘅 anchor_date（frozen dataclass → replace 出新 reference）。"""
+    s = eng.state
+    eng._state = dataclasses.replace(s, anchor_date=d)
     return eng
 
 
@@ -93,6 +125,24 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
+def _patch_now(monkeypatch, hkt_wall: datetime) -> None:
+    """Patch `fe.datetime.now(tz)` = 固定 instant（HKT wall clock）轉去傳入 tz。
+
+    模擬真實 `datetime.now(tz)` 語義：同一 instant、不同時區嘅 wall clock 唔同——
+    呢個先至測得到「美股喺 HKT 機上今日差一日」嗰種行為。
+    """
+    from zoneinfo import ZoneInfo
+
+    instant = hkt_wall.replace(tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    class _DT:
+        @staticmethod
+        def now(tz=None):
+            return instant.astimezone(tz if tz is not None else ZoneInfo("Asia/Hong_Kong"))
+
+    monkeypatch.setattr(fe, "datetime", _DT)
+
+
 # ---------------------------------------------------------------- _fetch_history
 
 class TestFetchHistory:
@@ -103,7 +153,7 @@ class TestFetchHistory:
             ("2026-09-30 09:31", 100.5, 102.0, 100.0, 101.0, 1200),
         ]
         ctx = FakeCtx([(RET_OK, kline_df(rows_in), None)])
-        out = eng._fetch_history(ctx)
+        out = eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert out == [
             ("2026-09-30 09:30", 100.0, 101.0, 99.5, 100.5, 1000.0),
             ("2026-09-30 09:31", 100.5, 102.0, 100.0, 101.0, 1200.0),
@@ -127,7 +177,7 @@ class TestFetchHistory:
             (RET_OK, kline_df(page1), "k1"),
             (RET_OK, kline_df(page2), None),
         ])
-        out = eng._fetch_history(ctx)
+        out = eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert [b[0] for b in out] == [r[0] for r in page1 + page2]
         # 第二頁帶住第一頁返回嘅 page_req_key
         assert ctx.kline_calls[1]["page_req_key"] == "k1"
@@ -138,7 +188,7 @@ class TestFetchHistory:
         rows = [((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
                  100.0, 101.0, 99.0, 100.5, 1000.0) for i in range(5)]
         ctx = FakeCtx([(RET_OK, kline_df(rows), None)])
-        out = eng._fetch_history(ctx)
+        out = eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert len(out) == 2
         assert [b[0] for b in out] == [rows[-2][0], rows[-1][0]]
 
@@ -146,7 +196,7 @@ class TestFetchHistory:
         eng = make_engine()
         ctx = FakeCtx([(-1, "connect timeout", None)])
         with pytest.raises(RuntimeError, match="request_history_kline 失敗"):
-            eng._fetch_history(ctx)
+            eng._fetch_history(ctx, "HK.HSImain", "K_1M")
 
     def test_nan_rows_skipped(self):
         eng = make_engine()
@@ -156,7 +206,7 @@ class TestFetchHistory:
             ("2026-09-30 09:32", 101.0, 102.5, 100.5, 102.0, 1400),         # 有效
         ]
         ctx = FakeCtx([(RET_OK, kline_df(rows), None)])
-        out = eng._fetch_history(ctx)
+        out = eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert len(out) == 1 and out[0][0] == "2026-09-30 09:32"
 
     def test_page_guard_raises(self, monkeypatch):
@@ -165,7 +215,7 @@ class TestFetchHistory:
         one_row = kline_df([("2026-09-30 09:30", 1.0, 2.0, 0.5, 1.5, 10)])
         ctx = FakeCtx([(RET_OK, one_row, "k")] * 10)  # page_key 永遠 truthy
         with pytest.raises(RuntimeError, match="歷史分頁超過"):
-            eng._fetch_history(ctx)
+            eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert len(ctx.kline_calls) == 3
 
 
@@ -184,7 +234,7 @@ class TestQuoteHandler:
 
     def test_tick_batch_updates_bar_and_emits(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)  # future anchor → tick_date 確定性（clock skew 分支）
+        set_anchor(eng, date(2030, 1, 1))  # future anchor → tick_date 確定性（clock skew 分支）
         df = quote_df([("09:30:45.123", 100.0, 1000), ("09:30:50.456", 101.0, 1500)])
         emitted, errors, ret_out, data_out = self._run(monkeypatch, eng, df)
         assert not errors and ret_out == RET_OK and data_out is df
@@ -198,7 +248,7 @@ class TestQuoteHandler:
 
     def test_updates_seeded_bar(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
         df = quote_df([("09:30:10.000", 100.0, 100)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
@@ -209,7 +259,7 @@ class TestQuoteHandler:
 
     def test_new_bar_after_period_rollover(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
         df = quote_df([("09:30:10.000", 100.0, 100), ("09:31:02.000", 102.0, 500)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
@@ -235,7 +285,7 @@ class TestQuoteHandler:
 
     def test_nan_price_row_skipped(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         df = quote_df([("09:30:05.000", float("nan"), 100), ("09:30:06.000", 100.0, 200)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
@@ -244,7 +294,7 @@ class TestQuoteHandler:
 
     def test_garbage_data_time_row_skipped(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         df = quote_df([("garbage", 100.0, 100), ("09:30:05.000", 101.0, 200)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
@@ -253,7 +303,7 @@ class TestQuoteHandler:
 
     def test_duplicate_tick_no_reemit(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         df = quote_df([("09:30:45.123", 100.0, 1000)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert len(emitted) == 1
@@ -263,29 +313,113 @@ class TestQuoteHandler:
 
     def test_out_of_order_tick_skipped(self, monkeypatch):
         eng = make_engine()
-        eng._anchor_date = date(2030, 1, 1)
+        set_anchor(eng, date(2030, 1, 1))
         df = quote_df([("09:31:00.000", 100.0, 100), ("09:30:59.000", 99.0, 90)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
         bars = emitted[0]
         assert len(bars) == 1 and bars[0][0] == "2030-01-01 09:31" and bars[0][4] == 100.0
 
+    def test_inflight_old_code_row_skipped(self, monkeypatch):
+        """切換後舊標的嘅 in-flight push（unsubscribe 唔係硬停）→ code filter skip。"""
+        eng = make_engine()  # state.code = HK.HSImain
+        df = quote_df([("09:30:45.123", 100.0, 1000)], code="US.AAPL")
+        emitted, errors, ret_out, data_out = self._run(monkeypatch, eng, df)
+        assert not errors and not emitted
+        assert ret_out == RET_OK and data_out is df
 
-# ---------------------------------------------------------------- tick_date
+    def test_state_swapped_mid_batch_discards_emit(self, monkeypatch):
+        """batch 中途 state 被 swap（identity check）→ 呢批唔 emit。"""
+        eng = make_engine()
+        set_anchor(eng, date(2030, 1, 1))
+        df = quote_df([("09:30:45.123", 100.0, 1000)])
+        emitted, errors, _, _ = self._run(monkeypatch, eng, df)
+        assert len(emitted) == 1
+        # 模擬切換：處理第一筆 tick 時 swap 去新 state（_reconfigure 完成嘅瞬間）
+        s = eng.state
+        new_state = dataclasses.replace(s, aggregator=CandleAggregator(1))
+        orig_apply = s.aggregator.apply_quote
+
+        def apply_and_swap(self_agg, dt, price, cum):
+            eng._state = new_state  # mid-batch switch
+            return orig_apply(dt, price, cum)
+
+        monkeypatch.setattr(CandleAggregator, "apply_quote", apply_and_swap)
+        emitted2, _, _, _ = self._run(monkeypatch, eng, df)
+        assert not emitted2  # handler capture 到嘅 state 已唔係當前 → discard
+
+    def test_no_state_silent_return(self, monkeypatch):
+        """start() 前（state None）收到 push → 靜默返回，唔 emit 唔報錯。"""
+        eng = FutuEngine()
+        eng._cfg = make_cfg()
+        df = quote_df([("09:30:45.123", 100.0, 1000)])
+        emitted, errors, ret_out, _ = self._run(monkeypatch, eng, df)
+        assert not errors and not emitted and ret_out == RET_OK
+
+
+# ---------------------------------------------------------------- tick_date / _fallback_date
+
+_NOW_HKT = datetime(2026, 9, 30, 15, 0)   # HKT 2026-09-30 15:00（日市收市後）
+
 
 class TestTickDate:
-    def test_no_anchor_uses_today(self):
-        assert make_engine().tick_date() == date.today()
+    def test_no_anchor_uses_market_today(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert make_engine().tick_date() == date(2026, 9, 30)
 
-    def test_future_anchor_wins_over_today(self):
-        eng = make_engine()
-        eng._anchor_date = date(2031, 1, 1)
+    def test_future_anchor_wins_over_today(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        eng = set_anchor(make_engine(), date(2031, 1, 1))
         assert eng.tick_date() == date(2031, 1, 1)  # clock skew：跟住 seed
 
-    def test_past_anchor_uses_today(self):
-        eng = make_engine()
-        eng._anchor_date = date(2020, 1, 1)
-        assert eng.tick_date() == date.today()  # 夜期跨午夜
+    def test_past_anchor_uses_today(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        eng = set_anchor(make_engine(), date(2020, 1, 1))
+        assert eng.tick_date() == date(2026, 9, 30)  # 夜期跨午夜 → 用市場今日
+
+    def test_no_state_uses_hk_today(self, monkeypatch):
+        """start() 前 tick_date（state None）→ HK fallback，唔炸。"""
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert FutuEngine().tick_date() == date(2026, 9, 30)
+
+
+class TestFallbackDate:
+    """市場時區 fallback：美股喺 HKT 機上「今日」會同 machine-local 差一日。"""
+
+    def test_hk_code_uses_hk_tz(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert _fallback_date(None, "HK.00700") == date(2026, 9, 30)
+
+    def test_us_code_same_day_as_hkt(self, monkeypatch):
+        # HKT 15:00 = NY 03:00（EDT）→ 兩邊同日
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert _fallback_date(None, "US.AAPL") == date(2026, 9, 30)
+
+    def test_us_code_ny_previous_day(self, monkeypatch):
+        # HKT 2026-10-01 02:00 = NY 2026-09-30 14:00 → NY「今日」係前一日
+        # （machine-local HKT 今日會係 10-01——呢個 test 就係驗證用咗市場時區）
+        _patch_now(monkeypatch, datetime(2026, 10, 1, 2, 0))
+        assert _fallback_date(None, "US.AAPL") == date(2026, 9, 30)
+
+    def test_unknown_prefix_falls_back_to_hk(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert _fallback_date(None, "SG.D05") == date(2026, 9, 30)
+
+    def test_no_dot_defaults_hk(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert _fallback_date(None, "HSImain") == date(2026, 9, 30)
+
+    def test_anchor_wins_when_after_today(self, monkeypatch):
+        _patch_now(monkeypatch, _NOW_HKT)
+        assert _fallback_date(date(2027, 1, 1), "US.AAPL") == date(2027, 1, 1)
+
+    def test_tzdata_missing_falls_back_machine_local(self, monkeypatch):
+        """ZoneInfo 炸（tzdata 缺失）→ 回落 machine-local，唔 propagate。"""
+        def boom(_name):
+            raise KeyError("no such timezone")
+
+        monkeypatch.setattr(fe, "ZoneInfo", boom)
+        assert _fallback_date(None, "HK.00700") == date.today()
 
 
 # ---------------------------------------------------------------- _setup 編排（test thread 同步行）
@@ -319,7 +453,9 @@ class TestSetup:
         assert ctx.handler is not None  # set_handler 已呼叫
         assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
         assert eng._ctx is ctx
-        assert eng._anchor_date == date(2026, 9, 30)  # seed 最後一根 bar 嘅日期
+        # seed 完成先 swap state：anchor = seed 最後一根 bar 嘅日期
+        assert eng.state.anchor_date == date(2026, 9, 30)
+        assert (eng.state.code, eng.state.kline_type) == ("HK.HSImain", "K_1M")
         assert statuses[-1].startswith("訂閱成功")
 
     def test_connect_failure_emits_error(self, monkeypatch):
@@ -356,6 +492,200 @@ class TestSetup:
         assert ctx.closed is True and eng._ctx is None
 
 
+# ---------------------------------------------------------------- switch 校驗（test thread 同步行）
+
+class TestSwitchValidation:
+    def _connected(self) -> FutuEngine:
+        eng = make_engine()
+        eng._ctx = FakeCtx([])  # 模擬已連線（switch 只檢查 ctx is not None）
+        return eng
+
+    def test_bad_code_format_emits_error(self):
+        eng = self._connected()
+        errors, statuses = [], []
+        eng.error.connect(errors.append)
+        eng.status.connect(statuses.append)
+        eng.switch(code="AAPL", kline_type="K_1M")  # 缺市場 prefix
+        assert len(errors) == 1 and "格式錯誤" in errors[0]
+        assert not statuses and not eng._switching
+
+    def test_bad_ktype_emits_error(self):
+        eng = self._connected()
+        errors = []
+        eng.error.connect(errors.append)
+        eng.switch(code="HK.00700", kline_type="K_2M")
+        assert len(errors) == 1 and "未知 K 線週期" in errors[0]
+
+    def test_not_connected_silent_return(self):
+        eng = make_engine()  # 無 ctx（start 未行過）
+        errors, statuses = [], []
+        eng.error.connect(errors.append)
+        eng.status.connect(statuses.append)
+        eng.switch(code="US.AAPL", kline_type="K_5M")
+        assert not errors and not statuses and not eng._switching
+
+    def test_closed_rejects_silently(self):
+        eng = self._connected()
+        eng.stop()  # _closed=True + ctx close
+        errors, statuses = [], []
+        eng.error.connect(errors.append)
+        eng.status.connect(statuses.append)
+        eng.switch(code="US.AAPL", kline_type="K_5M")
+        assert not errors and not statuses
+
+
+# ---------------------------------------------------------------- _reconfigure 運行時切換（test thread 同步行）
+
+class TestReconfigure:
+    def _setup_eng(self, pages, sub_ret=RET_OK, sub_info=None):
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx(pages, sub_ret=sub_ret, sub_info=sub_info)
+        eng._ctx = ctx
+        return eng, ctx
+
+    def test_happy_path_swaps_state(self):
+        eng, ctx = self._setup_eng([(RET_OK, kline_df(HIST_ROWS), None)])
+        statuses, errors, history = [], [], []
+        eng.status.connect(statuses.append)
+        eng.error.connect(errors.append)
+        eng.history_ready.connect(history.append)
+        old_state = eng.state
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        # 1) unsubscribe 舊 → 2) fetch 新 code/ktype → 3) subscribe 新
+        assert ctx.unsubscribed == (["HK.HSImain"], [SubType.QUOTE])
+        call = ctx.kline_calls[0]
+        assert call["code"] == "US.AAPL" and call["ktype"] is _KLTYPE_MAP["K_5M"]
+        assert ctx.subscribed == (["US.AAPL"], [SubType.QUOTE])
+        # state swap：新 aggregator + anchor（seed 最後一根 bar 日期）
+        st = eng.state
+        assert st is not old_state
+        assert (st.code, st.kline_type) == ("US.AAPL", "K_5M")
+        assert st.anchor_date == date(2026, 9, 30)
+        assert len(st.aggregator.bars()) == 2
+        # signals：history_ready 新 snapshot + status 切換成功（test thread → 同步遞送）
+        assert not errors and len(history) == 1 and len(history[0]) == 2
+        assert any("切換成功" in s for s in statuses)
+
+    def test_no_history_rolls_back(self):
+        eng, ctx = self._setup_eng([(RET_OK, kline_df([]), None)])
+        errors, history = [], []
+        eng.error.connect(errors.append)
+        eng.history_ready.connect(history.append)
+        old_state = eng.state
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        assert any("冇歷史數據" in e for e in errors)
+        assert not history
+        assert eng.state is old_state  # state 未 swap，圖表保持 live
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # rollback resubscribe 舊
+
+    def test_fetch_failure_rolls_back(self):
+        eng, ctx = self._setup_eng([(-1, "kline err", None)])
+        errors = []
+        eng.error.connect(errors.append)
+        old_state = eng.state
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        assert any("切換失敗" in e and "request_history_kline" in e for e in errors)
+        assert eng.state is old_state
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # resubscribe 舊
+
+    def test_subscribe_failure_rolls_back(self):
+        eng, ctx = self._setup_eng(
+            [(RET_OK, kline_df(HIST_ROWS), None)], sub_ret=-1, sub_info="no permission")
+        errors = []
+        eng.error.connect(errors.append)
+        old_state = eng.state
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        assert any("subscribe US.AAPL 失敗" in e for e in errors)
+        assert eng.state is old_state  # subscribe 失敗 → 唔 swap
+        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # 最後一次係 rollback
+
+    def test_unsubscribe_failure_does_not_block(self):
+        """unsubscribe 失敗唔阻切換（in-flight push 由 handler code filter 兜底）。"""
+        eng, ctx = self._setup_eng([(RET_OK, kline_df(HIST_ROWS), None)])
+
+        def bad_unsub(codes, sub_types):
+            return -1, "err"
+
+        ctx.unsubscribe = bad_unsub
+        errors = []
+        eng.error.connect(errors.append)
+        eng._reconfigure("US.AAPL", "K_5M")
+        assert not errors and eng.state.code == "US.AAPL"
+
+    def test_closed_suppresses_signals(self):
+        """stop() 後（_closed）worker 完成 → swap 照做但唔 emit。"""
+        eng, ctx = self._setup_eng([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._closed = True
+        statuses, history = [], []
+        eng.status.connect(statuses.append)
+        eng.history_ready.connect(history.append)
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        assert not statuses and not history
+
+
+# ---------------------------------------------------------------- switch 真線程（guard / lifecycle）
+
+class TestSwitchThreaded:
+    def test_guard_rejects_concurrent_switch(self):
+        """第一單切換進行中 → 第二單 reject；完成後 state 已 swap。"""
+        eng = make_engine(history_count=2)
+        ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx
+        statuses = []
+        eng.status.connect(statuses.append)
+
+        eng.switch(code="US.AAPL", kline_type="K_5M")
+        assert wait_until(lambda: ctx.gate_waited)  # worker 行到 subscribe（gate 住）
+        eng.switch(code="HK.00700", kline_type="K_1M")  # → reject
+        assert any("切換進行中" in s for s in statuses)  # switch() 喺 test thread → 同步遞送
+
+        ctx.gate.set()
+        assert wait_until(lambda: not eng._switching)
+        assert (eng.state.code, eng.state.kline_type) == ("US.AAPL", "K_5M")
+        eng.stop()
+
+    def test_code_normalized_to_upper(self):
+        """小寫輸入 → upper 後 fetch/subscribe/state 全部用正規格式。"""
+        eng = make_engine(history_count=2)
+        ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx
+
+        eng.switch(code="hk.00700", kline_type="k_5m")
+        assert wait_until(lambda: ctx.gate_waited)
+        ctx.gate.set()
+        assert wait_until(lambda: not eng._switching)
+        assert (eng.state.code, eng.state.kline_type) == ("HK.00700", "K_5M")
+        assert ctx.subscribed == (["HK.00700"], [SubType.QUOTE])
+        eng.stop()
+
+    def test_switch_rejected_while_setup_running(self, monkeypatch):
+        """setup thread 未收工（alive）→ switch reject + status 提示。"""
+        eng = FutuEngine()
+        ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        eng.start(make_cfg(history_count=2))
+        assert wait_until(lambda: ctx.gate_waited)  # setup thread 阻塞喺 subscribe（alive）
+
+        statuses = []
+        eng.status.connect(statuses.append)
+        eng.switch(code="US.AAPL", kline_type="K_5M")
+        assert any("連線中" in s for s in statuses)
+        assert not eng._switching  # 冇 spawn worker
+
+        ctx.gate.set()
+        eng.stop()
+
+
 # ---------------------------------------------------------------- start/stop lifecycle（真線程 + Event 同步）
 
 class TestStartStop:
@@ -371,19 +701,10 @@ class TestStartStop:
         eng.stop()  # idempotent
 
     def test_start_twice_noop(self, monkeypatch):
-        gate = threading.Event()
         connected = threading.Event()
         calls = []
 
-        class GatedCtx(FakeCtx):
-            def subscribe(self, codes, sub_types):  # gate 住令 setup thread 保持 alive
-                if not self.gate_waited:
-                    self.gate_waited = True
-                    gate.wait(timeout=10)
-                return super().subscribe(codes, sub_types)
-
-        gated = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
-        gated.gate_waited = False
+        gated = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])  # subscribe gate 住令 setup thread alive
 
         def factory(h, p):
             connected.set()
@@ -395,7 +716,7 @@ class TestStartStop:
         eng.start(make_cfg(history_count=2))
         assert connected.wait(5)  # worker thread 已入 _setup（alive）
         eng.start(make_cfg())     # 第二次 → early return
-        gate.set()                # 釋放 subscribe
+        gated.gate.set()          # 釋放 subscribe
         assert gated.subscribe_event.wait(5)
         eng.stop()
         assert len(calls) == 1

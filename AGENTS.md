@@ -98,9 +98,11 @@
 *   **【問題/限制】**：`subscribe()` 成功時第二個返回值係 **None**（唔係 sub info）。
 *   **【解決/避坑方案】**：只檢查 ret code；失敗時第二返回值先至係錯誤訊息 string。
 *   **【問題/限制】**：live QUOTE push 嘅 `data_time` 係 **time-only** string `'HH:mm:ss.SSS'`（無日期）。
-*   **【解決/避坑方案】**：engine 補 date = max(anchor, today)；anchor = seed 最後一根歷史 bar 嘅日期（處理夜期跨午夜 + clock skew），見 `timeutil.resolve_tick_datetime()`。
+*   **【解決/避坑方案】**：engine 補 date = max(anchor, market_today)；anchor = seed 最後一根歷史 bar 嘅日期（處理夜期跨午夜 + clock skew）；market_today 用**市場自己時區**（zoneinfo，HK=Asia/Hong_Kong / US=America/New_York）計算——美股喺 HKT 機上「今日」會同 machine-local 差一日。見 `engine/futu_engine.py` `_fallback_date()`。
 *   **【問題/限制】**（2026-09-30 live smoke 實測）：HK.HSImain 夜期最後一根 bar label 係 `03:00`（即交易去到 ~04:00 先收）；07:43–07:44 之間 tick 數 = 0——**非交易時段冇報價係正常現象**。
 *   **【解決/避坑方案】**：除錯「實時唔更新」時，先核對當前時間有冇喺交易時段內（日市 09:15 預開市 / 09:30 開市），唔好誤判做訂閱 bug。
+*   **【問題/限制】**（2026-09-30 live smoke 實測）：`unsubscribe()` 喺**訂閱後未滿 1 分鐘**會失敗，錯誤訊息「Basic訂閱時間過短，至少需要订阅1分钟」——快速連續切換標的必中。
+*   **【解決/避坑方案】**：unsubscribe 失敗**唔好阻切換**（log warning 繼續行）；舊標的嘅 in-flight / 殘留 push 由 handler per-row code filter（`row.code != state.code → skip`）兜底，見 `engine/futu_engine.py` `_reconfigure()`。
 
 #### 3. 🥇 PySide6 pyqtSignal 跨線程遞送語義（2026-09-30 probe 驗證）
 *   **【問題/限制】**：由非 GUI thread emit signal → plain Python callable **唔會同步收到**（AutoConnection queue 咗，要 event loop 先 drain）。

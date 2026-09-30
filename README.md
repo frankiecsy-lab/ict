@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 1 | **運行時切換標的與 K 線週期**：頂部 control bar（標的編號輸入欄 `HK.XXXXX`/`US.XXX` + 週期 combo，returnPressed / activated → `engine.switch()`）；engine 重構為 immutable `_State(agg, code, kline_type, anchor)` reference——switch worker thread 做 unsubscribe → fetch+seed → subscribe，**全部驗證通過先 atomic swap**，任何失敗 rollback（resubscribe 舊標的、圖表保持 live）；handler per-row code filter + emit 前 identity check 兜底 in-flight push；time-only tick fallback date 改用**市場時區**（zoneinfo：HK=Asia/Hong_Kong / US=America/New_York——美股喺 HKT 機上「今日」差一日）；`config.py` 公開 `KLINE_TYPES` + `kline_period_minutes()`。24 項新/改單測（全套 **160 passed**）+ live smoke：真 OpenD 實切 HK.HSImain K_1M → hk.00700 K_5M（小寫自動 normalize）成功、300 bars、乾淨斷線；實測發現 `unsubscribe()` 訂閱未滿 1 分鐘會失敗→已入 AGENTS.md 知識庫 |
 | 2026-09-30 | Step 1 · Commit 5（**Step 1 完成**） | 新增 `main.py` 入口：`Config.from_env()`（未知 KLINE_TYPE → stderr 報錯 exit(1)）→ QApplication + MainWindow `showFullScreen()`；SIGINT（Ctrl+C）排程 `app.quit()` 行完 event loop 先收；`exec()` 返回後 finally `window.shutdown()` clean stop。新增 `.env.example` 配置範本。**Live smoke test 實測通過**：offscreen 連真 OpenD → `history_ready` 300 根（夜期數據至 2026-09-30 03:00）→ QUOTE 訂閱成功 → close 乾淨斷線。全套 **136 passed** |
 | 2026-09-30 | Step 1 · Commit 4 | 新增全屏幕深色主題蠟燭圖表 UI：`ui/candle_chart.py`（純 QPainter、零第三方圖表庫——蠟燭 + volume subpane + nice-step grid/右軸 price label + last-price dashed line 同右軸 tag + crosshair OHLCV readout；backpressure = immutable snapshot + singleShot `QTimer(30ms)` coalesce repaint，tick burst 最多 ~30fps；`add_overlay()` 預留 ICT FVG / Order Block / Kill Zone 擴展點）+ `ui/main_window.py`（F11 全屏幕切換 / Esc 關閉、engine signal → chart 接線、深色主題跟 `.env` 配色）。20 項新單測全過（全套 **136 passed**）。剩餘：main.py 整合 |
 | 2026-09-30 | Step 1 · Commit 3 | 新增富途行情引擎 `engine/futu_engine.py`：OpenD setup daemon thread + `request_history_kline` 明確窗口分頁 seed + QUOTE 訂閱 `_QuoteHandler.on_recv_rsp` 實時回調聚合（pyqtSignal 跨線程 immutable snapshot）；`timeutil` 加 `parse_time_only` / `resolve_tick_datetime`（time-only tick 補 date）/ `history_window`。55 項新單測全過（全套 **116 passed**）。剩餘：全屏幕圖表 UI → main.py 整合 |
@@ -19,12 +20,17 @@
 - [x] Commit 4：`ui/main_window.py` + `ui/candle_chart.py`（全屏幕深色主題蠟燭圖、volume subpane、crosshair、overlay hook）
 - [x] Commit 5：`main.py` 入口 + `.env.example` + live smoke test
 
-### 下一步（Step 2 候選，未定範圍）
-- ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
+### Step 2 進度（運行時切換）
+- [x] Commit 1：control bar + `engine.switch()` / `_reconfigure()` / rollback + `_State` atomic swap + 市場時區 fallback date
 
-## Features（Step 1 目標）
+### 下一步（Step 2 後續候選，未定範圍）
+- ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
+- 切換歷史記錄 / 多標的並排顯示（視需要）
+
+## Features（Step 1 + Step 2）
 
 - **全屏幕終端**：PySide6/Qt6 全屏幕窗口，F11 切換全屏幕，Esc 關閉。
+- **運行時切換標的與週期**：頂部 control bar 輸入股票編號（`HK.XXXXX` / `US.XXX`，格式校驗 + 自動 upper）+ K 線週期 combo（9 種），Enter / 選單即切——engine worker thread 做 unsubscribe → fetch+seed → subscribe，全部驗證通過先 swap；失敗自動 rollback 返舊標的（圖表唔會斷）。
 - **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 300 根。
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
 - **紅漲綠跌（港股慣例）**：`.env` 可切 `CONVENTION=INTL`（綠漲紅跌）或用 `COLOR_UP` / `COLOR_DOWN` 手動 override。
@@ -38,10 +44,10 @@
 ```
 D:\coding\ICT_v1\
 ├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown
-├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import
-├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合）
-├─ ui\                         # ✅ main_window / candle_chart（純 QPainter；backpressure coalesce repaint；add_overlay 擴展點）
-├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線）；test_candle_chart.py ✅（20 項純 layout 函數單測，零 Qt app 依賴）
+├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()
+├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換）
+├─ ui\                         # ✅ main_window（control bar：標的輸入欄 + 週期 combo → engine.switch()）/ candle_chart（純 QPainter；backpressure coalesce repaint；add_overlay 擴展點）
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz）；test_candle_chart.py ✅（20 項純 layout 函數單測，零 Qt app 依賴）
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env）
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
@@ -49,17 +55,28 @@ D:\coding\ICT_v1\
 
 ### Threading & Signal 模型
 
-- futu-api **每個 context 只有一條 callback thread** → `on_recv_rsp` 必須快，唔好做重活/阻塞。
+- futu-api **每個 context 只有一條 callback thread** → `on_recv_rsp` 必須快，唔做重活/阻塞。
 - `request_history_kline` 係同步阻塞 → 放獨立 setup daemon thread（唔係 GUI thread）。
+- **運行時切換**：`switch()` 每次 spawn 一個 daemon worker thread 跑 `_reconfigure()`（unsubscribe → fetch+seed → subscribe）；`stop()` join 晒所有 worker。
 - **聚合喺 callback thread 做**；GUI 只負責 render。跨線程傳 **immutable tuple-of-tuples snapshot**（bar = `(time_key, open, high, low, close, volume)`），經 `pyqtSignal` queued 過 GUI——無共享可變狀態、無鎖。
 - **Backpressure**：chart widget 用 dirty flag + singleShot `QTimer(30ms)` coalesce repaint → tick burst 都最多 ~30fps redraw，永遠 render 最新 snapshot。
+
+### 運行時切換一致性（`_State` atomic swap）
+
+Engine 只持一個 immutable `_State(aggregator, code, kline_type, anchor_date)` reference；切換 = 一次過 swap reference：
+
+1. worker **先驗證後 swap**：fetch 失敗 / seed 0 根 / subscribe 失敗 → rollback（resubscribe 舊標的 + error signal），state 保持唔變、圖表繼續 live。
+2. handler 每 batch load 一次 state + per-row `row.code != state.code → skip`——unsubscribe **唔係硬停**（OpenD 實測：訂閱未滿 1 分鐘 unsubscribe 會失敗），in-flight / 殘留 push 一律 filter 掉。
+3. emit 前 identity check（`state is eng._state`）→ batch 中途 state 被 swap 走，呢批 discard，唔會用舊 aggregator 嘅 snapshot 覆蓋新圖。
+4. `switch()` guard：setup/switch 進行中 → reject + status 提示；校驗（code 格式 `^(HK|US)\.\w+$`、週期名）失敗 → error signal。
 
 ### 歷史 K 線取得（實測驗證行為）
 
 - **必須明確窗口**：`request_history_kline` 唔帶 start/end 對 HK.HSImain 會返回一年前舊數據 → `history_window()` 用 now() 計算保守窗口（覆蓋夜期 ~834 min/日）。
 - **返回頭 N 根而非最近 N 根**：window + max_count 返回時間序頭 N 根 → `page_req_key` 分頁攞晒（1000 根/頁）再 tail `history_count` 根。
 - **按欄位名提取**：DataFrame 欄位順序係 open/close/high/low（唔係 OHLC）→ 一律 `df[["time_key","open","high","low","close","volume"]]`。
-- **Live tick data_time 係 time-only**（'HH:mm:ss.SSS'，無日期）→ `resolve_tick_datetime()` 補 date = max(anchor, today)；anchor = seed 最後一根 bar 嘅日期（處理夜期跨午夜 + clock skew）。
+- **Live tick data_time 係 time-only**（'HH:mm:ss.SSS'，無日期）→ `resolve_tick_datetime()` 補 date = max(anchor, market_today)；anchor = seed 最後一根 bar 嘅日期（處理夜期跨午夜 + clock skew）；market_today 用 `_fallback_date()` 以**市場自己時區**（zoneinfo：HK=Asia/Hong_Kong / US=America/New_York，未知 prefix 回落 HK）計算——美股喺 HKT 機上「今日」會同 machine-local 差一日。
+- **`unsubscribe()` 訂閱未滿 1 分鐘會失敗**（實測錯誤訊息「Basic訂閱時間過短」）→ 切換流程唔阻擋，殘留 push 由 handler code filter 兜底（見上節）。
 
 ### 時區鐵律
 

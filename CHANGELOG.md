@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## [Unreleased] Step 2（2026-09-30）——運行時切換標的與 K 線週期
+
+### Added
+- （2026-09-30）`engine/futu_engine.py` 重構為 **immutable `_State(aggregator, code, kline_type, anchor_date)` reference**：engine 只持一個 state reference，切換 = atomic swap。新增 `switch(code, kline_type)`（校驗 code 格式 `^(HK|US)\.\w+$` + 週期名、guard setup/switch 進行中 → reject）+ `_reconfigure()` worker thread（unsubscribe 舊 → fetch+seed 新 → subscribe 新，**全部驗證通過先 swap**；任何失敗 `_rollback()` resubscribe 舊標的 + error signal，圖表保持 live）。
+- （2026-09-30）handler 切換一致性：每 batch load 一次 state + per-row `row.code != state.code → skip`（unsubscribe 唔係硬停——OpenD 實測訂閱未滿 1 分鐘 unsubscribe 會失敗「Basic訂閱時間過短」，殘留 push 由 code filter 兜底）+ emit 前 identity check（batch 中途 swap → 呢批 discard）。
+- （2026-09-30）time-only tick fallback date 升級為**市場時區感知**：`_fallback_date()` 用 zoneinfo（HK=Asia/Hong_Kong / US=America/New_York，未知 prefix 回落 HK；tzdata 缺失回落 machine-local）——美股喺 HKT 機上「今日」會同 machine-local 差一日。
+- （2026-09-30）`config.py` 公開 `KLINE_TYPES`（tuple，insertion order = UI 顯示順序）+ `kline_period_minutes()` helper，UI combo / engine 校驗共用同一事實來源。
+- （2026-09-30）`ui/main_window.py` 頂部 **control bar**：標的編號輸入欄（placeholder `HK.00700 / US.AAPL`、預設填 `.env` TRADING_CODE）+ K 線週期 combo（9 種，先 set items/index 再 connect 避免初始觸發 switch）；returnPressed / activated → `_do_switch()` 一次傳齊兩個值 → `engine.switch()`。深色主題跟 `.env` 配色；0 margin/spacing 保持全屏幕感。
+- （2026-09-30）`tests/test_futu_engine.py` 遷移到 `_State` 架構 + 新增覆蓋：code filter（in-flight 舊標的 skip / mid-batch swap discard / state None 靜默）、`_fallback_date` 市場時區 7 項（含 NY 前一日 instant-based fake clock、tzdata 缺失 fallback）、switch 校驗 4 項、`_reconfigure` happy path + 3 種 rollback + unsubscribe 失敗唔阻擋 + closed 抑制 emit、真線程 guard（concurrent reject / 小寫 normalize / setup 進行中 reject）；全套 **160 passed**（+24）。
+- （2026-09-30）**Live smoke test 實測通過**（offscreen + 真 OpenD `127.0.0.1:11111`）：HK.HSImain K_1M → `hk.00700` K_5M（小寫輸入自動 upper normalize）運行時切換成功——state swap、anchor=2026-09-30、300 bars；格式錯誤校驗（`AAPL` → error signal）正確；`stop()` 乾淨斷線（CallClose）。實測發現 `unsubscribe()` 訂閱未滿 1 分鐘失敗限制 → 已入 AGENTS.md 知識庫。
+
+### Next
+- Step 2 後續候選：ICT 指標 overlay（FVG / Order Block / Kill Zone）、切換歷史記錄、多標的並排顯示
+
 ## [Unreleased] Step 1（2026-09-29）
 
 ### Added
@@ -22,4 +36,4 @@
 - （2026-09-30）**Live smoke test 實測通過**（offscreen QApplication + 真 OpenD `127.0.0.1:11111`）：連線成功 → `history_ready` 300 根（HK.HSImain K_1M，夜期數據 `2026-09-29 22:01`→`2026-09-30 03:00`）→ QUOTE 訂閱成功 → `stop()` 乾淨斷線（CallClose）。全套 **136 passed**，**Step 1 完成**。
 
 ### Next
-- Step 2（候選，未定範圍）：ICT 指標 overlay——經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
+- （已完成）Step 2 · Commit 1：運行時切換標的與 K 線週期 → 見上方 [Unreleased] Step 2

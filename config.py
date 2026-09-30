@@ -25,6 +25,14 @@ _KLINE_PERIOD_MINUTES = {
     "K_MON": 30 * 24 * 60,
 }
 
+# 公開：UI combo / engine 校驗共用（insertion order = 顯示順序）
+KLINE_TYPES: tuple[str, ...] = tuple(_KLINE_PERIOD_MINUTES)
+
+
+def kline_period_minutes(ktype: str) -> int | None:
+    """K 線週期名 → 分鐘數；未知返回 None。"""
+    return _KLINE_PERIOD_MINUTES.get(ktype)
+
 # 蠟燭顏色慣例：HK=紅漲綠跌 / INTL=綠漲紅跌
 _CONVENTION_COLORS = {
     "HK": {"up": "#F23645", "down": "#089981"},
