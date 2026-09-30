@@ -106,4 +106,9 @@
 *   **【正確資源】**：https://futunn.com
 *   **【備註說明】**：此網址**僅作為輔助參考與功能對照用途**。當開發港量（HKQuant）相關功能遇到邏輯不清晰（例如：搶行情權限、特定 K 線參數、到價提醒回呼函式）時，可閱此官方文件的底層邏輯進行代碼設計。
 
+#### 2. 🥉 PySide6/Qt：QStandardItem Display/Edit role 耦合（無法雙 role）
+*   **【問題/限制】**：喺本專案嘅 PySide6 6.11.2 / Qt6 版本，`QStandardItem` **唔支持獨立嘅 `DisplayRole` 同 `EditRole`**——兩者係耦合嘅，最後 set 嗰個 role 會連帶覆蓋另一個。實測：constructor 設 full text 再 `setData(code, EditRole)` → Display/Edit 都變 code；反之先 `setData(EditRole)` 再 `setData(DisplayRole)=full` → 兩個都變 full。所以「dropdown popup 顯示完整名稱、輸入欄只寫入 code」嘅雙 role 方案**行唔通**。
+*   **【正確資源】**：PySide6 / Qt `QStandardItemModel` 官方文檔（role 機制）；本專案實測 probe（offscreen）。
+*   **【解決/避坑方案】**：要「dropdown 顯示 A、輸入欄寫入 B」時，**唔好靠 model role**——model item 用完整顯示字串（dropdown 顯示），喺 `QCompleter.activated` handler 內用純函數還原目標字串後 `setText()` 強制覆蓋。本專案即係 `ui/stock_completer.py::code_from_completion(text, mapping)`：mapping hit → canonical code、miss → 取 display_text 第一 whitespace token（code 永遠係第一 token）兜底，`_on_code_activated` 一律 `setText(code)`。另注意：offscreen QPA **無法驅動 completer popup 嘅鍵盤/滑鼠選中**（`setCompletion()` 喺 PySide6 未 expose、`activated.overloads()` 亦唔可用），所以「選中後寫入輸入欄」呢條路徑只能靠純邏輯 + handler 強制覆蓋保證，唔好期望 offscreen 實測到。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*

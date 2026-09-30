@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineE
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
 from .candle_chart import CandleChart
-from .stock_completer import StockCompleter
+from .stock_completer import StockCompleter, code_from_completion
 
 
 class MainWindow(QMainWindow):
@@ -129,8 +129,13 @@ class MainWindow(QMainWindow):
         self._code_by_text = self._completer.set_catalog(tuple(entries))
 
     def _on_code_activated(self, text: str) -> None:
-        """Dropdown 選中一行 → 用嚴格大小寫 canonical code switch（保留當前週期）。"""
-        code = self._code_by_text.get(text)
+        """Dropdown 選中一行 → 輸入欄只留 code（名稱唔入 TEXT FIELD）→ switch。
+
+        `code_from_completion()` 由 mapping 還原嚴格大小寫 canonical code；mapping miss 時取
+        display_text 第一 token（code 永遠係第一 whitespace token）兜底——確保任何路徑下輸入欄
+        都只出現 code，唔會殘留 dropdown 顯示嘅中英文名。
+        """
+        code = code_from_completion(text, self._code_by_text)
         if not code:
             return
         self.code_edit.setText(code)

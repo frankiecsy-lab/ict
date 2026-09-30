@@ -21,6 +21,7 @@
 - （2026-09-30）新單測：`TestFetchCatalog` 8 項斷言更新為 3 seeds；全套 **205 passed**。
 
 ### Fixed
+- （2026-09-30）**輸入欄 TEXT FIELD 只留 code（名稱唔入輸入欄）**：dropdown popup 繼續顯示完整 `display_text`（code + 中英文名），但選中後輸入欄會殘留 dropdown 顯示嘅字串（含名稱）。新增純函數 `ui/stock_completer.py::code_from_completion(text, mapping)`——mapping hit → 嚴格大小寫 canonical code、miss → 取 display_text 第一 whitespace token（`display_text()` 格式 code 永遠係第一 token）兜底；`_on_code_activated` 一律經佢還原後 `setText(code)` 強制覆蓋，確保任何路徑下輸入欄都只出現 code。**實測限制**：QStandardItem 喺呢個 PySide6/Qt 版本 **Display/Edit role 係耦合嘅**（設 EditRole 會連帶改 DisplayRole，無法用雙 role 分開 dropdown 顯示同輸入欄字串）→ 改用 handler 強制覆蓋方案。2 項新單測（全套 **207 passed**）。
 - （2026-09-30）**主力連續合約代碼大小寫敏感 bug**（live 使用發現）：`switch()` 嘅 `.strip().upper()` 會將 `hk.hsimain` 變 `HK.HSIMAIN`，OpenD 拒收（「未知股票 HSIMAIN」）→ 新增 `_CODE_ALIASES` + `_normalize_code()`（upper 後映返正規形式），switch 路徑同啟動 `.env` code 路徑一致應用；5 項新單測（全套 **165 passed**）。限制已入 AGENTS.md 知識庫。
 
 ### Next
