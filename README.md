@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 7 | **歷史 K 線預設深度 300 → 1000 根**：`config.py` `history_count` dataclass default + `from_env()` fallback、`.env.example` `HISTORY_COUNT=1000` 同步更新；seed 分頁邏輯（page_req_key 1000 根/頁）天然支援——1000 根通常單頁即返。全套 **222 passed** |
 | 2026-09-30 | Step 2 · Commit 6 | **輸入欄 onChange guard：代碼同名稱永唔會同時入欄**（live 使用發現：popup 開住撳 Enter，completer `setCompletion()` 會喺 `activated` signal **之前**將完整 display_text「code + 名稱」寫入 TEXT FIELD）：新增 `_on_code_text_changed()`（接 `textChanged`）——欄位一出現空白（= code + 名稱混入）即刻取第一 whitespace token 剝離返純 code，`blockSignals` 避免多餘 round-trip、無空白再觸發自然 no-op 唔死循環；任何路徑（手動輸入 / dropdown Enter / activated）下欄位都只持有純編號。移除 `_do_switch()` 嘅含空白拒絕門（guard 已確保欄位永遠無空白，變死代碼）。3 項新單測（全套 **222 passed**） |
 | 2026-09-30 | Step 2 · Commit 5 | **輸入欄只收純編號 + 存在性驗證 + 獨立名稱 LABEL**：(1) `_do_switch()` 新增兩道門——含空白（混入股票名稱，例「HK.00700 騰訊」）即拒絕；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號 → status bar 報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。(2) control bar 新增獨立 `QLabel` 名稱欄——經新純函數 `engine/stock_catalog.py::name_text()`（中文名 + 英文名，空欄位略過）顯示當前標的嘅中英文名，目錄載入 / dropdown 選中 / 手動切換時同步更新；**名稱永不入 TEXT FIELD**。12 項新單測（`test_main_window.py` offscreen Qt + fake engine、`name_text` ×4、`StockCompleter.catalog()` accessor）全套 **219 passed** |
 | 2026-09-30 | Step 2 · Commit 4 | **輸入欄 TEXT FIELD 只留 code（名稱唔入輸入欄）**：dropdown popup 繼續顯示完整 `display_text`（code + 中英文名），選中後經新增純函數 `ui/stock_completer.py::code_from_completion()` 還原嚴格大小寫 canonical code——mapping hit → canonical、miss → 取 display_text 第一 whitespace token（code 永遠係第一 token）兜底；`_on_code_activated` 一律 `setText(code)` 強制覆蓋，確保任何路徑下輸入欄都只出現 code。實測發現 QStandardItem 喺呢個 PySide6/Qt 版本 **Display/Edit role 耦合**（設 EditRole 會連帶改 DisplayRole）→ 無法用雙 role 分開 dropdown 顯示同輸入欄字串，故改用 handler 強制覆蓋方案。2 項新單測（全套 **207 passed**） |
@@ -33,6 +34,7 @@
 - [x] Commit 4：輸入欄 TEXT FIELD 只留 code——dropdown 顯示完整 `display_text`，選中後經 `code_from_completion()` 還原 canonical code 強制覆蓋（QStandardItem Display/Edit role 耦合 → 無法雙 role）
 - [x] Commit 5：輸入欄**只收純編號 + 存在性驗證**（含空白/名稱即拒絕；目錄載入後 `canonical_code()` 驗證存在 + 正規化大小寫，未知編號報錯唔切換）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名，名稱永不入輸入欄）
 - [x] Commit 6：輸入欄 **onChange guard**——`textChanged` handler 即刻剝離「code + 名稱」返純 code（completer `setCompletion()` 喺 activated 前寫完整 display_text 嘅路徑），代碼同名稱永唔會同時入欄
+- [x] Commit 7：歷史 K 線預設深度 **300 → 1000 根**（`config.py` default + `.env.example`）
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -45,7 +47,7 @@
 - **輸入欄只收純編號 + 存在性驗證**：TEXT FIELD 永遠只持有純編號——**onChange guard**（`textChanged` handler）一偵測到欄位出現「code + 名稱」（含空白，例 completer `setCompletion()` 喺 activated 前寫入嘅完整 display_text）即刻剝離返第一 token 純 code；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號直接報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。
 - **獨立名稱 LABEL**：control bar 輸入欄旁嘅 `QLabel` 顯示當前標的嘅中英文名（新純函數 `name_text()`），目錄載入 / dropdown 選中 / 手動切換時同步更新——名稱永遠唔會入 TEXT FIELD。
 - **模糊輸入自動補全**：股票編號欄支持中英文名 + 簡體/繁體中文模糊匹配（例：`騰訊`、`AAPL`、`hsimain`），dropdown 結果 rank-based（精確 > prefix > substring > typo fuzzy）；**dropdown popup 顯示完整 `display_text`（code + 中英文名）**，選中後輸入欄 TEXT FIELD **只留 code**——經 `code_from_completion()` 還原嚴格大小寫 canonical code（mapping hit → canonical、miss → 第一 token 兜底），名稱唔會入輸入欄。目錄由 `get_stock_basicinfo`（HK+US，~17k 隻）載入，主力連續合約經 seed 補返。
-- **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 300 根。
+- **富途 K 線資料源**：本地 OpenD（預設 `127.0.0.1:11111`），預設標的 `HK.HSImain`（恒指期貨主連），預設週期 1 分鐘，歷史深度預設 1000 根。
 - **實時報價回調更新**：訂閱 QUOTE → `_QuoteHandler(StockQuoteHandlerBase).on_recv_rsp()`；tick 即時聚合入當前蠟燭（close=最新價、high/low=max/min、volume=日累計成交量 delta）。
 - **紅漲綠跌（港股慣例）**：`.env` 可切 `CONVENTION=INTL`（綠漲紅跌）或用 `COLOR_UP` / `COLOR_DOWN` 手動 override。
 - **深色主題圖表**：蠟燭 + last-price dashed line 同右軸 tag + OHLCV readout + volume subpane + crosshair。
@@ -133,7 +135,7 @@ python -m pytest tests/ -q
 | `FUTU_OPEND_PORT` | `11111` | OpenD 端口 |
 | `TRADING_CODE` | `HK.HSImain` | 交易標的（富途代碼格式） |
 | `KLINE_TYPE` | `K_1M` | K 線週期：`K_1M/K_3M/K_5M/K_15M/K_30M/K_60M/K_DAY/K_WEEK/K_MON`；未知值啟動時報錯 |
-| `HISTORY_COUNT` | `300` | 歷史 K 線根數（≥1） |
+| `HISTORY_COUNT` | `1000` | 歷史 K 線根數（≥1） |
 | `VISIBLE_BARS` | `120` | 圖表右 pin 顯示嘅蠟燭數（≥1） |
 | `CONVENTION` | `HK` | 蠟燭顏色慣例：`HK`=紅漲綠跌 / `INTL`=綠漲紅跌；未知值回落 HK |
 | `COLOR_UP` / `COLOR_DOWN` | （空=跟隨慣例） | 手動 override 色值，如 `#FF4D4F` |

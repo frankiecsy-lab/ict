@@ -75,7 +75,7 @@ class Config:
     # --- 行情 ---
     trading_code: str = "HK.HSImain"
     kline_type: str = "K_1M"
-    history_count: int = 300
+    history_count: int = 1000
 
     # --- 圖表顯示 ---
     visible_bars: int = 120
@@ -117,7 +117,7 @@ class Config:
             opend_port=_int("FUTU_OPEND_PORT", 11111),
             trading_code=_str("TRADING_CODE", "HK.HSImain"),
             kline_type=kline_type,
-            history_count=max(1, _int("HISTORY_COUNT", 300)),
+            history_count=max(1, _int("HISTORY_COUNT", 1000)),
             visible_bars=max(1, _int("VISIBLE_BARS", 120)),
             convention=convention,
             color_up=_str("COLOR_UP", "") or None,

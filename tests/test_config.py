@@ -35,7 +35,7 @@ def test_defaults(tmp_path):
     assert cfg.trading_code == "HK.HSImain"
     assert cfg.kline_type == "K_1M"
     assert cfg.period_minutes == 1
-    assert cfg.history_count == 300
+    assert cfg.history_count == 1000
     assert cfg.visible_bars == 120
     assert cfg.convention == "HK"
     assert cfg.color_up is None

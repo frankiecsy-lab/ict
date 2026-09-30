@@ -3,6 +3,7 @@
 ## [Unreleased] Step 2（2026-09-30）——運行時切換標的與 K 線週期 + 股票編號模糊自動補全
 
 ### Added
+- （2026-09-30）**歷史 K 線預設深度 300 → 1000 根**：`config.py` `history_count` dataclass default + `from_env()` fallback、`.env.example` `HISTORY_COUNT=1000` 同步更新。seed 分頁邏輯（page_req_key 1000 根/頁）天然支援——1000 根通常單頁即返；`test_config.py::test_defaults` 斷言同步。全套 **222 passed**。
 - （2026-09-30）`engine/futu_engine.py` 重構為 **immutable `_State(aggregator, code, kline_type, anchor_date)` reference**：engine 只持一個 state reference，切換 = atomic swap。新增 `switch(code, kline_type)`（校驗 code 格式 `^(HK|US)\.\w+$` + 週期名、guard setup/switch 進行中 → reject）+ `_reconfigure()` worker thread（unsubscribe 舊 → fetch+seed 新 → subscribe 新，**全部驗證通過先 swap**；任何失敗 `_rollback()` resubscribe 舊標的 + error signal，圖表保持 live）。
 - （2026-09-30）handler 切換一致性：每 batch load 一次 state + per-row `row.code != state.code → skip`（unsubscribe 唔係硬停——OpenD 實測訂閱未滿 1 分鐘 unsubscribe 會失敗「Basic訂閱時間過短」，殘留 push 由 code filter 兜底）+ emit 前 identity check（batch 中途 swap → 呢批 discard）。
 - （2026-09-30）time-only tick fallback date 升級為**市場時區感知**：`_fallback_date()` 用 zoneinfo（HK=Asia/Hong_Kong / US=America/New_York，未知 prefix 回落 HK；tzdata 缺失回落 machine-local）——美股喺 HKT 機上「今日」會同 machine-local 差一日。
