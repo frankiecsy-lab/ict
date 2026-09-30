@@ -116,4 +116,9 @@
 *   **【正確資源】**：Qt `QCompleter` 官方文檔（completion flow）；本專案 live 實測。
 *   **【解決/避坑方案】**：**加 onChange guard**——接 QLineEdit `textChanged`，欄位一出現空白字符（= code + 名稱混入）即刻取第一 whitespace token 剝離返純 code。本專案即係 `ui/main_window.py::_on_code_text_changed()`：`blockSignals(True)` 包 `setText(code)` 避免多餘 round-trip；剝離後無空白 → 再觸發嘅 textChanged 自然 no-op，**唔會死循環**。呢個 guard 兜晒所有寫入路徑（手動輸入 / dropdown Enter / activated），比淨係靠 activated handler 強制覆蓋更穩。注意：guard 用 `textChanged`（唔係 `textEdited`）——`textEdited` 只捕獲用戶鍵盤輸入，捕唔到 completer 程序化 `setText()`；要攔截 completer 寫入必須用 `textChanged`。
 
+#### 4. 🥉 PySide6/Qt：`QPushButton.clicked` 有 `(bool checked)` 重載——直接 connect 可選參數方法會靜默綁定 bool 版（no-op bug）
+*   **【問題/限制】**：PySide6 6.11.2 / Qt6 嘅 `QAbstractButton.clicked` signal **同時 expose 兩個 overload**：無參數版同 `(bool checked)` 版。當 connect 嘅 Python slot 簽名「可以接受一個可選參數」（例如 `def zoom_in(self, steps: int = 1)`），PySide6 會綁定到 **`(bool checked)` 版**——click 時實際調用 `zoom_in(False)`，`steps=False` → `+False == 0` → guard `delta == 0` no-op。**表面完全冇報錯、signal 有 emit、方法有被 call，但行為係靜默無效**（本專案實測：offscreen probe 打 log 見到 `zoom_in called!` 但 `_view_count` 唔變）。
+*   **【正確資源】**：PySide6 signal overload 綁定機制；本專案 offscreen probe 實測（click → slot 收到 `False`）。
+*   **【解決/避坑方案】**：**用 lambda 包零參數調用**——`btn.clicked.connect(lambda: self.chart.zoom_in())`，lambda 無參數 → PySide6 只能綁定無參數 overload，永遠傳唔到 bool。本專案即係 `ui/main_window.py::_build_control_bar()` 嘅放大/縮小按鍵接線。通用規則：connect 任何**帶可選參數**嘅方法去 Qt signal 前，先確認該 signal 有冇多 overload（`clicked`、`activated`、`pressed` 等 button/completer signal 都有）；唔確定就一律 lambda 包零參數調用。另注意：offscreen QPA 下 `btn.click()` 可以正常驅動 signal（同 completer popup 唔同），所以呢類接線 bug **可以**用 offscreen widget 單測抓到——本專案即係 `tests/test_main_window.py::test_zoom_buttons_wired_to_chart`。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*

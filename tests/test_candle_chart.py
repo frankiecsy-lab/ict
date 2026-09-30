@@ -13,6 +13,7 @@ from ui.candle_chart import (
     visible_slice,
     visible_window,
     volume_max,
+    wheel_notches,
     zoom_x,
     zoom_y,
 )
@@ -91,6 +92,33 @@ class TestZoomX:
 
     def test_zero_delta_no_change(self):
         assert zoom_x(120, 30.0, 1000, 0.7, 0) == (120, 30.0)
+
+    def test_fractional_half_stage_zoom_in(self):
+        # delta=0.5 → count × 1.25^-0.5 ≈ ×0.8944 → round(89.44)=89（多段式小數 notch）
+        new_count, _off = zoom_x(100, 0.0, 1000, 0.5, 0.5)
+        assert new_count == 89
+
+    def test_fractional_half_stage_zoom_out(self):
+        # delta=-0.5 → count × 1.25^0.5 ≈ ×1.1180 → round(111.80)=112
+        new_count, _off = zoom_x(100, 0.0, 1000, 0.5, -0.5)
+        assert new_count == 112
+
+
+class TestWheelNotches:
+    def test_one_windows_notch_up_is_plus_one_stage(self):
+        # Windows 單 notch = +120° → +1 階（唔再係 1.25**120 直跳極限）
+        assert wheel_notches(120) == pytest.approx(1.0)
+
+    def test_one_windows_notch_down_is_minus_one_stage(self):
+        assert wheel_notches(-120) == pytest.approx(-1.0)
+
+    def test_fractional_delta_preserved(self):
+        # 部分裝置報半 notch（±60°）→ ±0.5 階，保留小數精度
+        assert wheel_notches(60) == pytest.approx(0.5)
+        assert wheel_notches(-240) == pytest.approx(-2.0)
+
+    def test_zero_angle_is_noop(self):
+        assert wheel_notches(0) == 0.0
 
 
 class TestPanX:

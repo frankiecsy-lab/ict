@@ -114,6 +114,18 @@ def test_catalog_ready_initializes_name_label(monkeypatch):
     assert win.name_label.text() == "恒指期货主连"
 
 
+def test_zoom_buttons_wired_to_chart(monkeypatch):
+    """control bar 放大/縮小按鍵 → chart 分步 X 軸縮放（每點擊一階 ×/÷1.25）。"""
+    win, _engine = _make_window(monkeypatch)
+    # 先餵數據（chart 無 bars 時 zoom no-op）
+    win.chart.update_bars(tuple((f"k{i}", 100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200)))
+    assert win.chart._view_count == 120  # Config 預設 visible_bars
+    win.zoom_in_btn.click()
+    assert win.chart._view_count == 96   # round(120 / 1.25)
+    win.zoom_out_btn.click()
+    assert win.chart._view_count == 120  # round-trip 還原
+
+
 def test_on_code_activated_sets_code_and_name(monkeypatch):
     """Dropdown 選中 → 輸入欄只留 canonical code + switch + 名稱 LABEL 同步。"""
     win, engine = _make_window(monkeypatch)

@@ -6,7 +6,10 @@ tick burst 都最多 ~30fps repaint，永遠 render 最新 snapshot。
 互動視圖狀態：X 軸 = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live 數據；
 Y 軸 = 手動價格範圍（None = auto-fit）。手勢：wheel = X 軸縮放（錨定游標）、
 Ctrl/Shift + wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、
-雙擊 = reset_view() 重置。
+雙擊 = reset_view() 重置。縮放係多段式：每個物理 wheel notch / 按鍵點擊 = 一階 ×/÷1.25
+（wheel_notches() 將 Windows ±120° angleDelta 正規化返 ±1 階——唔正規化會令單 notch
+直接跳去 min/max 極限，表現成「只有兩段」）；zoom_in()/zoom_out() 俾 control bar
+放大/縮小按鍵（中心錨定）。
 
 Overlay 擴展點：add_overlay(fn)；fn(painter, bars, price_rect) —— 預留俾日後
 ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
@@ -86,6 +89,16 @@ def fmt_price(p: float) -> str:
 _MIN_X_BARS = 5       # X 軸縮放下限（可見根數）
 _MAX_X_BARS = 2000    # X 軸縮放上限
 _Y_ZOOM_FLOOR = 1e-4  # Y 軸 span 下限（相對於當前 span，防退化範圍 / 除零爆炸）
+_WHEEL_NOTCH_DEG = 120.0  # Windows 標準 wheel 單 notch angleDelta.y() 幅度
+
+
+def wheel_notches(angle_delta_y: int) -> float:
+    """將原始 wheel angleDelta.y() 正規化成「階數」（每物理 notch ±1 階）。
+
+    Windows 每個物理 notch 報 ±120°；唔正規化會令單 notch 變 1.25**120 ≈ 3e13 →
+    X 軸縮放直接 clamp 去 min/max 極限（只達得到兩段）、Y 軸 span 無上限爆炸。
+    """
+    return float(angle_delta_y) / _WHEEL_NOTCH_DEG if angle_delta_y else 0.0
 
 
 def _clamp_offset(off: float, total_bars: int, count: int) -> float:
@@ -198,6 +211,22 @@ class CandleChart(QWidget):
         self._y_range = None
         self.update()
 
+    def zoom_in(self, steps: int = 1) -> None:
+        """放大 N 階（可見根數減少）；俾 control bar「放大」按鍵。每階 ×/÷1.25、中心錨定。"""
+        self._zoom_x_steps(+steps)
+
+    def zoom_out(self, steps: int = 1) -> None:
+        """縮小 N 階（可見根數增加）；俾 control bar「縮小」按鍵。每階 ×/÷1.25、中心錨定。"""
+        self._zoom_x_steps(-steps)
+
+    def _zoom_x_steps(self, delta: float) -> None:
+        """按鍵分步 X 軸縮放：無數據 / 零階 → no-op；anchor = plot 中心（f=0.5）。"""
+        if not self._bars or delta == 0:
+            return
+        self._view_count, self._right_offset = zoom_x(
+            self._view_count, self._right_offset, len(self._bars), 0.5, float(delta))
+        self.update()
+
     # ------------------------------------------------------------- geometry helpers
 
     def _panes(self):
@@ -225,14 +254,16 @@ class CandleChart(QWidget):
             return
         plot, price_r, _vol = self._panes()
         pos = event.position()
-        delta = event.angleDelta().y()
+        delta = wheel_notches(event.angleDelta().y())  # ±120°/notch → ±1 階（多段式縮放）
+        if delta == 0:
+            return
         if event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
-            # Y 軸縮放（游標錨定）：Ctrl/Shift + wheel
+            # Y 軸縮放（游標錨定）：Ctrl/Shift + wheel；每 notch 一階 ×/÷1.25
             rng = self._y_range or price_range(visible_window(self._bars, self._view_count, self._right_offset)) or (0.0, 1.0)
             f = (pos.y() - price_r.top()) / max(1e-9, price_r.height()) if price_r.contains(pos) else 0.5
             self._y_range = zoom_y(rng[0], rng[1], f, delta)
         else:
-            # X 軸縮放（游標錨定）：plain wheel
+            # X 軸縮放（游標錨定）：plain wheel；每 notch 一階 ×/÷1.25（多段式，唔再直跳極限）
             f = (pos.x() - plot.left()) / max(1e-9, plot.width()) if plot.contains(pos) else 0.5
             self._view_count, self._right_offset = zoom_x(self._view_count, self._right_offset, len(self._bars), f, delta)
         self.update()

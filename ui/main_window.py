@@ -6,7 +6,8 @@
   + **onChange guard**（`textChanged`：completer `setCompletion()` 會喺 activated 前將完整
     display_text「code + 名稱」寫入欄位 → handler 即刻剝離返純 code，欄位永不同時持有代碼同名稱）
   + 獨立名稱 LABEL（`name_text()`：中英文名顯示喺輸入欄外，名稱永不入 TEXT FIELD）+
-  K 線週期按鍵組（checkable + autoExclusive），returnPressed / 按鍵點擊 →
+  K 線週期按鍵組（checkable + autoExclusive）+ 右側**放大/縮小按鍵**（每點擊 = 一階 ×/÷1.25
+  分步 X 軸縮放，多段式唔再直跳 min/max 極限），returnPressed / 按鍵點擊 →
   engine.switch(code, kline_type) 運行時切換。
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
@@ -125,8 +126,19 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
 
+        # K 線放大/縮小按鍵（右側）：每點擊 = 一階 ×/÷1.25 分步 X 軸縮放（多段式，唔再直跳極限）
+        self.zoom_in_btn = QPushButton("放大")
+        self.zoom_out_btn = QPushButton("縮小")
+        for _b in (self.zoom_in_btn, self.zoom_out_btn):
+            _b.setCursor(Qt.CursorShape.PointingHandCursor)
+            h.addWidget(_b)
+
         self.code_edit.returnPressed.connect(self._do_switch)
         self._period_group.buttonClicked.connect(lambda _btn: self._do_switch())
+        # lambda 包零參數調用：PySide6 clicked 有 (bool checked) 重載，直接 connect 方法會綁定
+        # bool 版 → zoom_in(False) → steps=0 no-op（踩坑記錄見 AGENTS.md 附錄）
+        self.zoom_in_btn.clicked.connect(lambda: self.chart.zoom_in())
+        self.zoom_out_btn.clicked.connect(lambda: self.chart.zoom_out())
         return bar
 
     def current_period(self) -> str:
