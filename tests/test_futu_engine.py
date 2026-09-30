@@ -31,6 +31,16 @@ def make_cfg(**overrides) -> Config:
     return Config(**base)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_subscription_db(tmp_path, monkeypatch):
+    """每個測試用獨立臨時 SQLite 帳本：避免污染專案根目錄 subscriptions.db + 跨測試隔離。
+
+    engine._ensure_store() 喺 db_path=None（直接呼叫 _setup/_reconfigure，唔經 start()）時
+    fallback 去 fe.default_db_path()——呢度 patch 返 tmp_path，令所有 store 寫入都落臨時檔。
+    """
+    monkeypatch.setattr(fe, "default_db_path", lambda: tmp_path / "subscriptions.db")
+
+
 class FakeCtx:
     """Mock OpenQuoteContext：scripted request_history_kline 回應 + lifecycle 記錄。"""
 
@@ -912,3 +922,186 @@ class TestStartStop:
     def test_aggregator_before_start_raises(self):
         with pytest.raises(RuntimeError, match="start"):
             FutuEngine().aggregator
+
+
+# ---------------------------------------------------------------- 訂閱帳本 reconcile（自動清理洩漏）
+
+class ReconcileCtx:
+    """Mock OpenQuoteContext：query_subscription + unsubscribe 記錄（reconcile 測試用）。"""
+
+    def __init__(self, open_codes=(), unsub_ret=RET_OK):
+        self._open = set(open_codes)
+        self.unsub_calls = []          # list[list[code]]——每次 unsubscribe 嘅 code 列表
+        self._unsub_ret = unsub_ret
+
+    def query_subscription(self, is_all_conn=True):
+        return RET_OK, {
+            "total_used": len(self._open), "own_used": len(self._open), "remain": 900,
+            "sub_list": {"QUOTE": sorted(self._open)},
+        }
+
+    def unsubscribe(self, codes, sub_types):
+        self.unsub_calls.append(list(codes))
+        return self._unsub_ret, None
+
+
+def _reconcile_eng(active_code: str = "US.AAPL") -> FutuEngine:
+    """make_engine 後將 state.code 設為 active_code（reconcile 以呢個做「要保留」基準）。"""
+    eng = make_engine(history_count=2)
+    if active_code != "HK.HSImain":
+        eng._state = dataclasses.replace(eng.state, code=active_code)
+    return eng
+
+
+class TestReconcile:
+    def test_cleans_stale_leaked_subscriptions(self):
+        """帳本入面「唔係當前 state 且 age>=閾值」嘅洩漏訂閱 → unsubscribe + remove。"""
+        import time as _t
+        eng = _reconcile_eng("US.AAPL")
+        store = eng._ensure_store()
+        old = _t.time() - 120  # > MIN_SUBSCRIBE_SECONDS(75)
+        store.add("HK.HSImain", ts=old)
+        store.add("US.BBBL", ts=old)
+        ctx = ReconcileCtx(open_codes={"US.AAPL", "HK.HSImain", "US.BBBL"})
+        eng._ctx = ctx
+
+        eng._reconcile_subscriptions()
+
+        # 兩筆洩漏訂閱被清理；當前 state US.AAPL 唔會 unsub
+        assert sorted(c for call in ctx.unsub_calls for c in call) == ["HK.HSImain", "US.BBBL"]
+        assert all("US.AAPL" not in call for call in ctx.unsub_calls)
+        # 帳本只剩當前活躍 code（其實 US.AAPL 從來唔喺帳本——reconcile 只清 due）
+        remaining = {c for c, _s, _ts in store.list_active()}
+        assert "HK.HSImain" not in remaining and "US.BBBL" not in remaining
+
+    def test_skips_recent_subscriptions(self):
+        """age < MIN_SUBSCRIBE_SECONDS → 未到期，唔會 unsubscribe（避免又撞「訂閱時間過短」）。"""
+        import time as _t
+        eng = _reconcile_eng("US.AAPL")
+        store = eng._ensure_store()
+        store.add("HK.HSImain", ts=_t.time())  # 剛訂閱
+        ctx = ReconcileCtx(open_codes={"US.AAPL", "HK.HSImain"})
+        eng._ctx = ctx
+
+        eng._reconcile_subscriptions()
+
+        assert not ctx.unsub_calls  # 未滿 1min → 唔清，留待下輪
+        assert any(c == "HK.HSImain" for c, _s, _ts in store.list_active())
+
+    def test_query_failure_is_noop(self):
+        """query_subscription 失敗 → 跳過呢輪（唔改帳本、唔 unsubscribe），避免誤刪。"""
+        import time as _t
+        eng = _reconcile_eng("US.AAPL")
+        store = eng._ensure_store()
+        store.add("HK.HSImain", ts=_t.time() - 120)
+
+        def bad_query(is_all_conn=True):
+            return -1, "query err"
+
+        ctx = ReconcileCtx(open_codes={"US.AAPL"})
+        ctx.query_subscription = bad_query
+        eng._ctx = ctx
+
+        eng._reconcile_subscriptions()
+
+        assert not ctx.unsub_calls  # query 失敗 → 完全唔動
+        assert any(c == "HK.HSImain" for c, _s, _ts in store.list_active())  # 帳本 intact
+
+    def test_cleans_residual_not_in_ledger(self):
+        """OpenD 端有、帳本冇、且唔係當前 state → 直接 unsubscribe（上次 crash 殘留自癒）。"""
+        eng = _reconcile_eng("US.AAPL")
+        eng._ensure_store()  # 空帳本
+        ctx = ReconcileCtx(open_codes={"US.AAPL", "US.CCCC"})  # US.CCCC 係殘留
+        eng._ctx = ctx
+
+        eng._reconcile_subscriptions()
+
+        assert ["US.CCCC"] in ctx.unsub_calls  # 殘留被清
+        assert all("US.AAPL" not in call for call in ctx.unsub_calls)
+
+    def test_unsubscribe_failure_keeps_entry_for_retry(self):
+        """unsubscribe 仍失敗（例如仲未滿 1min）→ 保留帳本條目，下輪再試。"""
+        import time as _t
+        eng = _reconcile_eng("US.AAPL")
+        store = eng._ensure_store()
+        store.add("HK.HSImain", ts=_t.time() - 120)
+        ctx = ReconcileCtx(open_codes={"US.AAPL", "HK.HSImain"}, unsub_ret=-1)
+        eng._ctx = ctx
+
+        eng._reconcile_subscriptions()
+
+        assert ["HK.HSImain"] in ctx.unsub_calls  # 有試過
+        assert any(c == "HK.HSImain" for c, _s, _ts in store.list_active())  # 失敗 → 保留待重試
+
+    def test_schedule_reconcile_idempotent(self):
+        """_schedule_reconcile：排一次 timer；重複呼叫唔會再排（冪等）。"""
+        eng = _reconcile_eng("US.AAPL")
+        eng._ctx = ReconcileCtx(open_codes={"US.AAPL"})
+
+        eng._schedule_reconcile()
+        first = eng._reconcile_timer
+        assert first is not None and first.is_alive()
+        eng._schedule_reconcile()  # 第二次 → no-op（同一 timer）
+        assert eng._reconcile_timer is first
+        first.cancel()
+
+    def test_schedule_reconcile_noop_when_closed(self):
+        """_closed=True → _schedule_reconcile 唔排 timer。"""
+        eng = _reconcile_eng("US.AAPL")
+        eng._ctx = ReconcileCtx(open_codes={"US.AAPL"})
+        eng._closed = True
+
+        eng._schedule_reconcile()
+
+        assert eng._reconcile_timer is None
+
+
+class TestSubscriptionLedgerIntegration:
+    """_setup / _reconfigure 同 SQLite 帳本嘅整合（autouse fixture 已隔離 DB 去 tmp_path）。"""
+
+    def test_setup_records_initial_subscription(self, monkeypatch):
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        eng._setup()
+
+        assert any(c == "HK.HSImain" for c, _s, _ts in eng._store.list_active())
+        # 訂閱成功 → 排程咗 reconcile timer（開機對帳）
+        assert eng._reconcile_timer is not None and eng._reconcile_timer.is_alive()
+        eng._reconcile_timer.cancel()
+
+    def test_reconfigure_unsubscribe_failure_keeps_pending(self):
+        """unsubscribe 舊失敗（訂閱未滿 1min）→ 舊 code 保留喺帳本（pending），新 code 入帳。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        store = eng._ensure_store()
+        store.add("HK.HSImain", ts=_time.time())  # 模擬初始訂閱已入帳
+
+        def short_unsub(codes, sub_types):
+            return -1, "Basic訂閱時間過短"  # OpenD 拒收（未滿 1min）
+
+        ctx.unsubscribe = short_unsub
+        eng._ctx = ctx
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        # 舊 code unsubscribe 失敗 → 保留 pending；新 code subscribe 成功 → 入帳
+        remaining = {c for c, _s, _ts in store.list_active()}
+        assert "HK.HSImain" in remaining and "US.AAPL" in remaining
+        assert eng.state.code == "US.AAPL"
+        # reconcile timer 已排程（稍後重試清 HK.HSImain）
+        assert eng._reconcile_timer is not None and eng._reconcile_timer.is_alive()
+        eng._reconcile_timer.cancel()
+
+    def test_reconfigure_unsubscribe_success_removes_old(self):
+        """unsubscribe 舊成功 → 帳本移除舊 code，只留新 code。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])  # unsubscribe default RET_OK
+        store = eng._ensure_store()
+        store.add("HK.HSImain", ts=_time.time())
+        eng._ctx = ctx
+
+        eng._reconfigure("US.AAPL", "K_5M")
+
+        remaining = {c for c, _s, _ts in store.list_active()}
+        assert "HK.HSImain" not in remaining and "US.AAPL" in remaining

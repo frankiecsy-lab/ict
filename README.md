@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-10-01 | Step 2 · Commit 13 | **SQLite 訂閱帳本 + 自動清理 reconcile（杜絕訂閱洩漏）**：根因係切換標的時 `unsubscribe` 舊 code，但 OpenD 規則「同一 code 訂閱未滿 1 分鐘就 unsubscribe 會被拒」（實測「Basic訂閱時間過短」）→ 舊訂閱實際未移除、持續佔用額度（快速切換多隻股票會累積一堆清唔到嘅洩漏）。新增 `engine/subscription_store.py`（純 stdlib sqlite3，零 Qt/futu 依賴）——記錄每筆活躍 QUOTE 訂閱 `(code, subtype, subscribed_at)`；DB 路徑跟 `.env` 同邏輯（開發=專案根目錄、frozen=exe 旁邊）。`FutuEngine` 整合：subscribe/rollback 成功 → `store.add()`；unsubscribe 成功 → `store.remove()`、失敗（未滿 1min）→ **保留 pending**；定時 `_reconcile_subscriptions()`（30s，獨立 daemon thread）對「已不活躍且 age≥75s」嘅洩漏訂閱重試 unsubscribe + remove；開機經 `query_subscription()` 對帳自癒上次 crash 殘留（OpenD 端有、帳本冇、非當前 state → 直接清）。26 項新單測（全套 **302 passed**） |
 | 2026-09-30 | Step 2 · Commit 12 | **雙平台執行檔建置（Windows / Ubuntu x86-64，PyInstaller onedir）**：新增 `scripts/build_exe.py`（Windows → `dist/ICT-Trader-win/ICT-Trader.exe`）+ `scripts/build_ubuntu.sh`（WSL Ubuntu native build → `dist/ICT-Trader-ubuntu/ict-trader`；venv + apt tzdata/libgl1，唔需要 Docker daemon）。**frozen 模式支援**：`.env` 改讀 **exe 旁邊**（`config.py::_default_env_path()`——唔係 `_MEIPASS` temp dir，用戶部署可改）+ windowed build 配置錯誤彈 `QMessageBox`（`main.py::_report_config_error()`）。新增 `scripts/smoke_test.py` offscreen smoke。6 項新單測（全套 **276 passed**） |
 | 2026-09-30 | Step 2 · Commit 11 | **月K（K_MON）切換失敗修復**（live 使用發現：撳 K_MON 按鍵圖表冇更新、仲係顯示舊週期數據）：根因係 `history_window()` 為大週期 × 大 count 算出過長窗口——`K_MON`(43200min)×1000 ≈ **123 年**跨度，超過 OpenD `request_history_kline` 嘅 ~55 年臨界點（實測邊界：55yr OK / 60yr → `ret=-1 F3CNN返回错误`）→ fetch raise → `_reconfigure()` rollback → 圖表保持舊數據。修復：新增 `_MAX_WINDOW_DAYS=40*365` clamp——窗口寬度上限 **40 年**（遠低於臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。實測 K_MON 由 `ret=-1` → **`ret=0 / 256 根`**（全部月線）、K_WEEK 照常 1000 根。2 項回歸單測（全套 **270 passed**） |
 | 2026-09-30 | Step 2 · Commit 10 | **last-price 水平線跟隨「真正最新一根 bar」**（live 使用發現：pan 左走後虛線顯示嘅係可見視窗最右邊嗰根 K 線嘅 close，唔係真實最新價）：`paintEvent` 由 `bars[-1]`（visible_window slice）改用 `self._bars[-1]`——無論 pan/zoom 到咩位置，虛線 + 右軸 tag 永遠顯示數據尾部真正最新一根 bar 嘅 close；加 bounds-check（同 gridline 一樣）：最新價超出當前 Y 範圍（auto-fit 只 fit 可見 bars / 手動 Y zoom/pan）→ 整條線 + tag 唔畫，避免繪製出界。2 項 pixel 級回歸單測（offscreen render + `#FFB020` 精確色計數：tag 必須喺 y(真正最新價) 而唔係 y(可見視窗最右 close)；超範圍時全圖零 last-price 像素）。全套 **268 passed** |
@@ -45,6 +46,7 @@
 - [x] Commit 10：**last-price 水平線跟隨真正最新一根 bar**——`paintEvent` 由可見視窗 slice 改用 `self._bars[-1]`（pan 左走後仍顯示真實最新價）+ bounds-check（最新價超出當前 Y 範圍 → 整條線 + tag 唔畫）
 - [x] Commit 11：**月K（K_MON）切換失敗修復**——`history_window()` 大週期 × 大 count 算出過長窗口（K_MON×1000 ≈ 123 年 > OpenD ~55 年臨界點 → `ret=-1` → rollback）→ 加 `_MAX_WINDOW_DAYS=40*365` clamp
 - [x] Commit 12：**雙平台執行檔建置**——PyInstaller onedir（Windows `scripts/build_exe.py` / Ubuntu WSL native `scripts/build_ubuntu.sh`）+ frozen 模式 `.env` 讀 exe 旁邊 + windowed 配置錯誤彈框 + offscreen smoke test
+- [x] Commit 13：**SQLite 訂閱帳本 + 自動清理 reconcile**——`engine/subscription_store.py`（純 stdlib sqlite3）記錄每筆活躍 QUOTE 訂閱；切換時 unsubscribe 失敗（未滿 1min）→ 保留 pending，定時 `_reconcile_subscriptions()` 重試清理洩漏；開機 `query_subscription()` 對帳自癒殘留
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -54,6 +56,7 @@
 
 - **全屏幕終端**：PySide6/Qt6 全屏幕窗口，F11 切換全屏幕，Esc 關閉。
 - **運行時切換標的與週期**：頂部 control bar 輸入股票編號（`HK.XXXXX` / `US.XXX`，格式校驗 + 自動 uppercase；大小寫敏感特例如 `HK.HSImain` 經 `_CODE_ALIASES` 自動映返正規形式）+ K 線週期按鍵組（9 個 checkable button，QButtonGroup exclusive），點擊即切——engine worker thread 做 unsubscribe → fetch+seed → subscribe，全部驗證通過先 swap；失敗自動 rollback 返舊標的（圖表唔會斷）。
+- **訂閱洩漏自動清理**：切換時 `unsubscribe` 舊 code 若因「訂閱未滿 1 分鐘」被 OpenD 拒收，該筆訂閱會實際殘留、持續佔用額度——SQLite 訂閱帳本記錄每筆活躍訂閱 + 定時 reconcile（30s）對已不活躍且滿 75s 嘅洩漏訂閱重試清理；開機經 `query_subscription()` 對帳自癒上次 crash 殘留。快速切換多隻股票唔會累積清唔到嘅訂閱。
 - **輸入欄只收純編號 + 存在性驗證**：TEXT FIELD 永遠只持有純編號——**onChange guard**（`textChanged` handler）一偵測到欄位出現「code + 名稱」（含空白，例 completer `setCompletion()` 喺 activated 前寫入嘅完整 display_text）即刻剝離返第一 token 純 code；目錄載入後經 `StockCatalog.canonical_code()` 驗證編號存在並正規化嚴格大小寫（`hk.00700` → `HK.00700`），未知編號直接報錯唔切換（唔會打到 OpenD）；目錄未載入時放行俾 engine/OpenD 最終校驗。
 - **獨立名稱 LABEL**：control bar 輸入欄旁嘅 `QLabel` 顯示當前標的嘅中英文名（新純函數 `name_text()`），目錄載入 / dropdown 選中 / 手動切換時同步更新——名稱永遠唔會入 TEXT FIELD。
 - **模糊輸入自動補全**：股票編號欄支持中英文名 + 簡體/繁體中文模糊匹配（例：`騰訊`、`AAPL`、`hsimain`），dropdown 結果 rank-based（精確 > prefix > substring > typo fuzzy）；**dropdown popup 顯示完整 `display_text`（code + 中英文名）**，選中後輸入欄 TEXT FIELD **只留 code**——經 `code_from_completion()` 還原嚴格大小寫 canonical code（mapping hit → canonical、miss → 第一 token 兜底），名稱唔會入輸入欄。目錄由 `get_stock_basicinfo`（HK+US，~17k 隻）載入，主力連續合約經 seed 補返。
@@ -72,10 +75,10 @@
 D:\coding\ICT_v1\
 ├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown；windowed build（frozen + 無 console）配置錯誤彈 QMessageBox
 ├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()；`_default_env_path()`——frozen 時 .env 讀 exe 旁邊（開發模式 = 專案根目錄）
-├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換；`display_text()` dropdown 行、`name_text()` 名稱 LABEL、`canonical_code()` 存在性驗證）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch）
+├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換；`display_text()` dropdown 行、`name_text()` 名稱 LABEL、`canonical_code()` 存在性驗證）/ subscription_store（**SQLite 訂閱帳本**：純 stdlib sqlite3，記錄每筆活躍 QUOTE 訂閱 `(code,subtype,subscribed_at)` + `due_for_cleanup()`；DB 路徑跟 .env 同邏輯——開發=專案根目錄、frozen=exe 旁邊）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch + **訂閱帳本 reconcile 自動清理洩漏**）
 ├─ ui\                         # ✅ main_window（control bar：標的輸入欄（**只收純編號**——onChange guard `textChanged` 剝離「code + 名稱」、`canonical_code()` 驗證存在 + 正規化大小寫，fuzzy autocomplete dropdown 選中後只留 code）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code + `catalog()` accessor）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；**互動視圖狀態 X=(可見根數,右偏移)/Y=手動範圍 + 五個 pan/zoom 純函數（wheel/Ctrl+wheel/拖曳/雙擊 reset）**；add_overlay 擴展點）
 ├─ scripts\                    # ✅ build_exe.py（Windows PyInstaller onedir → dist/ICT-Trader-win/）/ build_ubuntu.sh（WSL Ubuntu native build → dist/ICT-Trader-ubuntu/）/ smoke_test.py（offscreen 啟動 + clean shutdown smoke）
-├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：onChange guard 剝離 code+名稱 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅；test_frozen.py ✅（frozen .env 路徑 + windowed 配置錯誤彈框）
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed + **訂閱帳本 reconcile / pending / query_subscription 對帳**）；test_subscription_store.py ✅（SQLite 帳本 CRUD + due_for_cleanup + frozen/dev DB 路徑 + 併發 add）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：onChange guard 剝離 code+名稱 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅；test_frozen.py ✅（frozen .env 路徑 + windowed 配置錯誤彈框）
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
 ├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env；build 腳本自動生成入產物夾）
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
@@ -87,6 +90,7 @@ D:\coding\ICT_v1\
 - `request_history_kline` 係同步阻塞 → 放獨立 setup daemon thread（唔係 GUI thread）。
 - **運行時切換**：`switch()` 每次 spawn 一個 daemon worker thread 跑 `_reconfigure()`（unsubscribe → fetch+seed → subscribe）；`stop()` join 晒所有 worker。
 - **股票目錄 fetch**：`get_stock_basicinfo` 係同步阻塞 → 喺 setup thread 內、subscribe 成功後執行，獨立 try/except——失敗唔影響主流程、唔 close ctx；結果經 `catalog_ready(tuple[StockEntry])` signal auto-queue 去 GUI build autocomplete dropdown。
+- **訂閱帳本 reconcile**：`_reconcile_subscriptions()` 喺獨立 daemon thread（`threading.Timer`，30s 間隔）跑——對「已不活躍且訂閱滿 75s」嘅洩漏訂閱重試 `unsubscribe`；`query_subscription()` / `unsubscribe` 都係同步阻塞 → 唔好占 callback / switch worker thread。SQLite 帳本 per-call connection（天然 thread-safe，見下節）。
 - **聚合喺 callback thread 做**；GUI 只負責 render。跨線程傳 **immutable tuple-of-tuples snapshot**（bar = `(time_key, open, high, low, close, volume)`），經 `pyqtSignal` queued 過 GUI——無共享可變狀態、無鎖。
 - **Backpressure**：chart widget 用 dirty flag + singleShot `QTimer(30ms)` coalesce repaint → tick burst 都最多 ~30fps redraw，永遠 render 最新 snapshot。
 
@@ -95,7 +99,7 @@ D:\coding\ICT_v1\
 Engine 只持一個 immutable `_State(aggregator, code, kline_type, anchor_date)` reference；切換 = 一次過 swap reference：
 
 1. worker **先驗證後 swap**：fetch 失敗 / seed 0 根 / subscribe 失敗 → rollback（resubscribe 舊標的 + error signal），state 保持唔變、圖表繼續 live。
-2. handler 每 batch load 一次 state + per-row `row.code != state.code → skip`——unsubscribe **唔係硬停**（OpenD 實測：訂閱未滿 1 分鐘 unsubscribe 會失敗），in-flight / 殘留 push 一律 filter 掉。
+2. handler 每 batch load 一次 state + per-row `row.code != state.code → skip`——unsubscribe **唔係硬停**（OpenD 實測：訂閱未滿 1 分鐘 unsubscribe 會失敗），in-flight / 殘留 push 一律 filter 掉；**洩漏訂閱由 SQLite 帳本 reconcile 兜底清理**（見下節）。
 3. emit 前 identity check（`state is eng._state`）→ batch 中途 state 被 swap 走，呢批 discard，唔會用舊 aggregator 嘅 snapshot 覆蓋新圖。
 4. `switch()` guard：setup/switch 進行中 → reject + status 提示；校驗（code 格式 `^(HK|US)\.\w+$`、週期名）失敗 → error signal。Code 經 `_normalize_code()` normalize（strip + uppercase，再將大小寫敏感特例如 `HK.HSImain` 經 `_CODE_ALIASES` 映返正規形式——OpenD 拒收全 upper 嘅 `HSIMAIN`）。
 
@@ -106,7 +110,20 @@ Engine 只持一個 immutable `_State(aggregator, code, kline_type, anchor_date)
 - **返回頭 N 根而非最近 N 根**：window + max_count 返回時間序頭 N 根 → `page_req_key` 分頁攞晒（1000 根/頁）再 tail `history_count` 根。
 - **按欄位名提取**：DataFrame 欄位順序係 open/close/high/low（唔係 OHLC）→ 一律 `df[["time_key","open","high","low","close","volume"]]`。
 - **Live tick data_time 係 time-only**（'HH:mm:ss.SSS'，無日期）→ `resolve_tick_datetime()` 補 date = max(anchor, market_today)；anchor = seed 最後一根 bar 嘅日期（處理夜期跨午夜 + clock skew）；market_today 用 `_fallback_date()` 以**市場自己時區**（zoneinfo：HK=Asia/Hong_Kong / US=America/New_York，未知 prefix 回落 HK）計算——美股喺 HKT 機上「今日」會同 machine-local 差一日。
-- **`unsubscribe()` 訂閱未滿 1 分鐘會失敗**（實測錯誤訊息「Basic訂閱時間過短」）→ 切換流程唔阻擋，殘留 push 由 handler code filter 兜底（見上節）。
+- **`unsubscribe()` 訂閱未滿 1 分鐘會失敗**（實測錯誤訊息「Basic訂閱時間過短」）→ 切換流程唔阻擋，殘留 push 由 handler code filter 兜底；**洩漏訂閱由 SQLite 帳本 reconcile 清理**（見下節）。
+
+### 訂閱帳本與自動清理（SQLite reconcile）
+
+**問題**：切換標的時 `unsubscribe` 舊 code，但 OpenD 規則「同一 code 訂閱未滿 1 分鐘就 unsubscribe 會被拒」→ 快速切換時舊訂閱實際未移除、持續佔用額度（洩漏）。純靠 handler code filter 只係過濾 push，**唔會清走 OpenD 端嗰筆訂閱**。
+
+**方案**：`engine/subscription_store.py`（純 stdlib sqlite3）做訂閱帳本 + `FutuEngine` 定時 reconcile：
+
+- **帳本**：每筆活躍 QUOTE 訂閱 = `(code, subtype, subscribed_at)`，主鍵 `(code, subtype)`。subscribe / rollback resubscribe 成功 → `add()`（re-subscribe 同 code → `INSERT OR REPLACE` 重新計時）；unsubscribe 成功 → `remove()`。**DB 路徑跟 `.env` 同邏輯**：開發 = 專案根目錄、frozen = exe 旁邊（`default_db_path()`）。
+- **pending 標記**：`_reconfigure()` unsubscribe 舊 code 失敗（未滿 1min）→ **唔 remove，保留喺帳本**做 pending；subscribe 新 code 成功 → `add(新)` + `_schedule_reconcile()`。
+- **定時 reconcile**（30s，獨立 daemon thread）：`query_subscription()` 攞 OpenD 端實際訂閱 code → 對「已不活躍（≠ 當前 state.code）且 age ≥ `MIN_SUBSCRIBE_SECONDS`(75s)」嘅帳本條目重試 `unsubscribe` + `remove`；失敗（仲未滿 1min）→ 保留，下輪再試。
+- **開機對帳自癒**：setup subscribe 成功後排程 reconcile——`query_subscription()` 攞到「OpenD 端有、但帳本完全冇記錄」嘅 code（上次 crash 前嘅訂閱殘留）→ 直接 `unsubscribe`（唔入帳本，清完即止）。
+- **冪等 + 安全**：每輪重讀帳本；無 due → no-op。`query_subscription()` 失敗 → 跳過該輪（唔改帳本、避免誤刪）。residual 判斷用 loop 前 ledger snapshot 排除「已喺帳本」嘅 code，避免同 due-loop 重複 unsub。
+- **Thread safety**：store per-call connection（每次操作開自己 connection + commit/close）→ 唔共享 connection object，天然 thread-safe；SQLite file locking 處理 reconcile worker 同 switch worker 嘅低頻併發寫入。
 
 ### 時區鐵律
 
@@ -121,6 +138,7 @@ Quote `data_time` 同 kline `time_key` 對 HK.HSImain 都係 **HKT naive string*
 - futu-api ≥ 10.4.6408（現裝 10.5.6508）
 - opencc-python-reimplemented —— 簡體/繁體中文轉換（fuzzy 搜尋 t2s 正規化，lazy init + identity fallback）
 - python-dotenv —— `.env` 讀取
+- sqlite3（**Python stdlib**，無額外依賴）—— 訂閱帳本 `subscriptions.db`（記錄活躍 QUOTE 訂閱 + reconcile 清理洩漏；DB 檔 gitignored）
 - pytest —— 單測
 
 ## How to Run

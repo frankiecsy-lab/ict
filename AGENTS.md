@@ -137,4 +137,9 @@
 *   **【正確資源】**：PyInstaller 官方文檔（Runtime Temporary Folder / Windows GUI apps）；本專案實測。
 *   **【解決/避坑方案】**：`config.py::_default_env_path()`——frozen 時 `.env` = `Path(sys.executable).with_name(".env")`（exe 旁邊，用戶部署可改、改完重開 app 生效），開發模式照舊專案根目錄；build 腳本自動由 `.env.example` 生成預設 `.env` 入產物夾。`main.py::_report_config_error()`——frozen + `sys.stdout is None`（windowed）→ `QMessageBox.critical` 彈出，否則 stderr。通用規則：任何「用戶可編輯配置」喺 frozen app 都要放 exe 旁邊或 `%APPDATA%`，唔好放 `_MEIPASS`；windowed build 嘅所有錯誤回報都要有 GUI fallback。
 
+#### 8. 🥉 Futu OpenD：`query_subscription()` 係訂閱狀態唯一權威來源 + 「帳本+定時重試」清理洩漏模式
+*   **【問題/限制】**：OpenD `unsubscribe()` 對「同一 code 訂閱未滿 1 分鐘」會拒收（實測「Basic訂閱時間過短」）→ 切換標的時舊訂閱**實際未移除、持續佔用額度**（洩漏）。純靠 handler per-row code filter 只係過濾 push，**清唔走 OpenD 端嗰筆訂閱**。另外 `unsubscribe` 失敗後冇任何 API 直接話你邊啲 code 仲訂閱緊——本地記錄會同 OpenD 實際狀態漂移。
+*   **【正確資源】**：futu-api `query_subscription(is_all_conn)` 文檔（返回 dict：`total_used/own_used/remain/sub_list{subtype:[codes]}`）；本專案實測。
+*   **【解決/避坑方案】**：**SQLite 訂閱帳本 + 定時 reconcile**——(1) 每筆 subscribe/rollback resubscribe 成功 → `store.add(code, ts)`（re-subscribe 同 code → `INSERT OR REPLACE` 重新計時）；unsubscribe 成功 → `remove()`、失敗 → **保留 pending**。(2) 定時 `_reconcile_subscriptions()`（30s daemon thread）：先 `query_subscription(is_all_conn=False)` 攞 OpenD 端**實際**訂閱 code（呢個係唯一權威來源，本地帳本只係輔助計時），再對「已不活躍且 age≥75s」嘅帳本條目重試 unsubscribe + remove；失敗保留下輪再試。(3) **開機自癒**：query 到但帳本冇記錄、非當前 state 的 code（上次 crash 殘留）→ 直接清。通用規則：任何「操作有頻率/時間限制、失敗唔會自動重試」嘅外部資源管理，都應該 (a) 持久化本地狀態 + (b) 用 API 查真實狀態做對帳錨點 + (c) 定時冪等 reconcile——唔好淨係靠「操作當下成功」。另注意：residual 判斷要用 loop **前**嘅 ledger snapshot（`open - active - ledger_before`），避免同 due-loop 重複 unsub 同一 code；query 失敗要跳過該輪（唔改帳本、避免誤刪）。本專案即係 `engine/subscription_store.py` + `futu_engine.py::_reconcile_subscriptions()`。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*

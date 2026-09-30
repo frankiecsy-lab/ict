@@ -45,9 +45,13 @@ from futu import (
 from config import kline_period_minutes
 from .candle_aggregator import CandleAggregator
 from .stock_catalog import StockEntry, register_code_aliases
+from .subscription_store import SubscriptionStore, default_db_path
 from .timeutil import history_window, parse_market_time, resolve_tick_datetime
 
 logger = logging.getLogger(__name__)
+
+# 定時 reconcile 間隔（秒）：對「已不活躍且訂閱滿 MIN_SUBSCRIBE_SECONDS」的洩漏訂閱重試 unsubscribe。
+_RECONCILE_INTERVAL = 30.0
 
 _KLTYPE_MAP: dict[str, KLType] = {
     "K_1M": KLType.K_1M,
@@ -204,6 +208,17 @@ class FutuEngine(QObject):
         self._switching = False                          # switch guard flag
         self._closed = False                             # stop() 後抑制 emit / reject switch
         self._lock = threading.Lock()
+        # SQLite 訂閱帳本：記錄每筆活躍 QUOTE 訂閱（code/subtype/時間）→ reconcile 清理洩漏。
+        # db_path=None → default_db_path()（開發=專案根目錄、frozen=exe 旁邊）。
+        self._store: SubscriptionStore | None = None
+        self._reconcile_timer: threading.Timer | None = None   # 定時重試 unsubscribe 洩漏訂閱
+
+    def _ensure_store(self) -> SubscriptionStore:
+        """惰性建立訂閱帳本（首次 subscribe/reconcile 前）；db_path 由 start() 注入或預設。"""
+        if self._store is None:
+            path = getattr(self, "_db_path", None) or default_db_path()
+            self._store = SubscriptionStore(path)
+        return self._store
 
     @property
     def cfg(self):
@@ -225,13 +240,17 @@ class FutuEngine(QObject):
             return _fallback_date(None, "HK")
         return _fallback_date(self._state.anchor_date, self._state.code)
 
-    def start(self, cfg) -> None:
-        """啟動連線 + 歷史 fetch + 訂閱（背景 daemon thread，立即返回）。"""
+    def start(self, cfg, db_path: str | Path | None = None) -> None:
+        """啟動連線 + 歷史 fetch + 訂閱（背景 daemon thread，立即返回）。
+
+        db_path：SQLite 訂閱帳本路徑；None → default_db_path()。
+        """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return  # 已經 starting/started
             self._closed = False
             self._cfg = cfg
+            self._db_path = db_path
             self._state = _State(CandleAggregator(cfg.period_minutes),
                                  _normalize_code(cfg.trading_code), cfg.kline_type, None)
             thread = threading.Thread(target=self._setup, name="futu-setup", daemon=True)
@@ -248,6 +267,10 @@ class FutuEngine(QObject):
             self._workers.clear()
             thread = self._thread
             self._thread = None
+            timer = self._reconcile_timer
+            self._reconcile_timer = None
+        if timer is not None:
+            timer.cancel()  # 阻止未觸發嘅 reconcile；已運行中嘅會因 _closed 快速返回
         self._close_ctx()
         for t in (thread, *workers):
             if t is not None and t.is_alive():
@@ -298,6 +321,8 @@ class FutuEngine(QObject):
                 ret, info = ctx.subscribe([code], [SubType.QUOTE])
                 if ret != RET_OK:
                     logger.error("rollback resubscribe %s 失敗: %s", code, info)
+                else:
+                    self._ensure_store().add(code)  # re-subscribe 成功 → 帳本重新計時
             except Exception:  # noqa: BLE001 — rollback 唔好 propagate
                 logger.exception("rollback resubscribe exception")
         if not self._closed:
@@ -317,6 +342,9 @@ class FutuEngine(QObject):
                 ret, info = ctx.unsubscribe([old_state.code], [SubType.QUOTE])
                 if ret != RET_OK:
                     logger.warning("unsubscribe %s 失敗: %s", old_state.code, info)
+                    # 「訂閱未滿 1 分鐘」→ OpenD 拒收；帳本保留呢筆（pending），reconcile 稍後重試
+                else:
+                    self._ensure_store().remove(old_state.code)
             except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
                 logger.exception("unsubscribe exception")
             # 2) fetch 新歷史（明確窗口 + 分頁；失敗 raise → rollback）
@@ -337,6 +365,8 @@ class FutuEngine(QObject):
             if ret != RET_OK:
                 self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}")
                 return
+            self._ensure_store().add(new_code)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
+            self._schedule_reconcile()           # 排程清理：舊 code 若 unsubscribe 失敗（pending）稍後重試
             # 5) atomic swap + notify
             new_state = _State(agg, new_code, new_ktype, anchor)
             self._state = new_state
@@ -349,6 +379,89 @@ class FutuEngine(QObject):
                 self._rollback(old_state.code, str(exc))
         finally:
             self._switching = False
+
+    # ------------------------------------------------------------- 訂閱帳本 reconcile（自動清理洩漏）
+
+    def _schedule_reconcile(self) -> None:
+        """排程一次定時 reconcile（_RECONCILE_INTERVAL 後）。
+
+        冪等：已有 pending timer → 唔重複排。reconcile 喺獨立 daemon thread 跑（unsubscribe
+        係同步阻塞，唔好占 switch worker / callback thread）。
+        """
+        with self._lock:
+            if self._closed or self._ctx is None:
+                return
+            if self._reconcile_timer is not None and self._reconcile_timer.is_alive():
+                return  # 已經排程咗
+            timer = threading.Timer(_RECONCILE_INTERVAL, self._reconcile_subscriptions)
+            timer.daemon = True
+            timer.name = "futu-reconcile"
+            self._reconcile_timer = timer
+        timer.start()
+
+    def _query_open_subscriptions(self, ctx) -> set[str] | None:
+        """query_subscription() → OpenD 端實際訂閱緊嘅 code 集合；失敗/異常 → None（對帳跳過）。"""
+        try:
+            ret, data = ctx.query_subscription(is_all_conn=False)
+        except Exception:  # noqa: BLE001 — query 唔好 propagate 去 reconcile worker
+            logger.exception("query_subscription exception")
+            return None
+        if ret != RET_OK or not isinstance(data, dict):
+            logger.warning("query_subscription 失敗: %s", data)
+            return None
+        codes: set[str] = set()
+        for sub_list in (data.get("sub_list") or {}).values():
+            codes.update(sub_list or [])
+        return codes
+
+    def _reconcile_subscriptions(self) -> None:
+        """定時清理：對「已不活躍且訂閱滿 MIN_SUBSCRIBE_SECONDS」的洩漏訂閱重試 unsubscribe。
+
+        流程（獨立 daemon thread）：
+        1. query_subscription() 攞 OpenD 端實際訂閱 code；失敗 → 跳過呢輪（下輪再試）。
+        2. store.due_for_cleanup(active_codes) = 帳本入面「唔係當前 state.code 且 age>=閾值」嘅條目。
+        3. 逐筆 unsubscribe：成功 → remove；失敗（例如仲未滿 1min）→ 保留，下輪再試。
+        4. query 到但帳本冇記錄嘅 code（上次 crash 殘留、唔係當前 state）→ 直接 unsubscribe + 唔入帳本。
+
+        冪等：每輪重讀 store；無 due → no-op。stop() 後 _closed=True → 快速返回。
+        """
+        with self._lock:
+            if self._closed or self._ctx is None:
+                return
+            ctx = self._ctx
+        state = self._state
+        active_codes = {state.code} if state else set()
+
+        open_codes = self._query_open_subscriptions(ctx)
+        if open_codes is None:
+            return  # query 失敗 → 唔改帳本，下輪再試（避免誤刪）
+
+        store = self._ensure_store()
+        ledger_codes = {c for c, _s, _ts in store.list_active()}  # loop 前 snapshot（residual 判斷用）
+        for code, subtype, _ts in store.due_for_cleanup(active_codes):
+            try:
+                ret, info = ctx.unsubscribe([code], [SubType.QUOTE])
+            except Exception:  # noqa: BLE001 — 單筆 unsubscribe exception 唔阻其餘清理
+                logger.exception("reconcile unsubscribe %s exception", code)
+                continue
+            if ret == RET_OK:
+                store.remove(code, subtype)
+                logger.info("reconcile：已清理洩漏訂閱 %s", code)
+            else:
+                logger.warning("reconcile：unsubscribe %s 仍失敗（稍後重試）: %s", code, info)
+
+        # 殘留自癒：OpenD 端有、但帳本完全冇記錄（上次 crash 前嘅訂閱）、且唔係當前 state →
+        # unsubscribe。用 loop 前 ledger snapshot 排除「已喺帳本」嘅 code——避免同 due-loop 重複 unsub。
+        for code in open_codes - active_codes - ledger_codes:
+            try:
+                ret, info = ctx.unsubscribe([code], [SubType.QUOTE])
+            except Exception:  # noqa: BLE001 — 同上
+                logger.exception("reconcile unsubscribe residual %s exception", code)
+                continue
+            if ret == RET_OK:
+                logger.info("reconcile：已清理殘留訂閱 %s（帳本無記錄）", code)
+            else:
+                logger.warning("reconcile：unsubscribe 殘留 %s 失敗: %s", code, info)
 
     def _close_ctx(self) -> None:
         """Close 本 engine 持有嘅 context（idempotent、thread-safe）。"""
@@ -461,6 +574,8 @@ class FutuEngine(QObject):
             ret, sub_info = ctx.subscribe([code], [SubType.QUOTE])
             if ret != RET_OK:
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
+            self._ensure_store().add(code)   # 初始訂閱入帳本
+            self._schedule_reconcile()       # 開機對帳：query_subscription 清理上次殘留訂閱
             self.status.emit(f"訂閱成功 · 歷史 {n} 根 · 等待實時報價")
 
             # 股票目錄 fetch（autocomplete 輔助功能）：獨立 try/except——失敗唔影響主流程、唔 close ctx
