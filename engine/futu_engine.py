@@ -35,6 +35,7 @@ from PySide6.QtCore import QObject, Signal
 from futu import (
     AuType,
     KLType,
+    Market,
     RET_OK,
     OpenQuoteContext,
     StockQuoteHandlerBase,
@@ -43,6 +44,7 @@ from futu import (
 
 from config import kline_period_minutes
 from .candle_aggregator import CandleAggregator
+from .stock_catalog import StockEntry, register_code_aliases
 from .timeutil import history_window, parse_market_time, resolve_tick_datetime
 
 logger = logging.getLogger(__name__)
@@ -70,11 +72,28 @@ _CODE_ALIASES = {
     "HK.HSIMAIN": "HK.HSImain",  # 恒指期貨主連
 }
 
+# get_stock_basicinfo 唔包含主力連續合約（2026-09-30 live 實測：HK 3798 rows 冇 HSImain）
+# → seed 補返，確保預設 TRADING_CODE 一定有 autocomplete；API 日後若返回同 code 會 dedup skip
+_SEED_ENTRIES = (StockEntry("HK.HSImain", "恒指期货主连", ""),)
+
 
 def _normalize_code(raw: str) -> str:
     """strip + uppercase，再將大小寫敏感特例映返正規形式。"""
     code = raw.strip().upper()
     return _CODE_ALIASES.get(code, code)
+
+
+def _cell_str(value) -> str:
+    """DataFrame cell → 乾淨 string（None/NaN 空欄位 → ""，防 "nan" 字串混入目錄）。"""
+    if value is None:
+        return ""
+    try:
+        if value != value:  # NaN guard（pandas 空欄位）
+            return ""
+    except TypeError:
+        pass
+    s = str(value).strip()
+    return "" if s.lower() == "nan" else s
 
 # time-only tick 補 fallback date 用嘅市場時區（只影響日曆日期推斷，永遠唔轉換數據 timestamp——時區鐵律不變）
 _MARKET_TZ: dict[str, str] = {
@@ -165,6 +184,7 @@ class FutuEngine(QObject):
     bars_changed = Signal(tuple)
     status = Signal(str)
     error = Signal(str)
+    catalog_ready = Signal(tuple)   # tuple[StockEntry]：HK+US 股票目錄（fuzzy autocomplete 用）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -364,6 +384,39 @@ class FutuEngine(QObject):
             raise RuntimeError(f"歷史分頁超過 {_MAX_PAGES} 頁")
         return rows[-cfg.history_count:]
 
+    def _fetch_catalog(self, ctx) -> list[StockEntry]:
+        """Fetch HK+US 股票基本資料（code/name/english_name）→ StockEntry list。
+
+        Per-market try/except：單一市場失敗唔阻另一邊；重覆 code dedup。
+        `code` 保留 API 返回嘅嚴格大小寫正規形式（autocomplete + alias 註冊用）。
+        """
+        entries: list[StockEntry] = []
+        seen: set[str] = set()
+        for e in _SEED_ENTRIES:  # seed 先入（API 返回同 code 時 dedup skip）
+            if e.code not in seen:
+                seen.add(e.code)
+                entries.append(e)
+        for market in (Market.HK, Market.US):
+            try:
+                ret, df = ctx.get_stock_basicinfo(market)
+            except Exception:  # noqa: BLE001 — 單市場 exception 唔阻另一邊
+                logger.exception("get_stock_basicinfo(%s) exception", market)
+                continue
+            if ret != RET_OK or df is None:
+                logger.warning("get_stock_basicinfo(%s) 失敗: %s", market, df)
+                continue
+            for row in df.itertuples(index=False):
+                code = _cell_str(getattr(row, "code", None))
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                entries.append(StockEntry(
+                    code=code,
+                    name_cn=_cell_str(getattr(row, "name", None)),
+                    name_en=_cell_str(getattr(row, "english_name", None)),
+                ))
+        return entries
+
     def _setup(self) -> None:
         cfg = self._cfg
         try:
@@ -401,6 +454,16 @@ class FutuEngine(QObject):
             if ret != RET_OK:
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
             self.status.emit(f"訂閱成功 · 歷史 {n} 根 · 等待實時報價")
+
+            # 股票目錄 fetch（autocomplete 輔助功能）：獨立 try/except——失敗唔影響主流程、唔 close ctx
+            try:
+                entries = self._fetch_catalog(ctx)
+                if entries and not self._closed:
+                    register_code_aliases(entries, _CODE_ALIASES)
+                    self.catalog_ready.emit(tuple(entries))
+                    self.status.emit(f"股票目錄已載入 · {len(entries)} 隻")
+            except Exception:  # noqa: BLE001 — catalog failure must not break startup
+                logger.exception("stock catalog fetch failed")
         except Exception as exc:  # noqa: BLE001 — setup 任何失敗 → 回報 + 確保 ctx close
             logger.exception("FutuEngine setup failed")
             self.error.emit(str(exc))

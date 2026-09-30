@@ -13,13 +13,14 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytest
-from futu import RET_OK, SubType, StockQuoteHandlerBase
+from futu import Market, RET_OK, SubType, StockQuoteHandlerBase
 
 import engine.futu_engine as fe
 from config import Config
 from engine.candle_aggregator import CandleAggregator
 from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
                                 _State, _fallback_date, _normalize_code)
+from engine.stock_catalog import StockEntry
 
 
 # ---------------------------------------------------------------- fixtures / fakes
@@ -33,7 +34,7 @@ def make_cfg(**overrides) -> Config:
 class FakeCtx:
     """Mock OpenQuoteContext：scripted request_history_kline 回應 + lifecycle 記錄。"""
 
-    def __init__(self, pages, sub_ret=RET_OK, sub_info=None):
+    def __init__(self, pages, sub_ret=RET_OK, sub_info=None, basicinfo=None):
         self._pages = list(pages)
         self.kline_calls = []
         self.handler = None
@@ -43,6 +44,16 @@ class FakeCtx:
         self.subscribe_event = threading.Event()
         self._sub_ret = sub_ret
         self._sub_info = sub_info
+        # market → (ret, df) | Exception；未 script 嘅市場 default 空 DataFrame（catalog fetch 零 entries）
+        self._basicinfo = basicinfo or {}
+        self.basicinfo_calls = []
+
+    def get_stock_basicinfo(self, market):
+        self.basicinfo_calls.append(market)
+        resp = self._basicinfo.get(market)
+        if isinstance(resp, Exception):
+            raise resp
+        return resp if resp is not None else (RET_OK, pd.DataFrame())
 
     def request_history_kline(self, code, ktype=None, autype=None, start=None, end=None,
                               max_count=None, page_req_key=None):
@@ -97,6 +108,11 @@ def quote_df(rows, code="HK.HSImain") -> pd.DataFrame:
     return pd.DataFrame(
         [dict(code=code, data_time=dt, last_price=p, volume=v) for dt, p, v in rows]
     )
+
+
+def basic_df(rows) -> pd.DataFrame:
+    """rows: (code, name, english_name) → get_stock_basicinfo DataFrame（按欄位名提取驗證）。"""
+    return pd.DataFrame([dict(code=c, name=n, english_name=e) for c, n, e in rows])
 
 
 def make_engine(**cfg_overrides) -> FutuEngine:
@@ -217,6 +233,80 @@ class TestFetchHistory:
         with pytest.raises(RuntimeError, match="歷史分頁超過"):
             eng._fetch_history(ctx, "HK.HSImain", "K_1M")
         assert len(ctx.kline_calls) == 3
+
+
+# ---------------------------------------------------------------- _fetch_catalog（autocomplete 目錄）
+
+class TestFetchCatalog:
+    def test_extracts_by_column_name_both_markets(self):
+        eng = make_engine()
+        ctx = FakeCtx([], basicinfo={
+            Market.HK: (RET_OK, basic_df([("HK.HSImain", "恒指期货主连", ""),
+                                          ("HK.00700", "腾讯控股", "TENCENT")])),
+            Market.US: (RET_OK, basic_df([("US.AAPL", "苹果", "Apple Inc.")])),
+        })
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.00700", "US.AAPL"]  # seed 先入 + dedup skip API 重複
+        by_code = {e.code: e for e in entries}
+        assert by_code["HK.00700"].name_cn == "腾讯控股"
+        assert by_code["US.AAPL"].name_en == "Apple Inc."
+
+    def test_nan_and_none_cells_cleaned(self):
+        eng = make_engine()
+        df = pd.DataFrame([dict(code="US.X", name=float("nan"), english_name=None)])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain", "US.X"]  # seed + US row
+        by_code = {e.code: e for e in entries}
+        assert by_code["US.X"].name_cn == "" and by_code["US.X"].name_en == ""
+
+    def test_empty_code_skipped_and_dedup(self):
+        eng = make_engine()
+        df = pd.DataFrame([dict(code="", name="x", english_name=""),
+                           dict(code="US.AAPL", name="苹果", english_name="Apple Inc."),
+                           dict(code="US.AAPL", name="dup", english_name="")])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain", "US.AAPL"]  # seed + dedup 後單一 US row
+
+    def test_one_market_exception_other_still_fetched(self):
+        eng = make_engine()
+        ctx = FakeCtx([], basicinfo={
+            Market.HK: RuntimeError("boom"),
+            Market.US: (RET_OK, basic_df([("US.MSFT", "", "Microsoft Corp.")])),
+        })
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain", "US.MSFT"]  # HK exception 唔阻 US + seed
+
+    def test_ret_not_ok_skipped_without_crash(self):
+        eng = make_engine()
+        ctx = FakeCtx([], basicinfo={Market.HK: (-1, "no permission"),
+                                     Market.US: (RET_OK, pd.DataFrame())})
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain"]  # 兩市場全失敗 → 只剩 seed
+
+    def test_missing_columns_yield_no_entries(self):
+        """df 冇 code/name/english_name 欄（schema 差異）→ getattr None → skip，唔炸。"""
+        eng = make_engine()
+        df = pd.DataFrame([dict(foo=1, bar=2)])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain"]  # schema 差異 → 只剩 seed
+
+    def test_seed_present_when_api_empty_and_deduped(self):
+        """live 實測：get_stock_basicinfo 唔返回主力連續合約（HK 3798 rows 冇 HSImain）
+        → _SEED_ENTRIES 補返預設標的；API 若日後返回同 code 只保留 seed 一份。"""
+        eng = make_engine()
+        ctx = FakeCtx([], basicinfo={Market.HK: (RET_OK, pd.DataFrame()),
+                                     Market.US: (RET_OK, pd.DataFrame())})
+        entries = eng._fetch_catalog(ctx)
+        assert [e.code for e in entries] == ["HK.HSImain"]
+
+        ctx2 = FakeCtx([], basicinfo={
+            Market.HK: (RET_OK, basic_df([("HK.HSImain", "恒指期貨主連(異體)", "")])),
+        })
+        entries2 = eng._fetch_catalog(ctx2)
+        assert [e.code for e in entries2] == ["HK.HSImain"]  # dedup：seed 先入，API row skip
 
 
 # ---------------------------------------------------------------- on_recv_rsp
@@ -456,7 +546,7 @@ class TestSetup:
         # seed 完成先 swap state：anchor = seed 最後一根 bar 嘅日期
         assert eng.state.anchor_date == date(2026, 9, 30)
         assert (eng.state.code, eng.state.kline_type) == ("HK.HSImain", "K_1M")
-        assert statuses[-1].startswith("訂閱成功")
+        assert any(s.startswith("訂閱成功") for s in statuses)  # catalog status 會喺跟住 emit
 
     def test_env_lowercase_hsimain_normalized(self, monkeypatch):
         """.env 小寫 hk.hsimain → fetch/subscribe/state 全部用正規形式 HK.HSImain。"""
@@ -504,6 +594,45 @@ class TestSetup:
         eng._setup()
         assert any("request_history_kline" in e for e in errors)
         assert ctx.closed is True and eng._ctx is None
+
+    def test_setup_emits_catalog_ready_and_registers_aliases(self, monkeypatch):
+        """catalog fetch 成功 → catalog_ready emit + status；mixed-case code 自動註冊 alias。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)], basicinfo={
+            Market.HK: (RET_OK, basic_df([("HK.FUTmain", "富途控股", "")])),
+        })
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        statuses, catalogs = [], []
+        eng.status.connect(statuses.append)
+        eng.catalog_ready.connect(catalogs.append)
+        eng._setup()
+
+        assert len(catalogs) == 1 and all(isinstance(e, StockEntry) for e in catalogs[0])
+        assert any("股票目錄已載入" in s for s in statuses)
+        # alias auto-registration：upper form → canonical（_normalize_code 即刻生效）
+        assert fe._CODE_ALIASES.get("HK.FUTMAIN") == "HK.FUTmain"
+        assert _normalize_code("hk.futmain") == "HK.FUTmain"
+        monkeypatch.delitem(fe._CODE_ALIASES, "HK.FUTMAIN", raising=False)
+
+    def test_catalog_failure_does_not_break_setup(self, monkeypatch):
+        """catalog fetch 炸 → log + continue：主流程完成、ctx 唔 close、無 error signal。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+
+        def boom(_ctx):
+            raise RuntimeError("catalog boom")
+
+        monkeypatch.setattr(eng, "_fetch_catalog", boom)
+        statuses, errors = [], []
+        eng.status.connect(statuses.append)
+        eng.error.connect(errors.append)
+        eng._setup()
+
+        assert not errors
+        assert ctx.closed is False and eng._ctx is ctx  # 主流程 intact
+        assert any("訂閱成功" in s for s in statuses)
+        assert not any("股票目錄已載入" in s for s in statuses)
 
 
 # ---------------------------------------------------------------- _normalize_code（大小寫敏感特例）

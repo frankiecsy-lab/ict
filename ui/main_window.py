@@ -1,10 +1,12 @@
 """全屏幕終端主窗口：control bar + CandleChart + FutuEngine 接線 + 狀態列。
 
-- 頂部 control bar：標的編號輸入欄（HK.XXXXX / US.XXX）+ K 線週期 combo，
-  returnPressed / activated → engine.switch(code, kline_type) 運行時切換。
+- 頂部 control bar：標的編號輸入欄（fuzzy autocomplete：編號 / 中英文名、簡繁兼容，
+  目錄由 engine `catalog_ready` 一次性載入）+ K 線週期 combo，
+  returnPressed / dropdown activated → engine.switch(code, kline_type) 運行時切換。
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
-  history_ready / bars_changed → chart.update_bars；status / error → status bar。
+  history_ready / bars_changed → chart.update_bars；status / error → status bar；
+  catalog_ready → completer model rebuild。
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
 from .candle_chart import CandleChart
+from .stock_completer import StockCompleter
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +45,7 @@ class MainWindow(QMainWindow):
         self._engine.bars_changed.connect(self.chart.update_bars)
         self._engine.status.connect(lambda m: sb.showMessage(m, 8000))
         self._engine.error.connect(self._on_error)
+        self._engine.catalog_ready.connect(self._on_catalog_ready)
 
         # Central：container + 頂部 control bar + chart（0 margin/spacing，全屏幕感不變）
         central = QWidget()
@@ -72,9 +76,14 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("標的"))
 
         self.code_edit = QLineEdit()
-        self.code_edit.setPlaceholderText("HK.00700 / US.AAPL")
+        self.code_edit.setPlaceholderText("編號 / 中英文名（模糊匹配，例：騰訊、AAPL、hsimain）")
         self.code_edit.setText(cfg.trading_code)
-        self.code_edit.setFixedWidth(180)
+        self.code_edit.setFixedWidth(340)
+        # Fuzzy autocomplete：目錄由 engine catalog_ready 載入；activated → 用 canonical code switch
+        self._completer = StockCompleter(self)
+        self._code_by_text: dict[str, str] = {}
+        self._completer.activated.connect(self._on_code_activated)
+        self.code_edit.setCompleter(self._completer)
         h.addWidget(self.code_edit)
 
         h.addSpacing(16)
@@ -97,6 +106,18 @@ class MainWindow(QMainWindow):
         self.code_edit.returnPressed.connect(_do_switch)
         self.period_combo.activated.connect(lambda _idx: _do_switch())
         return bar
+
+    def _on_catalog_ready(self, entries) -> None:
+        """Engine setup thread fetch 完 HK+US 目錄 → rebuild completer model（GUI thread）。"""
+        self._code_by_text = self._completer.set_catalog(tuple(entries))
+
+    def _on_code_activated(self, text: str) -> None:
+        """Dropdown 選中一行 → 用嚴格大小寫 canonical code switch（保留當前週期）。"""
+        code = self._code_by_text.get(text)
+        if not code:
+            return
+        self.code_edit.setText(code)
+        self._engine.switch(code=code, kline_type=self.period_combo.currentText())
 
     def _on_error(self, msg: str) -> None:
         label = QLabel(f"⚠ {msg}")

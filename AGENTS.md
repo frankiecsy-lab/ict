@@ -109,3 +109,17 @@
 #### 3. 🥇 PySide6 pyqtSignal 跨線程遞送語義（2026-09-30 probe 驗證）
 *   **【問題/限制】**：由非 GUI thread emit signal → plain Python callable **唔會同步收到**（AutoConnection queue 咗，要 event loop 先 drain）。
 *   **【解決/避坑方案】**：生產環境靠 `app.exec()` 嘅 GUI event loop auto-queue（正常）；單測若要斷言 signal，必須喺**同一 thread** emit（直接同步遞送），或者用 `threading.Event` + 狀態斷言代替 signal 斷言。
+
+#### 4. 🥇 get_stock_basicinfo 實測行為（HK.HSImain 目錄 fetch，2026-09-30 live 驗證；詳見 `engine/futu_engine.py::_fetch_catalog()`）
+*   **【問題/限制】**：返回 DataFrame **冇 `english_name` 欄位**——實際 17 欄係 `code, name, lot_size, stock_type, stock_child_type, stock_owner, option_type, strike_time, strike_price, suspension, listing_date, stock_id, delisting, index_option_type, main_contract, last_trade_time, exchange_type`。
+*   **【解決/避坑方案】**：英文名欄位用 `getattr(row, "english_name", None)` 優雅退化做 ""（唔會 KeyError）；英文 fuzzy 搜尋 tier 保留，日後 API 加返欄位即刻生效。
+*   **【問題/限制】**：`name` 欄係**簡體中文**（HK.00700 →「腾讯控股」）。
+*   **【解決/避坑方案】**：fuzzy 搜尋方向用 **t2s**（OpenCC `to_simplified`）——query 每 keystroke 轉簡體、entry 名 index build 時預計算一次；見 `engine/stock_catalog.py::to_simplified()`。
+*   **【問題/限制】**：**主力連續合約唔喺列表**——HK 3798 rows / US 13111 rows，`code.str.contains("HSI")` 對 Market.HK 零命中（US 只有 EHSI/HSIC/HSIGF/WHSI 等普通股票）。
+*   **【解決/避坑方案】**：`_SEED_ENTRIES = (StockEntry("HK.HSImain", "恒指期货主连", ""),)` seed **先入** entries + `seen` set dedup（API 日後若返回同 code 會 skip，唔會重複）；確保預設 TRADING_CODE 一定有 autocomplete。
+*   **【問題/限制】**：本機 PySide6 build 嘅 `QStandardItem` **同** `QStandardItemModel` 都喺 `PySide6.QtGui`（唔係 QtWidgets）——由 QtWidgets import 會 `ImportError: cannot import name 'QStandardItem'`。
+*   **【解決/避坑方案】**：見 `ui/stock_completer.py`——`from PySide6.QtGui import QStandardItem, QStandardItemModel`，只有 `QCompleter` 由 QtWidgets import。
+
+#### 5. 🥇 futu-api 背景線程 hang 住 interpreter shutdown（2026-09-30 live smoke 實測）
+*   **【問題/限制】**：futu spawn 嘅非 daemon 線程會令 Python process 喺 `ctx.close()` 之後**永遠 hang**——live smoke script 唔加處理會 timeout。
+*   **【解決/避坑方案】**：smoke/test script 喺 `ctx.close()` 後用 `os._exit(0)` 強制退出；另外 piped stdout 係 block-buffered，`os._exit` 會 skip flush → 每個 print 必須帶 `flush=True`。
