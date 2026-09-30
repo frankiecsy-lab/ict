@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 11 | **月K（K_MON）切換失敗修復**（live 使用發現：撳 K_MON 按鍵圖表冇更新、仲係顯示舊週期數據）：根因係 `history_window()` 為大週期 × 大 count 算出過長窗口——`K_MON`(43200min)×1000 ≈ **123 年**跨度，超過 OpenD `request_history_kline` 嘅 ~55 年臨界點（實測邊界：55yr OK / 60yr → `ret=-1 F3CNN返回错误`）→ fetch raise → `_reconfigure()` rollback → 圖表保持舊數據。修復：新增 `_MAX_WINDOW_DAYS=40*365` clamp——窗口寬度上限 **40 年**（遠低於臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。實測 K_MON 由 `ret=-1` → **`ret=0 / 256 根`**（全部月線）、K_WEEK 照常 1000 根。2 項回歸單測（全套 **270 passed**） |
 | 2026-09-30 | Step 2 · Commit 10 | **last-price 水平線跟隨「真正最新一根 bar」**（live 使用發現：pan 左走後虛線顯示嘅係可見視窗最右邊嗰根 K 線嘅 close，唔係真實最新價）：`paintEvent` 由 `bars[-1]`（visible_window slice）改用 `self._bars[-1]`——無論 pan/zoom 到咩位置，虛線 + 右軸 tag 永遠顯示數據尾部真正最新一根 bar 嘅 close；加 bounds-check（同 gridline 一樣）：最新價超出當前 Y 範圍（auto-fit 只 fit 可見 bars / 手動 Y zoom/pan）→ 整條線 + tag 唔畫，避免繪製出界。2 項 pixel 級回歸單測（offscreen render + `#FFB020` 精確色計數：tag 必須喺 y(真正最新價) 而唔係 y(可見視窗最右 close)；超範圍時全圖零 last-price 像素）。全套 **268 passed** |
 | 2026-09-30 | Step 2 · Commit 9 | **K 線圖多段式縮放 + 放大/縮小按鍵**（live 使用發現「只有兩段」bug）：根因係 Windows wheel 每物理 notch 報 `angleDelta.y()=±120°`，未正規化會令單 notch 變 `1.25**120 ≈ 3e13` → X 軸縮放直接 clamp 去 min(5)/max(2000) 極限（放大即跳到 5 根超大蠟燭）。修復：新增純函數 `wheel_notches()`（±120° → ±1 階）+ `wheelEvent` 改用正規化 delta——**每物理 notch / 按鍵點擊 = 一階 ×/÷1.25**；control bar 右側新增**放大/縮小按鍵**→ `CandleChart.zoom_in()/zoom_out()`（中心錨定、無數據 no-op）。踩坑：PySide6 `clicked` 有 `(bool)` 重載會令直接 connect 變 no-op → lambda 包零參數調用。14 項新單測（全套 **266 passed**） |
 | 2026-09-30 | Step 2 · Commit 8 | **K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**：`ui/candle_chart.py` 新增互動視圖狀態（X = (可見根數, 右偏移)——右偏移 0 = 右 pin 跟隨 live；Y = 手動價格範圍，None=auto-fit）+ 五個純函數（`visible_window`/`zoom_x`/`pan_x`/`zoom_y`/`pan_y`：游標錨定縮放、邊界 clamp、可獨立單測）。手勢：wheel = X 軸縮放（錨定游標，每 notch ×/÷1.25）、Ctrl/Shift+wheel = Y 軸縮放、左鍵拖曳 = 左右平移、右鍵拖曳 = 垂直平移、雙擊 = `reset_view()`；切換標的自動 reset。30 項新單測（全套 **252 passed**） |
@@ -41,6 +42,7 @@
 - [x] Commit 8：**K 線圖 X/Y 軸縮放 + 手勢 + 左右平移**——互動視圖狀態（X=(可見根數,右偏移)、Y=手動範圍|auto-fit）+ 五個純函數 pan/zoom（游標錨定、邊界 clamp）；wheel/Ctrl+wheel/左鍵拖曳/右鍵拖曳/雙擊 reset
 - [x] Commit 9：**K 線圖多段式縮放 + 放大/縮小按鍵**——`wheel_notches()` 將 Windows ±120° wheel delta 正規化返每 notch 一階 ×/÷1.25（修「只有兩段」bug：未正規化單 notch 直跳 min/max 極限）；control bar 右側放大/縮小按鍵 → `zoom_in()/zoom_out()`（中心錨定分步縮放）
 - [x] Commit 10：**last-price 水平線跟隨真正最新一根 bar**——`paintEvent` 由可見視窗 slice 改用 `self._bars[-1]`（pan 左走後仍顯示真實最新價）+ bounds-check（最新價超出當前 Y 範圍 → 整條線 + tag 唔畫）
+- [x] Commit 11：**月K（K_MON）切換失敗修復**——`history_window()` 大週期 × 大 count 算出過長窗口（K_MON×1000 ≈ 123 年 > OpenD ~55 年臨界點 → `ret=-1` → rollback）→ 加 `_MAX_WINDOW_DAYS=40*365` clamp
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -97,6 +99,7 @@ Engine 只持一個 immutable `_State(aggregator, code, kline_type, anchor_date)
 ### 歷史 K 線取得（實測驗證行為）
 
 - **必須明確窗口**：`request_history_kline` 唔帶 start/end 對 HK.HSImain 會返回一年前舊數據 → `history_window()` 用 now() 計算保守窗口（覆蓋夜期 ~834 min/日）。
+- **窗口寬度上限 clamp**：OpenD 對過長窗口會拒收——實測 K_MON 跨度 >~55 年 → `ret=-1 F3CNN返回错误`。大週期 × 大 count 算出嘅理論窗口可達百多年（K_MON×1000 ≈ 123 年）→ `history_window()` 將窗口寬度 clamp 到 `_MAX_WINDOW_DAYS=40*365`（遠低於臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。
 - **返回頭 N 根而非最近 N 根**：window + max_count 返回時間序頭 N 根 → `page_req_key` 分頁攞晒（1000 根/頁）再 tail `history_count` 根。
 - **按欄位名提取**：DataFrame 欄位順序係 open/close/high/low（唔係 OHLC）→ 一律 `df[["time_key","open","high","low","close","volume"]]`。
 - **Live tick data_time 係 time-only**（'HH:mm:ss.SSS'，無日期）→ `resolve_tick_datetime()` 補 date = max(anchor, market_today)；anchor = seed 最後一根 bar 嘅日期（處理夜期跨午夜 + clock skew）；market_today 用 `_fallback_date()` 以**市場自己時區**（zoneinfo：HK=Asia/Hong_Kong / US=America/New_York，未知 prefix 回落 HK）計算——美股喺 HKT 機上「今日」會同 machine-local 差一日。

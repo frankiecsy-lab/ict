@@ -10,6 +10,10 @@ import math
 from datetime import date, datetime, time as dtime, timedelta
 
 _MINUTES_PER_DAY = 24 * 60
+# request_history_kline 窗口寬度上限（天）：OpenD 對過長窗口會拒收（實測 K_MON 跨度 >~55 年 → ret=-1
+# F3CNN返回错误）。大週期 × 大 count 算出嘅理論窗口可達百多年（K_MON×1000 ≈ 123 年）→ 必須 clamp。
+# 40 年遠低於臨界點（留 ~15 年安全餘量），且已覆蓋 HK.HSImain 全部可用歷史（~21 年）。
+_MAX_WINDOW_DAYS = 40 * 365
 
 
 def parse_market_time(value) -> datetime | None:
@@ -120,5 +124,6 @@ def history_window(period_minutes: int, count: int, now=None) -> tuple[str, str]
         days = math.ceil(count * period_minutes / 360.0) + 2
     else:
         days = int(math.ceil(count * (period_minutes / _MINUTES_PER_DAY) * 1.5)) + 7
+    days = min(days, _MAX_WINDOW_DAYS)  # 大週期 × 大 count → clamp，防 OpenD 拒收過長窗口
     start = now - timedelta(days=days)
     return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")

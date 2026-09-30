@@ -1,9 +1,11 @@
 """timeutil 單測：時間解析、週期 floor、bar key、方向判定、tick 時間補全、歷史窗口。"""
+import math
 from datetime import date, datetime, time as dtime, timedelta
 
 import pytest
 
 from engine.timeutil import (
+    _MAX_WINDOW_DAYS,
     bar_key,
     floor_to_period,
     history_window,
@@ -160,6 +162,19 @@ class TestHistoryWindow:
         # K_DAY: days = int(ceil(300*1.5))+7 = 457（日線要覆蓋更多自然日）
         start, _ = history_window(24 * 60, 300, now=self.NOW)
         assert start == (self.NOW - timedelta(days=457)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_mon_period_clamped_to_max_window(self):
+        # K_MON(43200min) × 1000 → raw days ≈ 45007（>123 年）→ OpenD 拒收過長窗口。
+        # clamp 到 _MAX_WINDOW_DAYS：start = NOW − max_window，唔會算出百多年跨度。
+        start, end = history_window(30 * 24 * 60, 1000, now=self.NOW)
+        assert start == (self.NOW - timedelta(days=_MAX_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        assert end == "2026-09-30 15:00:00"
+
+    def test_week_period_not_clamped(self):
+        # K_WEEK(10080min) × 300 → raw days ≈ 10577（< max）→ 唔受 clamp 影響。
+        start, _ = history_window(7 * 24 * 60, 300, now=self.NOW)
+        expected_days = int(math.ceil(300 * (7 * 24 * 60 / (24 * 60)) * 1.5)) + 7
+        assert start == (self.NOW - timedelta(days=expected_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def test_format_is_futu_compatible(self):
         start, end = history_window(1, 10, now=self.NOW)

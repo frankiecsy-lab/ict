@@ -121,4 +121,9 @@
 *   **【正確資源】**：PySide6 signal overload 綁定機制；本專案 offscreen probe 實測（click → slot 收到 `False`）。
 *   **【解決/避坑方案】**：**用 lambda 包零參數調用**——`btn.clicked.connect(lambda: self.chart.zoom_in())`，lambda 無參數 → PySide6 只能綁定無參數 overload，永遠傳唔到 bool。本專案即係 `ui/main_window.py::_build_control_bar()` 嘅放大/縮小按鍵接線。通用規則：connect 任何**帶可選參數**嘅方法去 Qt signal 前，先確認該 signal 有冇多 overload（`clicked`、`activated`、`pressed` 等 button/completer signal 都有）；唔確定就一律 lambda 包零參數調用。另注意：offscreen QPA 下 `btn.click()` 可以正常驅動 signal（同 completer popup 唔同），所以呢類接線 bug **可以**用 offscreen widget 單測抓到——本專案即係 `tests/test_main_window.py::test_zoom_buttons_wired_to_chart`。
 
+#### 5. 🥉 Futu OpenD：`request_history_kline` 窗口寬度上限（~55 年）——過長會 `ret=-1 F3CNN返回错误`
+*   **【問題/限制】**：OpenD `request_history_kline` 對**過長嘅 start/end 窗口**會拒收。實測邊界（HK.HSImain K_MON）：50yr / 55yr OK、60yr → `ret=-1 F3CNN返回错误，可能是参数错误或者断线`。本專案 `history_window()` 原公式對大週期 × 大 count 會算出百多年窗口（K_MON=43200min × count=1000 ≈ **123 年**）→ fetch raise → `_reconfigure()` rollback → **圖表靜默保持舊數據**（表現成「撳月K冇反應、仲係顯示週K」——唔會報錯，好難察覺）。
+*   **【正確資源】**：本專案 live probe 實測（逐段試窗口跨度搵臨界點）；futu-api `request_history_kline` 文檔。
+*   **【解決/避坑方案】**：`engine/timeutil.py::history_window()` 加 `_MAX_WINDOW_DAYS=40*365` clamp——窗口寬度上限 **40 年**（遠低於 ~55 年臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。通用規則：任何「按週期 × count 估算窗口」嘅邏輯都要 clamp 上限；大週期（K_MON/K_QUARTER/K_YEAR）尤其要防。另注意：clamp 後 K_MON 返回 **256 根**（= 全部可用月線，少於 history_count），分頁 tail 邏輯天然處理——唔會報錯、只係拿晒有嘅數據。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*
