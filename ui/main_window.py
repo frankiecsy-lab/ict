@@ -1,8 +1,8 @@
 """全屏幕終端主窗口：control bar + CandleChart + FutuEngine 接線 + 狀態列。
 
 - 頂部 control bar：標的編號輸入欄（fuzzy autocomplete：編號 / 中英文名、簡繁兼容，
-  目錄由 engine `catalog_ready` 一次性載入）+ K 線週期 combo，
-  returnPressed / dropdown activated → engine.switch(code, kline_type) 運行時切換。
+  目錄由 engine `catalog_ready` 一次性載入）+ K 線週期按鍵組（checkable + autoExclusive），
+  returnPressed / 按鍵點擊 → engine.switch(code, kline_type) 運行時切換。
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
   history_ready / bars_changed → chart.update_bars；status / error → status bar；
@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QMainWindow, QPushButton, QVBoxLayout, QWidget)
 
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
@@ -59,17 +59,25 @@ class MainWindow(QMainWindow):
         self._engine.start(cfg)
 
     def _build_control_bar(self):
-        """頂部 control bar：標的編號輸入欄 + K 線週期 combo（深色主題跟 cfg 配色）。"""
+        """頂部 control bar：標的編號輸入欄 + K 線週期按鍵組（深色主題跟 cfg 配色）。"""
         cfg = self._cfg
         bar = QFrame()
         bar.setFixedHeight(40)
         bar.setStyleSheet(
             f"QFrame {{ background: {cfg.grid_color}; border-bottom: 1px solid {cfg.axis_text_color}; }}"
             f"QLabel {{ color: {cfg.text_color}; font-family: Consolas; padding-left: 8px; }}"
-            f"QLineEdit, QComboBox {{"
+            f"QLineEdit {{"
             f" background: {cfg.bg_color}; color: {cfg.text_color};"
             f" border: 1px solid {cfg.axis_text_color}; border-radius: 4px;"
             f" padding: 2px 8px; font-family: Consolas; }}"
+            f"QPushButton {{"
+            f" background: {cfg.bg_color}; color: {cfg.text_color};"
+            f" border: 1px solid {cfg.axis_text_color}; border-radius: 4px;"
+            f" padding: 2px 8px; font-family: Consolas; }}"
+            f"QPushButton:hover {{ background: {cfg.grid_color}; }}"
+            f"QPushButton:checked {{"
+            f" background: {cfg.last_price_color}; color: {cfg.bg_color};"
+            f" border-color: {cfg.last_price_color}; font-weight: bold; }}"
         )
         h = QHBoxLayout(bar)
         h.setContentsMargins(8, 0, 8, 0)
@@ -89,23 +97,32 @@ class MainWindow(QMainWindow):
         h.addSpacing(16)
         h.addWidget(QLabel("週期"))
 
-        self.period_combo = QComboBox()
-        # 先 set items/index 再 connect（避免初始設定觸發 activated → switch）
-        self.period_combo.addItems(list(KLINE_TYPES))
-        idx = KLINE_TYPES.index(cfg.kline_type) if cfg.kline_type in KLINE_TYPES else 0
-        self.period_combo.setCurrentIndex(idx)
-        h.addWidget(self.period_combo)
+        # K 線週期按鍵組（checkable + autoExclusive）：取代 dropdown，一鍵直切
+        self._period_group = QButtonGroup(self)
+        self._period_group.setExclusive(True)
+        for name in KLINE_TYPES:
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._period_group.addButton(btn)
+            h.addWidget(btn)
+            if cfg.kline_type == name:
+                btn.setChecked(True)  # 先 set checked 再 connect（避免初始觸發 switch）
 
         h.addStretch(1)
 
-        def _do_switch():
-            # 一次 action 傳齊兩個值（避免連續兩次 switch）
-            self._engine.switch(code=self.code_edit.text(),
-                                kline_type=self.period_combo.currentText())
-
-        self.code_edit.returnPressed.connect(_do_switch)
-        self.period_combo.activated.connect(lambda _idx: _do_switch())
+        self.code_edit.returnPressed.connect(self._do_switch)
+        self._period_group.buttonClicked.connect(lambda _btn: self._do_switch())
         return bar
+
+    def current_period(self) -> str:
+        """當前選中嘅 K 線週期名（button group checked button text）。"""
+        btn = self._period_group.checkedButton()
+        return btn.text() if btn else KLINE_TYPES[0]
+
+    def _do_switch(self):
+        # 一次 action 傳齊兩個值（避免連續兩次 switch）
+        self._engine.switch(code=self.code_edit.text(), kline_type=self.current_period())
 
     def _on_catalog_ready(self, entries) -> None:
         """Engine setup thread fetch 完 HK+US 目錄 → rebuild completer model（GUI thread）。"""
@@ -117,7 +134,7 @@ class MainWindow(QMainWindow):
         if not code:
             return
         self.code_edit.setText(code)
-        self._engine.switch(code=code, kline_type=self.period_combo.currentText())
+        self._engine.switch(code=code, kline_type=self.current_period())
 
     def _on_error(self, msg: str) -> None:
         label = QLabel(f"⚠ {msg}")

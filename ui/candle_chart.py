@@ -187,17 +187,19 @@ class CandleChart(QWidget):
             p.drawText(QRectF(x - 40, vol_r.bottom() + 4, 80, 16),
                        Qt.AlignHCenter | Qt.AlignTop, time_label(bars[i][0]))
 
-        # --- volume subpane（先畫，蠟燭層喺上面）
+        # --- volume subpane（先畫，蠟燭層喺上面；bar 寬度同蠟燭 body 一致）
         vmax = volume_max(bars)
         slot = self._bar_slot(n, plot)
         body_w = max(1.0, slot * 0.7)
         up_c = QColor(cfg.up_color)
         down_c = QColor(cfg.down_color)
+        p.setPen(Qt.NoPen)
         for i, b in enumerate(bars):
             x = self._bar_x(i, n, plot)
             h_px = (b[5] / vmax) * vol_r.height()
-            p.setPen(QColor(up_c if b[4] >= b[1] else down_c))
-            p.drawLine(int(x), int(vol_r.bottom()), int(x), int(vol_r.bottom() - h_px))
+            color = up_c if b[4] >= b[1] else down_c
+            p.setBrush(QBrush(color))
+            p.drawRect(QRectF(x - body_w / 2, vol_r.bottom() - h_px, body_w, max(1.0, h_px)))
 
         # --- 蠟燭（wick + body）
         for i, b in enumerate(bars):

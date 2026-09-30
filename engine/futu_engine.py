@@ -69,12 +69,20 @@ _CODE_RE = re.compile(r"^(HK|US)\.\w+$", re.IGNORECASE)
 
 # Futu 代碼大小寫敏感特例（主力連續合約）：OpenD 拒收全 upper 形式（實測「未知股票 HSIMAIN」）
 _CODE_ALIASES = {
-    "HK.HSIMAIN": "HK.HSImain",  # 恒指期貨主連
+    "HK.HSIMAIN": "HK.HSImain",   # 恒指期貨主連
+    "HK.HHIMAIN": "HK.HHImain",   # 國指期貨主連
+    "HK.MHIMAIN": "HK.MHImain",   # 小恒指期貨主連
 }
 
 # get_stock_basicinfo 唔包含主力連續合約（2026-09-30 live 實測：HK 3798 rows 冇 HSImain）
-# → seed 補返，確保預設 TRADING_CODE 一定有 autocomplete；API 日後若返回同 code 會 dedup skip
-_SEED_ENTRIES = (StockEntry("HK.HSImain", "恒指期货主连", ""),)
+# → seed 補返，確保預設 TRADING_CODE 一定有 autocomplete；API 日後若返回同 code 會 dedup skip。
+# 三隻 HK 指數期貨主連均經 get_market_snapshot live 驗證（2026-09-30）；US/SG 指數期貨本帳號
+# 行情權限不足、官方名稱無法核實 → 暫唔 seed（避免 seed-first dedup 用錯名 shadow API 正確名）。
+_SEED_ENTRIES = (
+    StockEntry("HK.HSImain", "恒指期货主连", ""),
+    StockEntry("HK.HHImain", "国指期货主连", ""),
+    StockEntry("HK.MHImain", "小恒指期货主连", ""),
+)
 
 
 def _normalize_code(raw: str) -> str:

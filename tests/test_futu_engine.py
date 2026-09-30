@@ -246,7 +246,7 @@ class TestFetchCatalog:
             Market.US: (RET_OK, basic_df([("US.AAPL", "苹果", "Apple Inc.")])),
         })
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain", "HK.00700", "US.AAPL"]  # seed 先入 + dedup skip API 重複
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain", "HK.00700", "US.AAPL"]  # 3 seeds 先入 + dedup skip API 重複
         by_code = {e.code: e for e in entries}
         assert by_code["HK.00700"].name_cn == "腾讯控股"
         assert by_code["US.AAPL"].name_en == "Apple Inc."
@@ -256,7 +256,7 @@ class TestFetchCatalog:
         df = pd.DataFrame([dict(code="US.X", name=float("nan"), english_name=None)])
         ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain", "US.X"]  # seed + US row
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain", "US.X"]  # seeds + US row
         by_code = {e.code: e for e in entries}
         assert by_code["US.X"].name_cn == "" and by_code["US.X"].name_en == ""
 
@@ -267,7 +267,7 @@ class TestFetchCatalog:
                            dict(code="US.AAPL", name="dup", english_name="")])
         ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain", "US.AAPL"]  # seed + dedup 後單一 US row
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain", "US.AAPL"]  # seeds + dedup 後單一 US row
 
     def test_one_market_exception_other_still_fetched(self):
         eng = make_engine()
@@ -276,14 +276,14 @@ class TestFetchCatalog:
             Market.US: (RET_OK, basic_df([("US.MSFT", "", "Microsoft Corp.")])),
         })
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain", "US.MSFT"]  # HK exception 唔阻 US + seed
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain", "US.MSFT"]  # HK exception 唔阻 US + seeds
 
     def test_ret_not_ok_skipped_without_crash(self):
         eng = make_engine()
         ctx = FakeCtx([], basicinfo={Market.HK: (-1, "no permission"),
                                      Market.US: (RET_OK, pd.DataFrame())})
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain"]  # 兩市場全失敗 → 只剩 seed
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain"]  # 兩市場全失敗 → 只剩 seeds
 
     def test_missing_columns_yield_no_entries(self):
         """df 冇 code/name/english_name 欄（schema 差異）→ getattr None → skip，唔炸。"""
@@ -291,22 +291,22 @@ class TestFetchCatalog:
         df = pd.DataFrame([dict(foo=1, bar=2)])
         ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain"]  # schema 差異 → 只剩 seed
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain"]  # schema 差異 → 只剩 seeds
 
     def test_seed_present_when_api_empty_and_deduped(self):
         """live 實測：get_stock_basicinfo 唔返回主力連續合約（HK 3798 rows 冇 HSImain）
-        → _SEED_ENTRIES 補返預設標的；API 若日後返回同 code 只保留 seed 一份。"""
+        → _SEED_ENTRIES 補返三隻 HK 指數期貨主連；API 若日後返回同 code 只保留 seed 一份。"""
         eng = make_engine()
         ctx = FakeCtx([], basicinfo={Market.HK: (RET_OK, pd.DataFrame()),
                                      Market.US: (RET_OK, pd.DataFrame())})
         entries = eng._fetch_catalog(ctx)
-        assert [e.code for e in entries] == ["HK.HSImain"]
+        assert [e.code for e in entries] == ["HK.HSImain", "HK.HHImain", "HK.MHImain"]
 
         ctx2 = FakeCtx([], basicinfo={
             Market.HK: (RET_OK, basic_df([("HK.HSImain", "恒指期貨主連(異體)", "")])),
         })
         entries2 = eng._fetch_catalog(ctx2)
-        assert [e.code for e in entries2] == ["HK.HSImain"]  # dedup：seed 先入，API row skip
+        assert [e.code for e in entries2] == ["HK.HSImain", "HK.HHImain", "HK.MHImain"]  # dedup：seeds 先入，API row skip
 
 
 # ---------------------------------------------------------------- on_recv_rsp
