@@ -3,14 +3,29 @@
 唯一事實來源係 .env 檔案（範本見 .env.example）；本模組只負責讀取環境變數並
 組裝成 immutable Config。純 stdlib + python-dotenv 實現，無 Qt / futu 依賴，
 可獨立單測。
+
+.env 路徑：開發模式 = 專案根目錄；PyInstaller frozen（onedir）= exe 旁邊——
+用戶部署時將 .env 放喺 dist/ICT-Trader-win/.env（或 Ubuntu 版同層）即可。
 """
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+def _default_env_path() -> Path:
+    """預設 .env 路徑。
+
+    開發模式 = 專案根目錄（config.py 同層）；PyInstaller frozen 模式 = exe 旁邊
+    （onedir dist 目錄）——唔係 sys._MEIPASS（temp dir，啟動後即刪、用戶改唔到）。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().with_name(".env")
+    return Path(__file__).resolve().with_name(".env")
 
 # K 線週期（futu KLType 列舉名）→ 分鐘數；未知週期直接報錯，避免靜默用錯聚合粒度
 _KLINE_PERIOD_MINUTES = {
@@ -100,7 +115,7 @@ class Config:
         方便測試與部署時臨時覆蓋。
         """
         if env_file is None:
-            env_file = Path(__file__).resolve().with_name(".env")
+            env_file = _default_env_path()
         load_dotenv(env_file, override=False)
 
         kline_type = _str("KLINE_TYPE", "K_1M").upper()

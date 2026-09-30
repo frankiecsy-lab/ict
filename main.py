@@ -1,6 +1,7 @@
 """ICT Trader 入口：Config → QApplication + MainWindow → event loop。
 
-- Config.from_env() 失敗（例如未知 KLINE_TYPE）→ stderr 報錯並 exit(1)，唔開窗口。
+- Config.from_env() 失敗（例如未知 KLINE_TYPE）→ 報錯並 exit(1)，唔開窗口；
+  windowed build（無 console，sys.stdout is None）改用 QMessageBox 彈出。
 - SIGINT（Ctrl+C）→ 排程 app.quit()，行完 event loop 先 clean shutdown。
 - exec() 返回後 finally window.shutdown()：close OpenD context + join setup thread。
 """
@@ -17,11 +18,22 @@ from config import Config
 from ui.main_window import MainWindow
 
 
+def _report_config_error(message: str) -> None:
+    """配置錯誤回報：有 console → stderr；windowed build（無 console）→ 彈出對話框。"""
+    if getattr(sys, "frozen", False) and sys.stdout is None:
+        from PySide6.QtWidgets import QMessageBox
+
+        app = QApplication.instance() or QApplication([])
+        QMessageBox.critical(None, "ICT Trader 配置錯誤", message)
+    else:
+        print(f"配置錯誤：{message}", file=sys.stderr)
+
+
 def main() -> int:
     try:
         cfg = Config.from_env()
     except ValueError as exc:
-        print(f"配置錯誤：{exc}", file=sys.stderr)
+        _report_config_error(str(exc))
         return 1
 
     logging.basicConfig(

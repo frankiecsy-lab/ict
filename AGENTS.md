@@ -126,4 +126,15 @@
 *   **【正確資源】**：本專案 live probe 實測（逐段試窗口跨度搵臨界點）；futu-api `request_history_kline` 文檔。
 *   **【解決/避坑方案】**：`engine/timeutil.py::history_window()` 加 `_MAX_WINDOW_DAYS=40*365` clamp——窗口寬度上限 **40 年**（遠低於 ~55 年臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。通用規則：任何「按週期 × count 估算窗口」嘅邏輯都要 clamp 上限；大週期（K_MON/K_QUARTER/K_YEAR）尤其要防。另注意：clamp 後 K_MON 返回 **256 根**（= 全部可用月線，少於 history_count），分頁 tail 邏輯天然處理——唔會報錯、只係拿晒有嘅數據。
 
+#### 6. 🥉 PyInstaller：`--collect-submodules PySide6` 令 build 極慢（~10min+）；futu data files 要明確 `--collect-data futu`
+*   **【問題/限制】**：(1) `--collect-submodules PySide6` 會分析 **全部** PySide6 submodules（QtWebEngineCore / Qt3D / QtCharts…），Windows build 實測 >10 分鐘（background task 直接 timeout）——完全唔需要，因為 PyInstaller 內置 `hook-PySide6.py` 已經用 `pyside6_library_info.collect_extra_binaries()` 自動收集晒所有 Qt binaries + plugins（platforms/qoffscreen、styles、imageformats…）。(2) `futu/__init__.py:117` import 時讀取 package 內 data file `VERSION.txt`——PyInstaller **唔會**自動收集第三方 package 嘅 data files → frozen binary 啟動即 crash：`FileNotFoundError: .../_internal/futu/VERSION.txt`。
+*   **【正確資源】**：PyInstaller 官方文檔（hooks / collect-data）；本專案實測（Windows + WSL Ubuntu）。
+*   **【解決/避坑方案】**：build flags 淨係 `--collect-data futu`（收集 VERSION.txt / proto 等 data files，唔會分析多餘 submodules）——見 `scripts/build_exe.py` / `scripts/build_ubuntu.sh`。通用規則：frozen app 啟動 crash 喺第三方 package import 時讀 file → 90% 係漏咗 `--collect-data <pkg>`；Qt bindings 唔好手動 collect submodules（內置 hook 已處理）。另注意：PyInstaller onedir 產物目錄名 = `--name` 值（`dist/ICT-Trader/`、`dist/ict-trader/`），build 腳本要 rename 做平台標識名；Windows filesystem case-insensitive——`dist/ICT-Trader` 同 `dist/ict-trader` 係同一個目錄，雙平台 build 唔好同時喺同一 repo 跑。
+*   **【補充（產物膨脹）】**：用**裝晒成百套件嘅 global Python** build 會令 PyInstaller `hook-pandas.py` 將 pandas optional deps（torch/cv2/transformers/scipy…，只要 site-packages 有就收集）全部打入產物——本專案實測 **1.5GB vs 乾淨 venv ~300MB**。兩邊 build 腳本都改用**獨立乾淨 venv**（`.venv-win` / `.venv-ubuntu`，只 pin requirements.txt 必要依賴）。
+
+#### 7. 🥉 PyInstaller frozen：`.env` 要讀 exe 旁邊（唔係 `_MEIPASS`）+ windowed build 冇 console
+*   **【問題/限制】**：frozen onedir 模式下 `sys._MEIPASS` 係 temp dir（啟動時解壓、退出即刪），用戶改唔到；而 `Path(__file__)` 喺 frozen 後指向 `_internal/` 內——兩者都唔適合放用戶可編輯嘅 `.env`。另外 `--windowed` build **冇 console**：`sys.stdout/stderr is None`，配置錯誤如果淨係 `print(..., file=sys.stderr)` → 用戶完全無從得知點解 app 即刻退出（靜默閃退）。
+*   **【正確資源】**：PyInstaller 官方文檔（Runtime Temporary Folder / Windows GUI apps）；本專案實測。
+*   **【解決/避坑方案】**：`config.py::_default_env_path()`——frozen 時 `.env` = `Path(sys.executable).with_name(".env")`（exe 旁邊，用戶部署可改、改完重開 app 生效），開發模式照舊專案根目錄；build 腳本自動由 `.env.example` 生成預設 `.env` 入產物夾。`main.py::_report_config_error()`——frozen + `sys.stdout is None`（windowed）→ `QMessageBox.critical` 彈出，否則 stderr。通用規則：任何「用戶可編輯配置」喺 frozen app 都要放 exe 旁邊或 `%APPDATA%`，唔好放 `_MEIPASS`；windowed build 嘅所有錯誤回報都要有 GUI fallback。
+
 *(此處留空，供 AI 在後續開發中自動填入發現的頻率限制、新官方文檔網址等珍貴經驗)*

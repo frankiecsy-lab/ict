@@ -13,6 +13,10 @@
 # ====================================================================
 venv/
 .venv/
+# Ubuntu build venv（scripts/build_ubuntu.sh 產生，WSL 內）
+.venv-ubuntu/
+# Windows build venv（scripts/build_exe.py 產生；乾淨環境避免收集無關套件）
+.venv-win/
 env/
 ENV/
 lib/
@@ -44,6 +48,8 @@ share/python-wheels/
 build/
 develop-eggs/
 dist/
+# PyInstaller spec（scripts/build_*.py 產生）
+*.spec
 downloads/
 eggs/
 installed.cfg

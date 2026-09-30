@@ -6,6 +6,7 @@
 
 | 日期 | 階段 | 更新摘要 |
 |---|---|---|
+| 2026-09-30 | Step 2 · Commit 12 | **雙平台執行檔建置（Windows / Ubuntu x86-64，PyInstaller onedir）**：新增 `scripts/build_exe.py`（Windows → `dist/ICT-Trader-win/ICT-Trader.exe`）+ `scripts/build_ubuntu.sh`（WSL Ubuntu native build → `dist/ICT-Trader-ubuntu/ict-trader`；venv + apt tzdata/libgl1，唔需要 Docker daemon）。**frozen 模式支援**：`.env` 改讀 **exe 旁邊**（`config.py::_default_env_path()`——唔係 `_MEIPASS` temp dir，用戶部署可改）+ windowed build 配置錯誤彈 `QMessageBox`（`main.py::_report_config_error()`）。新增 `scripts/smoke_test.py` offscreen smoke。6 項新單測（全套 **276 passed**） |
 | 2026-09-30 | Step 2 · Commit 11 | **月K（K_MON）切換失敗修復**（live 使用發現：撳 K_MON 按鍵圖表冇更新、仲係顯示舊週期數據）：根因係 `history_window()` 為大週期 × 大 count 算出過長窗口——`K_MON`(43200min)×1000 ≈ **123 年**跨度，超過 OpenD `request_history_kline` 嘅 ~55 年臨界點（實測邊界：55yr OK / 60yr → `ret=-1 F3CNN返回错误`）→ fetch raise → `_reconfigure()` rollback → 圖表保持舊數據。修復：新增 `_MAX_WINDOW_DAYS=40*365` clamp——窗口寬度上限 **40 年**（遠低於臨界點、留 ~15 年安全餘量，且已覆蓋 HK.HSImain 全部可用歷史 ~21 年）。實測 K_MON 由 `ret=-1` → **`ret=0 / 256 根`**（全部月線）、K_WEEK 照常 1000 根。2 項回歸單測（全套 **270 passed**） |
 | 2026-09-30 | Step 2 · Commit 10 | **last-price 水平線跟隨「真正最新一根 bar」**（live 使用發現：pan 左走後虛線顯示嘅係可見視窗最右邊嗰根 K 線嘅 close，唔係真實最新價）：`paintEvent` 由 `bars[-1]`（visible_window slice）改用 `self._bars[-1]`——無論 pan/zoom 到咩位置，虛線 + 右軸 tag 永遠顯示數據尾部真正最新一根 bar 嘅 close；加 bounds-check（同 gridline 一樣）：最新價超出當前 Y 範圍（auto-fit 只 fit 可見 bars / 手動 Y zoom/pan）→ 整條線 + tag 唔畫，避免繪製出界。2 項 pixel 級回歸單測（offscreen render + `#FFB020` 精確色計數：tag 必須喺 y(真正最新價) 而唔係 y(可見視窗最右 close)；超範圍時全圖零 last-price 像素）。全套 **268 passed** |
 | 2026-09-30 | Step 2 · Commit 9 | **K 線圖多段式縮放 + 放大/縮小按鍵**（live 使用發現「只有兩段」bug）：根因係 Windows wheel 每物理 notch 報 `angleDelta.y()=±120°`，未正規化會令單 notch 變 `1.25**120 ≈ 3e13` → X 軸縮放直接 clamp 去 min(5)/max(2000) 極限（放大即跳到 5 根超大蠟燭）。修復：新增純函數 `wheel_notches()`（±120° → ±1 階）+ `wheelEvent` 改用正規化 delta——**每物理 notch / 按鍵點擊 = 一階 ×/÷1.25**；control bar 右側新增**放大/縮小按鍵**→ `CandleChart.zoom_in()/zoom_out()`（中心錨定、無數據 no-op）。踩坑：PySide6 `clicked` 有 `(bool)` 重載會令直接 connect 變 no-op → lambda 包零參數調用。14 項新單測（全套 **266 passed**） |
@@ -43,6 +44,7 @@
 - [x] Commit 9：**K 線圖多段式縮放 + 放大/縮小按鍵**——`wheel_notches()` 將 Windows ±120° wheel delta 正規化返每 notch 一階 ×/÷1.25（修「只有兩段」bug：未正規化單 notch 直跳 min/max 極限）；control bar 右側放大/縮小按鍵 → `zoom_in()/zoom_out()`（中心錨定分步縮放）
 - [x] Commit 10：**last-price 水平線跟隨真正最新一根 bar**——`paintEvent` 由可見視窗 slice 改用 `self._bars[-1]`（pan 左走後仍顯示真實最新價）+ bounds-check（最新價超出當前 Y 範圍 → 整條線 + tag 唔畫）
 - [x] Commit 11：**月K（K_MON）切換失敗修復**——`history_window()` 大週期 × 大 count 算出過長窗口（K_MON×1000 ≈ 123 年 > OpenD ~55 年臨界點 → `ret=-1` → rollback）→ 加 `_MAX_WINDOW_DAYS=40*365` clamp
+- [x] Commit 12：**雙平台執行檔建置**——PyInstaller onedir（Windows `scripts/build_exe.py` / Ubuntu WSL native `scripts/build_ubuntu.sh`）+ frozen 模式 `.env` 讀 exe 旁邊 + windowed 配置錯誤彈框 + offscreen smoke test
 
 ### 下一步（Step 2 後續候選，未定範圍）
 - ICT 指標 overlay：經 `CandleChart.add_overlay()` 加 FVG / Order Block / Kill Zone 圖層
@@ -68,13 +70,14 @@
 
 ```
 D:\coding\ICT_v1\
-├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown
-├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()
+├─ main.py                     # ✅ entry：Config → QApplication + MainWindow(showFullScreen)；SIGINT 排程 quit；finally clean shutdown；windowed build（frozen + 無 console）配置錯誤彈 QMessageBox
+├─ config.py                   # ✅ frozen dataclass Config.from_env()，純 stdlib+dotenv，無 Qt/futu import；公開 KLINE_TYPES / kline_period_minutes()；`_default_env_path()`——frozen 時 .env 讀 exe 旁邊（開發模式 = 專案根目錄）
 ├─ engine\                     # ✅ timeutil / candle_aggregator（純類）/ stock_catalog（StockEntry + fuzzy 搜尋，OpenCC 簡繁轉換；`display_text()` dropdown 行、`name_text()` 名稱 LABEL、`canonical_code()` 存在性驗證）/ futu_engine（QObject：OpenD 連線 + seed + QUOTE 回調聚合 + switch 運行時切換 + get_stock_basicinfo 目錄 fetch）
 ├─ ui\                         # ✅ main_window（control bar：標的輸入欄（**只收純編號**——onChange guard `textChanged` 剝離「code + 名稱」、`canonical_code()` 驗證存在 + 正規化大小寫，fuzzy autocomplete dropdown 選中後只留 code）+ **獨立名稱 LABEL**（`name_text()` 顯示中英文名）+ K 線週期按鍵組（checkable QButtonGroup exclusive）→ engine.switch()）/ stock_completer（StockCompleter matching 委派 StockCatalog + `code_from_completion()` 純函數還原 canonical code + `catalog()` accessor）/ candle_chart（純 QPainter；backpressure coalesce repaint；volume 填充矩形同 body 等寬；**互動視圖狀態 X=(可見根數,右偏移)/Y=手動範圍 + 五個 pan/zoom 純函數（wheel/Ctrl+wheel/拖曳/雙擊 reset）**；add_overlay 擴展點）
-├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：onChange guard 剝離 code+名稱 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅
+├─ scripts\                    # ✅ build_exe.py（Windows PyInstaller onedir → dist/ICT-Trader-win/）/ build_ubuntu.sh（WSL Ubuntu native build → dist/ICT-Trader-ubuntu/）/ smoke_test.py（offscreen 啟動 + clean shutdown smoke）
+├─ tests\                      # test_config.py ✅；test_timeutil.py ✅；test_aggregator.py ✅；test_futu_engine.py ✅（mock ctx，零真實連線；含 switch/_reconfigure/rollback/market tz/catalog fetch + seed）；test_stock_catalog.py ✅（fuzzy 搜尋 + name_text）；test_stock_completer.py ✅（offscreen Qt）；test_main_window.py ✅（offscreen Qt + fake engine：onChange guard 剝離 code+名稱 / 存在性檢查 / 名稱 LABEL）；test_candle_chart.py ✅；test_frozen.py ✅（frozen .env 路徑 + windowed 配置錯誤彈框）
 ├─ .env                        # gitignored；唯一事實來源（host/port/標的/週期/convention）
-├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env）
+├─ .env.example                # ✅ commit 嘅配置文檔（複製做 .env；build 腳本自動生成入產物夾）
 └─ requirements.txt            # pip freeze 輸出（PySide6==6.11.2、futu_api==10.5.6508…）
 ```
 
@@ -130,6 +133,21 @@ python main.py            # 全屏幕啟動；F11 切換全屏幕、Esc 關閉�
 ```
 
 > 前提：本地富途 OpenD 已開（預設 `127.0.0.1:11111`）。連唔到時窗口會照開，status bar 顯示錯誤訊息。
+
+## Build Executables（雙平台執行檔）
+
+PyInstaller **onedir** build（windowed、無 console）；產物係一個資料夾（exe + `_internal/`），整夾 zip / tar.gz 分發。**`.env` 唔會打包**——部署時放喺 exe 旁邊（build 腳本已自動由 `.env.example` 生成一份預設）。
+
+| 平台 | 指令（喺 repo root） | 產物 |
+|---|---|---|
+| Windows x86-64 | `python scripts\build_exe.py [--clean]` | `dist/ICT-Trader-win/ICT-Trader.exe` |
+| Ubuntu x86-64 | WSL：`wsl -d Ubuntu -- bash -lc "cd /mnt/d/coding/ICT_v1 && bash scripts/build_ubuntu.sh"` | `dist/ICT-Trader-ubuntu/ict-trader` |
+
+- **frozen 模式 `.env`**：`config.py::_default_env_path()`——frozen 時讀 **exe 旁邊**（唔係 `_MEIPASS` temp dir，用戶改咗先要重開 app）；開發模式照舊讀專案根目錄。
+- **windowed build 配置錯誤**：無 console → `QMessageBox.critical` 彈出（console / 開發模式照舊 stderr）。
+- **乾淨 venv build**：兩邊都用獨立 venv（`.venv-win` / `.venv-ubuntu`，只 pin 必要依賴）——global Python 裝咗 torch/cv2 等無關套件時，PyInstaller `hook-pandas.py` 會將 pandas optional deps 全部打入產物（實測 1.5GB vs ~300MB）。
+- **Ubuntu build**：WSL Ubuntu native + apt `tzdata libgl1 libegl1`——唔需要 Docker daemon；首次跑會自動裝依賴。
+- **Smoke test**：`QT_QPA_PLATFORM=offscreen python scripts/smoke_test.py [timeout]`——驗證入口可啟動、event loop 行得、clean shutdown（連唔到 OpenD 係預期行為，engine error signal 唔算失敗）。
 
 ## Tests
 
