@@ -33,6 +33,12 @@
   順勢突破最近結構極值 = **BOS**（延續）；首次逆勢突破 = **CHoCH**（反轉訊號，翻轉
   direction）。pivot 需前後各 k bar 確認（喺 i=s+k 先算 confirmed），每個 pivot 只觸發
   一次（break 後 consumed、等下一個新 pivot）。標記畫喺 break 發生嘅 bar。
+- **Premium / Discount**：最近 lookback bar 嘅 dealing range（high max / low min）→
+  equilibrium = midpoint；premium zone = [eq, high]（上方 sell 區）、discount zone =
+  [low, eq]（下方 buy 區）。兩條全寬水平帶（start_idx=0、end_idx=None），背景層。
+- **OTE（Optimal Trade Entry）**：最近位移腿嘅 62%–79% Fibonacci 回撤帶（golden pocket
+  ~70.5%）。用 pivot swing high/low 搵出**最近一個**極值 + 其前最近反向極值做 origin——
+  bullish OTE = [H-0.79·span, H-0.62·span]（由 swing high H 回落）、bearish 對稱。最多兩帶。
 
 全部 O(n) 純函數；bars = tuple[Bar, ...]，Bar = (time_key, open, high, low, close, volume)
 （同 ui/candle_chart.py / engine/candle_aggregator.py 定義）。
@@ -47,9 +53,10 @@ from datetime import datetime
 class Zone:
     """價格錨定指標矩形。
 
-    kind ∈ {"ob", "fvg", "confluence", "breaker", "vob"}；side ∈ {"bullish", "bearish"}。
-    start_idx = origin bar 嘅 global index（矩形左緣）；end_idx=None 表示仍活躍
-    （畫到 plot 右緣），否則喺該 bar 被填補/失效。top/bottom 係價格（top > bottom）。
+    kind ∈ {"ob", "fvg", "confluence", "breaker", "vob", "ote", "premium", "discount"}；
+    side ∈ {"bullish", "bearish"}。start_idx = origin bar 嘅 global index（矩形左緣）；
+    end_idx=None 表示仍活躍（畫到 plot 右緣），否則喺該 bar 被填補/失效。top/bottom 係價格
+    （top > bottom）。premium/discount 用 start_idx=0/end_idx=None 表全寬水平帶。
     """
 
     kind: str
@@ -557,3 +564,61 @@ def detect_structure_breaks(bars, k: int = 2) -> tuple[Marker, ...]:
             if _is_swing_low(bars, s, k):
                 last_sl = (float(bars[s][3]), s)     # arm 一個新可 break low
     return tuple(markers)
+
+
+# ---------------------------------------------------------------- Premium / Discount
+
+def detect_premium_discount(bars, lookback: int = 50) -> tuple[Zone, ...]:
+    """Premium/Discount：最近 lookback bar 嘅 dealing range → equilibrium 分界。
+
+    dealing range = bars[-lookback:]（lookback<=0 → 全部）嘅 high max（range_high）/
+    low min（range_low）；equilibrium = (high+low)/2。**premium zone** = [eq, high]
+    （上方 sell 區，side="bearish"）、**discount zone** = [low, eq]（下方 buy 區，
+    side="bullish"）。兩條全寬水平帶（start_idx=0、end_idx=None）。flat（high<=low）→ ()。
+    """
+    if len(bars) < 2:
+        return ()
+    win = bars[-lookback:] if lookback > 0 else bars
+    hi = max(float(b[2]) for b in win)
+    lo = min(float(b[3]) for b in win)
+    if hi <= lo:
+        return ()
+    eq = (hi + lo) / 2.0
+    return (Zone("premium", "bearish", 0, None, hi, eq),
+            Zone("discount", "bullish", 0, None, eq, lo))
+
+
+# ---------------------------------------------------------------- OTE（Optimal Trade Entry）
+
+def detect_ote_zones(bars, k: int = 3) -> tuple[Zone, ...]:
+    """OTE：最近位移腿嘅 62%–79% Fibonacci 回撤帶（golden pocket ~70.5%）。
+
+    pivot swing high/low（_swing_points，k bar 確認）搵出**最近一個**極值 + 其前最近
+    反向極值做 origin：
+      - bullish OTE（buy zone）：origin = 該 swing high 之前最近嘅 swing low L、extreme =
+        swing high H → 帶 [H-0.79·span, H-0.62·span]（價格由 H 回落入呢個帶）。
+      - bearish OTE（sell zone）：origin = 該 swing low 之前最近嘅 swing high H、extreme =
+        swing low L → 帶 [L+0.62·span, L+0.79·span]。
+    start_idx = extreme pivot index、end_idx=None（活躍到右緣）。最多兩個 zone；無 origin
+    / span<=0 → 該方向唔產出。O(n·k)。
+    """
+    if len(bars) < 2 * k + 1:
+        return ()
+    highs = _swing_points(bars, k, "high")   # [(idx, price), ...] idx 遞增
+    lows = _swing_points(bars, k, "low")
+    out: list[Zone] = []
+    if highs and lows:                       # bullish OTE：最近 swing high + 其前最近 swing low
+        hi_idx, hi_price = highs[-1]
+        prior_low = next((p for i, p in reversed(lows) if i < hi_idx), None)
+        if prior_low is not None and hi_price > prior_low:
+            span = hi_price - prior_low
+            out.append(Zone("ote", "bullish", hi_idx, None,
+                            hi_price - 0.62 * span, hi_price - 0.79 * span))
+    if highs and lows:                       # bearish OTE：最近 swing low + 其前最近 swing high
+        lo_idx, lo_price = lows[-1]
+        prior_high = next((p for i, p in reversed(highs) if i < lo_idx), None)
+        if prior_high is not None and prior_high > lo_price:
+            span = prior_high - lo_price
+            out.append(Zone("ote", "bearish", lo_idx, None,
+                            lo_price + 0.79 * span, lo_price + 0.62 * span))
+    return tuple(out)

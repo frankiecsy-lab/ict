@@ -654,3 +654,115 @@ class TestStructureBreaks:
         assert self._count_in(img_on, QColor("#FF9100")) > 0
         assert self._count_in(img_on, QColor("#E040FB")) > 0
 
+
+class TestPremiumDiscount:
+    """Premium/Discount dealing range 圖層（Step 2 · Commit 21）：set_indicator("pd") →
+    detect_premium_discount()；EQ 線 #CFD8DC 係 palette 唯一色 → off=0 / on>0
+    （premium/discount fill 係 alpha-blend、唔計入 pixel count）。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _pd_bars():
+        """6-bar 序列：max high=13（b1）、min low=8（b2）→ equilibrium=(13+8)/2=10.5。"""
+        ohlc = ((10.0, 12.0, 9.5, 11.0), (11.0, 13.0, 10.0, 12.0), (12.0, 12.5, 8.0, 9.0),
+                (9.0, 11.0, 8.5, 10.5), (10.5, 12.0, 9.5, 11.5), (11.5, 12.2, 10.0, 11.8))
+        return tuple((f"2026-09-30 09:{i:02d}", o, h, l, c, 1000.0)
+                     for i, (o, h, l, c) in enumerate(ohlc))
+
+    def test_premium_discount_recomputes_immediately(self):
+        """set_indicator("pd", True) → _pd_zones = premium[eq,hi] + discount[lo,eq]；toggle off → 清空。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._pd_bars())
+        assert ch._pd_zones == ()                     # 預設全 off
+        ch.set_indicator("pd", True)
+        hi, lo = 13.0, 8.0
+        eq = (hi + lo) / 2.0                          # 10.5
+        assert ch._pd_zones == (Zone("premium", "bearish", 0, None, hi, eq),
+                                Zone("discount", "bullish", 0, None, eq, lo))
+        ch.set_indicator("pd", False)
+        assert ch._pd_zones == ()
+
+    def test_premium_discount_pixels_only_when_enabled(self):
+        """EQ 線 #CFD8DC palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._pd_bars())
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#CFD8DC")) == 0
+        ch.set_indicator("pd", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#CFD8DC")) > 0
+
+
+class TestOTEIndicator:
+    """OTE（Optimal Trade Entry）圖層（Step 2 · Commit 21）：set_indicator("ote") →
+    detect_ote_zones()；邊框 #FFC400 係 palette 唯一色 → off=0 / on>0
+    （fill alpha-blend、唔計入 pixel count）。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _ote_bars():
+        """14-bar（同 test_indicators._ote_both_bars，k=3）：bullish OTE@6 + bearish OTE@10。"""
+        ohlc = ((10.0, 10.5, 9.8, 10.3), (10.3, 10.6, 9.5, 9.9), (9.9, 10.0, 9.0, 9.4),
+                (9.4, 9.7, 8.5, 9.2), (9.2, 10.2, 9.1, 10.0), (10.0, 11.0, 9.9, 10.8),
+                (10.8, 13.0, 10.7, 12.8), (12.8, 12.5, 12.0, 12.2), (12.2, 12.4, 11.8, 12.0),
+                (12.0, 12.3, 11.5, 11.7), (11.7, 11.9, 10.5, 11.0), (11.0, 11.6, 10.8, 11.3),
+                (11.3, 11.9, 11.0, 11.7), (11.7, 12.2, 11.4, 12.0))
+        return tuple((f"2026-09-30 09:{i:02d}", o, h, l, c, 1000.0)
+                     for i, (o, h, l, c) in enumerate(ohlc))
+
+    def test_ote_recomputes_immediately(self):
+        """set_indicator("ote", True) → _zones["ote"] = bullish@6 + bearish@10；toggle off → 移除。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._ote_bars())
+        assert "ote" not in ch._zones                # 預設全 off
+        ch.set_indicator("ote", True)
+        span_b, span_s = 13.0 - 8.5, 13.0 - 10.5     # bullish H-L1=4.5 / bearish H-L2=2.5
+        assert ch._zones["ote"] == (
+            Zone("ote", "bullish", 6, None, 13.0 - 0.62 * span_b, 13.0 - 0.79 * span_b),
+            Zone("ote", "bearish", 10, None, 10.5 + 0.79 * span_s, 10.5 + 0.62 * span_s),
+        )
+        ch.set_indicator("ote", False)
+        assert "ote" not in ch._zones
+
+    def test_ote_pixels_only_when_enabled(self):
+        """OTE 邊框 #FFC400 palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._ote_bars())
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#FFC400")) == 0
+        ch.set_indicator("ote", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#FFC400")) > 0
+

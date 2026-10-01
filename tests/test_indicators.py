@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from engine.indicators import (Level, Marker, RefLine, Zone, confluence_zones, daily_reference_lines,
                                detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
-                               detect_order_blocks, detect_structure_breaks,
-                               detect_valid_order_blocks, kill_zone_bands)
+                               detect_order_blocks, detect_ote_zones, detect_premium_discount,
+                               detect_structure_breaks, detect_valid_order_blocks, kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -466,3 +466,86 @@ def test_structure_empty_and_short():
     assert detect_structure_breaks(()) == ()
     four = tuple(bar(10 + i * 0.1, 11 + i * 0.1, 9 + i * 0.1, 10.5 + i * 0.1) for i in range(4))
     assert detect_structure_breaks(four) == ()
+
+
+# ---------------------------------------------------------------- Premium / Discount
+
+def test_premium_discount_basic():
+    """dealing range = [min low, max high] → equilibrium midpoint；premium=[eq,hi]、discount=[lo,eq]。"""
+    bars = (bar(10.0, 12.0, 9.5, 11.0),   # high=12, low=9.5
+            bar(11.0, 13.0, 10.0, 12.0),  # high=13（max）
+            bar(12.0, 12.5, 8.0, 9.0))    # low=8（min）
+    hi, lo = 13.0, 8.0
+    eq = (hi + lo) / 2.0                  # 10.5
+    assert detect_premium_discount(bars) == (
+        Zone("premium", "bearish", 0, None, hi, eq),
+        Zone("discount", "bullish", 0, None, eq, lo),
+    )
+
+
+def test_premium_discount_lookback_window():
+    """lookback=2 → 只計最後兩根嘅 high/low（前面嘅極端值唔計入 range）。"""
+    bars = (bar(100.0, 200.0, 50.0, 90.0),   # lookback 外：high=200 / low=50（唔計入）
+            bar(10.0, 12.0, 9.0, 11.0),      # win: high=12, low=9
+            bar(11.0, 13.0, 8.0, 12.0))      # win: high=13（max）, low=8（min）
+    hi, lo = 13.0, 8.0                     # 只計最後兩根 → hi=13（唔係 200）、lo=8（唔係 50）
+    eq = (hi + lo) / 2.0                  # 10.5
+    assert detect_premium_discount(bars, lookback=2) == (
+        Zone("premium", "bearish", 0, None, hi, eq),
+        Zone("discount", "bullish", 0, None, eq, lo),
+    )
+
+
+def test_premium_discount_flat_and_short():
+    """flat（high==low → hi<=lo）→ ()；空 / <2 bar → ()。"""
+    assert detect_premium_discount(()) == ()
+    assert detect_premium_discount((bar(10, 10, 10, 10),)) == ()
+    flat = (bar(10, 10, 10, 10), bar(10, 10, 10, 10))   # hi==lo==10 → hi<=lo
+    assert detect_premium_discount(flat) == ()
+
+
+# ---------------------------------------------------------------- OTE（Optimal Trade Entry）
+
+def _ote_both_bars():
+    """14-bar（k=3，pivot i∈[3,10]）：swing low L1@3(8.5) → swing high H@6(13) → swing low L2@10(10.5)。
+    bullish OTE 由 L1→H、bearish OTE 由 H→L2，兩方向同時產出。"""
+    return (bar(10.0, 10.5, 9.8, 10.3),   # b0
+            bar(10.3, 10.6, 9.5, 9.9),    # b1
+            bar(9.9, 10.0, 9.0, 9.4),     # b2
+            bar(9.4, 9.7, 8.5, 9.2),      # b3 swing low L1（low=8.5）
+            bar(9.2, 10.2, 9.1, 10.0),    # b4
+            bar(10.0, 11.0, 9.9, 10.8),   # b5
+            bar(10.8, 13.0, 10.7, 12.8),  # b6 swing high H（high=13）
+            bar(12.8, 12.5, 12.0, 12.2),  # b7
+            bar(12.2, 12.4, 11.8, 12.0),  # b8
+            bar(12.0, 12.3, 11.5, 11.7),  # b9
+            bar(11.7, 11.9, 10.5, 11.0),  # b10 swing low L2（low=10.5）
+            bar(11.0, 11.6, 10.8, 11.3),  # b11
+            bar(11.3, 11.9, 11.0, 11.7),  # b12
+            bar(11.7, 12.2, 11.4, 12.0))  # b13
+
+
+def test_ote_bullish_and_bearish():
+    """最近 swing high H + 其前 swing low L1 → bullish OTE [H-0.79s, H-0.62s]；
+    最近 swing low L2 + 其前 swing high H → bearish OTE [L2+0.62s, L2+0.79s]。"""
+    span_b = 13.0 - 8.5                    # bullish：H-L1 = 4.5
+    top_b, bot_b = 13.0 - 0.62 * span_b, 13.0 - 0.79 * span_b
+    span_s = 13.0 - 10.5                   # bearish：H-L2 = 2.5
+    top_s, bot_s = 10.5 + 0.79 * span_s, 10.5 + 0.62 * span_s
+    assert detect_ote_zones(_ote_both_bars()) == (
+        Zone("ote", "bullish", 6, None, top_b, bot_b),
+        Zone("ote", "bearish", 10, None, top_s, bot_s),
+    )
+
+
+def test_ote_no_pivot_monotonic():
+    """單邊上升（無 interior pivot）→ _swing_points 空 → ()。"""
+    mono = tuple(bar(10 + i * 0.5, 11 + i * 0.5, 9 + i * 0.5, 10.5 + i * 0.5) for i in range(8))
+    assert detect_ote_zones(mono) == ()
+
+
+def test_ote_empty_and_short():
+    """空 / 少於 2*k+1（k=3 → 7）bar → 無 pivot 可確認 → ()。"""
+    assert detect_ote_zones(()) == ()
+    six = tuple(bar(10 + i * 0.5, 11 + i * 0.5, 9 + i * 0.5, 10.5 + i * 0.5) for i in range(6))
+    assert detect_ote_zones(six) == ()
