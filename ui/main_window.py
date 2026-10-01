@@ -12,7 +12,8 @@
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
   history_ready / bars_changed → chart.update_bars；status / error → status bar；
-  catalog_ready → completer model rebuild + 名稱 LABEL 初始化。
+  catalog_ready → completer model rebuild + 名稱 LABEL 初始化；
+  connection_state(bool, float) → **右下角**連線狀態 + 反應速度（µs/ms，addPermanentWidget）。
 """
 from __future__ import annotations
 
@@ -41,6 +42,23 @@ INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
     ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS"), ("pd", "PD"), ("ote", "OTE"),
     ("shl", "SHL")
 )
+
+# OpenD 連線狀態指示色（獨立於市場慣例漲跌色——已連線恆綠、斷線恆紅，唔隨 convention 翻轉）
+_CONN_OK_COLOR = "#089981"    # teal green（= HK down_color）
+_CONN_BAD_COLOR = "#F23645"   # red（= HK up_color）
+
+
+def format_latency(ms: float | None) -> str:
+    """延遲顯示：<1ms → µs 精度、≥1ms → ms；負數/None → "—"（斷線 / 未知）。
+
+    「反應速度微秒ms」：本地 OpenD RTT 通常 sub-millisecond，<1ms 顯示 µs（例 320µs）、
+    否則 ms（例 4.2ms）——一個函數兩種單位自適應。
+    """
+    if ms is None or ms < 0:
+        return "—"
+    if ms < 1.0:
+        return f"{ms * 1000:.0f}µs"
+    return f"{ms:.1f}ms"
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +99,12 @@ class MainWindow(QMainWindow):
         self._engine.status.connect(lambda m: sb.showMessage(m, 8000))
         self._engine.error.connect(self._on_error)
         self._engine.catalog_ready.connect(self._on_catalog_ready)
+        # 右下角：OpenD 連線狀態 + 反應速度（µs/ms）——addPermanentWidget = status bar 右側永久 widget。
+        self._conn_label = QLabel("● OpenD 未連線")
+        self._conn_ok: bool | None = None   # 上次連線狀態（只在翻轉時改色，避免每 ping 重寫 stylesheet）
+        self._conn_label.setStyleSheet(f"color: {_CONN_BAD_COLOR}; font-family: Consolas;")
+        sb.addPermanentWidget(self._conn_label)
+        self._engine.connection_state.connect(self._on_connection_state)
 
         # Central：container + 頂部 control bar + pane grid（0 margin/spacing，全屏幕感不變）
         central = QWidget()
@@ -433,6 +457,17 @@ class MainWindow(QMainWindow):
         label = QLabel(f"⚠ {msg}")
         self.statusBar().addWidget(label, 1)
         # 保留最後一條 error 喺 status bar（唔會自動消失）；新 status message 會另計
+
+    def _on_connection_state(self, connected: bool, latency_ms: float) -> None:
+        """connection_state signal → 右下角 label：● OpenD 已連線 · 320µs / ● OpenD 未連線。"""
+        if self._conn_ok is not connected:   # 只在狀態翻轉時改色（避免每 ping 重寫 stylesheet）
+            color = _CONN_OK_COLOR if connected else _CONN_BAD_COLOR
+            self._conn_label.setStyleSheet(f"color: {color}; font-family: Consolas;")
+            self._conn_ok = connected
+        if connected:
+            self._conn_label.setText(f"● OpenD 已連線 · {format_latency(latency_ms)}")
+        else:
+            self._conn_label.setText("● OpenD 未連線")
 
     # ------------------------------------------------------------- panes / time sync
 

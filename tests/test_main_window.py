@@ -34,6 +34,7 @@ class FakeEngine(QObject):
     status = Signal(str)
     error = Signal(str)
     catalog_ready = Signal(tuple)
+    connection_state = Signal(bool, float)   # (connected, latency_ms) — 右下角連線狀態 + 延遲
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -476,3 +477,37 @@ def test_save_on_code_switch(monkeypatch):
     snap = win._state_store.saved[-1]
     assert snap["code"] == "US.AAPL"
     assert engine.switch_calls and engine.switch_calls[-1][0] == "US.AAPL"
+
+
+# ---------------------------------------------------------------- OpenD 連線狀態顯示（右下角）
+
+def test_format_latency_units():
+    """format_latency：<1ms → µs；≥1ms → ms；負數/None → "—"。"""
+    assert mw_module.format_latency(0.32) == "320µs"
+    assert mw_module.format_latency(0.999) == "999µs"    # 邊界：<1ms 仍用 µs（0.999ms = 999µs）
+    assert mw_module.format_latency(1.0) == "1.0ms"      # 邊界：≥1ms 轉 ms
+    assert mw_module.format_latency(4.256) == "4.3ms"
+    assert mw_module.format_latency(-1.0) == "—"         # 斷線 / 未知
+    assert mw_module.format_latency(None) == "—"
+
+
+def test_connection_label_initial_disconnected(monkeypatch):
+    """右下角 label 初始 = ● OpenD 未連線（紅），且掛喺 status bar（addPermanentWidget → 右側）。"""
+    win, _engine = _make_window(monkeypatch)
+    assert win._conn_label.text() == "● OpenD 未連線"
+    assert "#F23645" in win._conn_label.styleSheet()     # 初始斷線色（紅）
+    assert win._conn_label.parent() is win.statusBar()   # status bar permanent widget（右下角）
+
+
+def test_connection_state_updates_label(monkeypatch):
+    """connection_state signal → label 文字 + 顏色：已連線（綠 + µs/ms 自適應）/ 斷線（紅）。"""
+    win, engine = _make_window(monkeypatch)
+    engine.connection_state.emit(True, 0.32)
+    assert "已連線" in win._conn_label.text() and "320µs" in win._conn_label.text()
+    assert "#089981" in win._conn_label.styleSheet()     # 已連線 → 綠
+    engine.connection_state.emit(True, 4.256)            # ≥1ms → ms 單位（顏色唔重寫）
+    assert "4.3ms" in win._conn_label.text()
+    assert "#089981" in win._conn_label.styleSheet()
+    engine.connection_state.emit(False, -1.0)
+    assert win._conn_label.text() == "● OpenD 未連線"
+    assert "#F23645" in win._conn_label.styleSheet()     # 斷線 → 紅

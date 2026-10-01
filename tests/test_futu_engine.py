@@ -7,6 +7,7 @@ tick_date / _fallback_date（市場時區）、_setup 編排、switch/_reconfigu
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 import time as _time
 from datetime import date, datetime, timedelta
@@ -15,12 +16,20 @@ import pandas as pd
 import pytest
 from futu import Market, RET_OK, SubType, StockQuoteHandlerBase
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必須喺 PySide6 import 前設（同其他 Qt 測試檔一致）
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
 import engine.futu_engine as fe
 from config import Config, kline_period_minutes
 from engine.candle_aggregator import CandleAggregator
 from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
                                 _State, _fallback_date, _normalize_code)
 from engine.stock_catalog import StockEntry
+
+# cross-thread signal（ping thread → test thread）係 queued 到 test thread event loop——
+# 需要一個 app instance 先至 processEvents() 有得 pump（同其他 Qt 測試檔共用同一個）。
+_app = QApplication.instance() or QApplication([])
 
 
 # ---------------------------------------------------------------- fixtures / fakes
@@ -41,10 +50,28 @@ def _isolate_subscription_db(tmp_path, monkeypatch):
     monkeypatch.setattr(fe, "default_db_path", lambda: tmp_path / "subscriptions.db")
 
 
+_CREATED_ENGINES: list[FutuEngine] = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_engines():
+    """Teardown：stop 晒 make_engine 建立嘅 engine（join ping/setup/switch threads，防 daemon 洩漏）。
+
+    connection_state 功能後 _setup() 會 spawn 定時 ping thread——同步跑 _setup 嘅測試唔會自己
+    stop() → 呢個 fixture 喺測試結束統一清理。已自行 stop() 過嘅測試 → idempotent no-op。
+    """
+    yield
+    for eng in list(_CREATED_ENGINES):
+        try:
+            eng.stop()
+        finally:
+            _CREATED_ENGINES.remove(eng)
+
+
 class FakeCtx:
     """Mock OpenQuoteContext：scripted request_history_kline 回應 + lifecycle 記錄。"""
 
-    def __init__(self, pages, sub_ret=RET_OK, sub_info=None, basicinfo=None):
+    def __init__(self, pages, sub_ret=RET_OK, sub_info=None, basicinfo=None, global_state=None):
         self._pages = list(pages)
         self.kline_calls = []
         self.handler = None
@@ -57,6 +84,13 @@ class FakeCtx:
         # market → (ret, df) | Exception；未 script 嘅市場 default 空 DataFrame（catalog fetch 零 entries）
         self._basicinfo = basicinfo or {}
         self.basicinfo_calls = []
+        # get_global_state() scripted 回應（ping loop 用）；default = 行情伺服器已登入（qot_logined='1'）
+        self._global_state = global_state if global_state is not None else (RET_OK, {"qot_logined": "1"})
+        self.global_state_calls = []
+
+    def get_global_state(self):
+        self.global_state_calls.append(None)
+        return self._global_state
 
     def get_stock_basicinfo(self, market):
         self.basicinfo_calls.append(market)
@@ -137,6 +171,7 @@ def make_engine(**cfg_overrides) -> FutuEngine:
     agg = CandleAggregator(kline_period_minutes(ktype) or cfg.period_minutes)
     # 跟 production start() 一致：state.code 永遠係正規化後形式（_setup/_reconfigure 信任輸入、唔再 normalize）
     eng._state = _State(_normalize_code(cfg.trading_code), None, frozenset({ktype}), {ktype: agg})
+    _CREATED_ENGINES.append(eng)   # autouse fixture teardown → stop()（清理 ping thread）
     return eng
 
 
@@ -152,6 +187,18 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
     while _time.monotonic() < deadline:
         if predicate():
             return True
+        _time.sleep(0.01)
+    return predicate()
+
+
+def wait_until_pump(predicate, timeout: float = 5.0) -> bool:
+    """wait_until + processEvents：cross-thread signal（ping thread emit）→ queued 到 test
+    thread event loop，必須 pump events 先至 deliver 到 plain callable receiver。"""
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _app.processEvents()
         _time.sleep(0.01)
     return predicate()
 
@@ -962,6 +1009,9 @@ class ReconcileCtx:
         self.unsub_calls.append(list(codes))
         return self._unsub_ret, None
 
+    def close(self):
+        self.closed = True
+
 
 def _reconcile_eng(active_code: str = "US.AAPL") -> FutuEngine:
     """make_engine 後將 state.code 設為 active_code（reconcile 以呢個做「要保留」基準）。"""
@@ -1156,3 +1206,107 @@ class TestStartCodeParam:
         cfg = make_cfg(trading_code="HK.HSImain")
         eng.start(cfg, periods=["K_5M", "k_15m"], code="US.AAPL")
         assert eng.state.periods == frozenset({"K_5M", "K_15M"})
+
+
+# ---------------------------------------------------------------- OpenD 定時 ping（連線狀態 + RTT）
+
+class TestPingOnce:
+    """_ping_once：get_global_state() RTT → (connected, latency_ms)——純邏輯、零線程。"""
+
+    def test_connected_when_qot_logined(self):
+        eng = make_engine()
+        ctx = FakeCtx([])   # default global_state = (RET_OK, {"qot_logined": "1"})
+        connected, latency_ms = eng._ping_once(ctx)
+        assert connected is True
+        assert latency_ms >= 0.0   # perf_counter RTT（本地 mock ≈ 0ms）
+        assert len(ctx.global_state_calls) == 1
+
+    def test_disconnected_when_qot_not_logged_in(self):
+        """qot_logined='0'（行情伺服器未登入）→ 斷線。"""
+        eng = make_engine()
+        ctx = FakeCtx([], global_state=(RET_OK, {"qot_logined": "0"}))
+        connected, _latency = eng._ping_once(ctx)
+        assert connected is False
+
+    def test_disconnected_when_ret_not_ok(self):
+        """ret != RET_OK（data 係錯誤字串）→ 斷線。"""
+        eng = make_engine()
+        ctx = FakeCtx([], global_state=(-1, "F3CNN返回错误"))
+        connected, _latency = eng._ping_once(ctx)
+        assert connected is False
+
+    def test_exception_returns_disconnected_sentinel(self):
+        """get_global_state 拋 exception（OpenD 斷線）→ (False, -1.0)。"""
+        class BoomCtx:
+            def get_global_state(self):
+                raise ConnectionError("OpenD down")
+
+        eng = make_engine()
+        assert eng._ping_once(BoomCtx()) == (False, -1.0)
+
+
+class TestPingLoopLifecycle:
+    """_start_ping_loop / _ping_loop thread lifecycle + connection_state signal 遞送。"""
+
+    def test_setup_starts_ping_and_emits_connected(self, monkeypatch):
+        """_setup() 連線成功 → ping thread 啟動並 emit (True, RTT)。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        states = []
+        eng.connection_state.connect(lambda c, l: states.append((c, l)))   # 2-arg signal → tuple record
+        eng._setup()   # test thread 同步行 → ping thread spawn
+
+        assert wait_until_pump(lambda: len(ctx.global_state_calls) >= 1)
+        assert wait_until_pump(
+            lambda: any(c is True and lat >= 0 for c, lat in states))   # connected + RTT（cross-thread queued）
+        eng.stop()
+        assert not (eng._ping_thread and eng._ping_thread.is_alive())
+
+    def test_ping_loop_exits_when_stopped(self):
+        """stop() → _ping_stop set + ctx=None → ping thread 退出（唔再 ping）。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx
+        eng._start_ping_loop()
+        assert wait_until(lambda: len(ctx.global_state_calls) >= 1)   # ping 運行中
+        eng.stop()
+        n_after_stop = len(ctx.global_state_calls)
+        _time.sleep(0.3)   # 留一段間隔 → thread 應已退出、冇新 ping
+        assert len(ctx.global_state_calls) == n_after_stop
+
+    def test_ping_loop_superseded_by_new_generation(self):
+        """_start_ping_loop 重啟（setup retry）→ 舊 thread 偵測 gen mismatch 自然退出（唔重複 ping）。"""
+        eng = make_engine()
+        ctx = FakeCtx([])
+        eng._ctx = ctx
+        eng._start_ping_loop()
+        first_thread = eng._ping_thread
+        assert wait_until(lambda: len(ctx.global_state_calls) >= 1)
+        eng._start_ping_loop()   # 重啟 → gen+1、新 thread
+        second_thread = eng._ping_thread
+        assert second_thread is not first_thread
+        assert wait_until(lambda: not first_thread.is_alive())   # 舊 thread 退出（≤2s）
+
+    def test_disconnected_emitted_when_open_d_drops(self):
+        """運行時 OpenD 斷線（get_global_state 拋 exception）→ connection_state(False, -1.0)。"""
+        class DropCtx(FakeCtx):
+            def __init__(self):
+                super().__init__([], global_state=(RET_OK, {"qot_logined": "1"}))
+                self.drop = threading.Event()
+
+            def get_global_state(self):
+                if self.drop.is_set():
+                    raise ConnectionError("OpenD down")
+                return super().get_global_state()
+
+        eng = make_engine()
+        ctx = DropCtx()
+        eng._ctx = ctx
+        states = []
+        eng.connection_state.connect(lambda c, l: states.append((c, l)))   # 2-arg signal → tuple record
+        eng._start_ping_loop()
+        assert wait_until_pump(lambda: any(c is True for c, _l in states))   # 先 connected（cross-thread queued）
+        ctx.drop.set()
+        assert wait_until_pump(lambda: (False, -1.0) in states)              # 再報斷線
+        eng.stop()

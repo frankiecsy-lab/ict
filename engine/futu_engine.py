@@ -28,6 +28,7 @@ import logging
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 
 # 定時 reconcile 間隔（秒）：對「已不活躍且訂閱滿 MIN_SUBSCRIBE_SECONDS」的洩漏訂閱重試 unsubscribe。
 _RECONCILE_INTERVAL = 30.0
+
+# OpenD 定時 ping 間隔（秒）：get_global_state() RTT → connection_state signal（右下角連線狀態 + 延遲）。
+_PING_INTERVAL = 2.0
 
 _KLTYPE_MAP: dict[str, KLType] = {
     "K_1M": KLType.K_1M,
@@ -200,6 +204,7 @@ class FutuEngine(QObject):
     - history_ready(str, tuple[Bar]): seed / 切換完成後嘅完整 snapshot，(period, bars)
     - bars_changed(str, tuple[Bar]): tick 聚合後嘅新 snapshot，(period, bars)
     - status(str) / error(str)
+    - connection_state(bool, float): (connected, latency_ms) 定時 ping get_global_state RTT（右下角狀態）
 
     運行時切換：switch(code=None, periods=None) spawn worker thread——code 變先 unsubscribe/subscribe、
     periods 變先 fetch+seed 差集；全部驗證通過先 swap `_State`（單一 QUOTE 訂閱 → N aggregator）。
@@ -210,6 +215,7 @@ class FutuEngine(QObject):
     status = Signal(str)
     error = Signal(str)
     catalog_ready = Signal(tuple)   # tuple[StockEntry]：HK+US 股票目錄（fuzzy autocomplete 用）
+    connection_state = Signal(bool, float)   # (connected, latency_ms)：定時 ping RTT（右下角連線狀態 + 延遲）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -225,6 +231,9 @@ class FutuEngine(QObject):
         # db_path=None → default_db_path()（開發=專案根目錄、frozen=exe 旁邊）。
         self._store: SubscriptionStore | None = None
         self._reconcile_timer: threading.Timer | None = None   # 定時重試 unsubscribe 洩漏訂閱
+        self._ping_thread: threading.Thread | None = None      # OpenD 定時 ping thread（連線狀態 + RTT）
+        self._ping_stop = threading.Event()                    # stop()/supersede → 喚醒 ping loop 退出
+        self._ping_gen = 0                                     # generation counter：重啟後舊 thread 偵測 mismatch 自然退出
 
     def _ensure_store(self) -> SubscriptionStore:
         """惰性建立訂閱帳本（首次 subscribe/reconcile 前）；db_path 由 start() 注入或預設。"""
@@ -279,7 +288,7 @@ class FutuEngine(QObject):
         thread.start()
 
     def stop(self) -> None:
-        """Idempotent 關閉：close ctx（停 callback thread）、join setup + switch worker threads。"""
+        """Idempotent 關閉：close ctx（停 callback thread）、join setup + switch worker + ping threads。"""
         with self._lock:
             if self._closed:
                 return
@@ -290,12 +299,17 @@ class FutuEngine(QObject):
             self._thread = None
             timer = self._reconcile_timer
             self._reconcile_timer = None
+            ping_thread = self._ping_thread
+            self._ping_thread = None
         if timer is not None:
             timer.cancel()  # 阻止未觸發嘅 reconcile；已運行中嘅會因 _closed 快速返回
-        self._close_ctx()
+        self._ping_stop.set()   # 喚醒 ping loop（若喺 wait）→ 下輪偵測退出
+        self._close_ctx()       # ctx=None → ping loop 偵測到即退出
         for t in (thread, *workers):
             if t is not None and t.is_alive():
                 t.join(timeout=10)
+        if ping_thread is not None and ping_thread.is_alive():
+            ping_thread.join(timeout=5)
 
     def switch(self, code: str | None = None, periods=None) -> None:
         """運行時改標的 / 週期集合（worker thread，立即返回）。
@@ -424,6 +438,55 @@ class FutuEngine(QObject):
             self._switching = False
 
     # ------------------------------------------------------------- 訂閱帳本 reconcile（自動清理洩漏）
+
+    def _start_ping_loop(self) -> None:
+        """啟動定時 ping thread（每 _PING_INTERVAL 秒 get_global_state RTT → connection_state signal）。
+
+        Generation counter（_ping_gen）：重啟時舊 thread 偵測 gen mismatch 自然退出——唔會重複 ping / 洩漏。
+        _setup() OpenD 連線成功後呼叫；switch() 唔改連線（同一 ctx）→ 唔使重啟。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._ping_gen += 1
+            gen = self._ping_gen
+            self._ping_stop.clear()
+            thread = threading.Thread(target=self._ping_loop, args=(gen,), name="futu-ping", daemon=True)
+            self._ping_thread = thread
+        thread.start()
+
+    def _ping_once(self, ctx) -> tuple[bool, float]:
+        """單次 ping：get_global_state() RTT → (connected, latency_ms)；exception → (False, -1.0)。
+
+        connected = ret OK + data 係 dict + qot_logined=='1'（行情伺服器已登入——連線狀態權威來源）。
+        latency_ms 用 perf_counter（高精度 monotonic clock）量 RTT——本地 OpenD 通常 sub-millisecond，
+        UI 端 <1ms 顯示 µs、否則 ms。
+        """
+        try:
+            t0 = time.perf_counter()
+            ret, data = ctx.get_global_state()
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:  # noqa: BLE001 — ping exception → 當斷線，唔 propagate 去 GUI shutdown path
+            logger.exception("OpenD ping failed")
+            return False, -1.0
+        connected = ret == RET_OK and isinstance(data, dict) and str(data.get("qot_logined")) == "1"
+        return connected, latency_ms
+
+    def _ping_loop(self, gen: int) -> None:
+        """定時 ping loop：每輪 get_global_state RTT → connection_state(connected, latency_ms)。
+
+        退出條件：stop()（_ping_stop set / ctx=None）或被新 ping loop supersede（gen mismatch）。
+        """
+        while not self._ping_stop.is_set():
+            if gen != self._ping_gen or self._closed:
+                break   # engine 已關閉 / 被取代 → 自然退出
+            ctx = self._ctx
+            if ctx is None:
+                break   # stop()/setup 失敗 close 咗 ctx → 退出（UI 保持初始「未連線」狀態）
+            connected, latency_ms = self._ping_once(ctx)
+            if not self._closed and gen == self._ping_gen:
+                self.connection_state.emit(connected, latency_ms)
+            self._ping_stop.wait(_PING_INTERVAL)
 
     def _schedule_reconcile(self) -> None:
         """排程一次定時 reconcile（_RECONCILE_INTERVAL 後）。
@@ -597,6 +660,7 @@ class FutuEngine(QObject):
             self._ctx = ctx
         try:
             self.status.emit("OpenD 連線成功")
+            self._start_ping_loop()   # 定時 ping：get_global_state RTT → 右下角連線狀態 + 延遲顯示
 
             cur_state = self._state
             code = cur_state.code   # start() 已正規化（cfg.trading_code 或 GUI UI-state 記憶還原嘅 code）
