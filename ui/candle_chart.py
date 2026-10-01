@@ -31,7 +31,7 @@ from engine.indicators import (_KZ_LABELS, Level, Marker, RefLine, Zone, conflue
                                detect_premium_discount, detect_session_high_low,
                                detect_structure_breaks,
                                detect_valid_order_blocks,
-                               kill_zone_bands)
+                               kill_zone_bands, weekly_monthly_reference_lines)
 from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
@@ -290,6 +290,7 @@ class CandleChart(QWidget):
         self._markers: tuple[Marker, ...] = ()                   # Structure Breaks BOS/CHoCH 標記
         self._pd_zones: tuple[Zone, ...] = ()                    # Premium/Discount dealing range 帶（背景層）
         self._session_lines: tuple[RefLine, ...] = ()            # Session High/Low per-day 範圍線
+        self._wm_lines: tuple[RefLine, ...] = ()                 # Prev Week/Month HLC 全寬參考線
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -319,7 +320,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -336,8 +337,8 @@ class CandleChart(QWidget):
         VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
         唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels / structure
         markers / premium-discount 存獨立狀態（_kz_bands / _ref_lines / _levels /
-        _markers / _pd_zones / _session_lines），唔入 zones dict；任何 recompute 都先重置
-        六者（toggle off → 清空，唔會殘留舊 band/line/level/marker/pd/session）。OTE 入
+        _markers / _pd_zones / _session_lines / _wm_lines），唔入 zones dict；任何 recompute 都先重置
+        七者（toggle off → 清空，唔會殘留舊 band/line/level/marker/pd/session/wm）。OTE 入
         zones["ote"]（同 FVG/OB 一樣價格錨定矩形、畫喺蠟燭上面）。
         """
         self._kz_bands = ()
@@ -346,6 +347,7 @@ class CandleChart(QWidget):
         self._markers = ()
         self._pd_zones = ()
         self._session_lines = ()
+        self._wm_lines = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -370,6 +372,8 @@ class CandleChart(QWidget):
             self._ref_lines = daily_reference_lines(self._bars)
         if self._indicator_enabled.get("shl"):
             self._session_lines = detect_session_high_low(self._bars)   # Session High/Low per-day 範圍線（獨立圖層）
+        if self._indicator_enabled.get("wmref"):
+            self._wm_lines = weekly_monthly_reference_lines(self._bars)   # Prev Week/Month HLC 全寬線（獨立圖層）
         if self._indicator_enabled.get("liq"):
             self._levels = detect_liquidity_levels(self._bars)   # BSL/SSL 流動性池（獨立圖層）
         if self._indicator_enabled.get("bos"):
@@ -752,6 +756,21 @@ class CandleChart(QWidget):
                 color = QColor(session_colors[rl.kind])
                 p.setPen(QPen(color, 1, Qt.SolidLine))   # 實線：當日實際範圍（已成交）
                 p.drawLine(int(x_left), int(y), int(x_right), int(y))
+
+        # --- Weekly/Monthly reference lines（Prev Week / Prev Month HLC 全寬水平線；畫喺 session lines 之後）
+        if self._wm_lines:
+            wm_colors = {"pwh": "#00ACC1", "pwl": "#0097A7", "pwc": "#26C6DA",   # weekly 青色系（palette 唯一）
+                         "pmh": "#9575CD", "pml": "#7E57C2", "pmc": "#B39DDB"}  # monthly 紫色系（palette 唯一）
+            for rl in self._wm_lines:
+                y = y_price(rl.price)
+                if y < price_r.top() or y > price_r.bottom():
+                    continue                       # 超出當前 Y 範圍 → 唔畫
+                color = QColor(wm_colors[rl.kind])
+                dash = Qt.DashDotLine if rl.kind.startswith("pw") else Qt.DotLine   # weekly 點劃線 / monthly 虛點線
+                p.setPen(QPen(color, 1, dash))
+                p.drawLine(int(plot.left()), int(y), int(plot.right()), int(y))     # 全部全寬（end_idx=None）
+                p.drawText(QRectF(plot.left() + 2, y - 14, 30, 12),
+                           Qt.AlignLeft | Qt.AlignBottom, rl.kind.upper())
 
         # --- Liquidity Levels（BSL/SSL 流動性池水平線；畫喺 ref lines 之後、overlay 之前）
         if self._levels:

@@ -266,7 +266,7 @@ def test_text_changed_guard_strips_name_before_catalog(monkeypatch):
 def test_indicator_toggle_buttons_exist_and_default_off(monkeypatch):
     """control bar「指標」區：INDICATOR_TOGGLES 每個 entry 一個 checkable 按鍵、預設 off。"""
     win, _engine = _make_window(monkeypatch)
-    assert set(win._indicator_btns) == {"ob", "fvg", "vob", "brk", "kz", "ref", "liq", "bos", "pd", "ote", "shl"}
+    assert set(win._indicator_btns) == {"ob", "fvg", "vob", "brk", "kz", "ref", "liq", "bos", "pd", "ote", "shl", "wmref"}
     for btn in win._indicator_btns.values():
         assert btn.isCheckable()
         assert not btn.isChecked()
@@ -370,6 +370,18 @@ def test_shl_toggle_applies_to_all_panes(monkeypatch):
     win._indicator_btns["shl"].click()
     for pane in win._panes:
         assert pane._indicator_enabled.get("shl") is False
+
+
+def test_wmref_toggle_applies_to_all_panes(monkeypatch):
+    """W/M（Weekly/Monthly ref lines）開關 click → 全部 4 pane _indicator_enabled["wmref"] 同步翻轉；再 click 還原。"""
+    win, _engine = _make_window(monkeypatch)
+    win._indicator_btns["wmref"].click()
+    assert win._indicator_btns["wmref"].isChecked()
+    for pane in win._panes:
+        assert pane._indicator_enabled.get("wmref") is True
+    win._indicator_btns["wmref"].click()
+    for pane in win._panes:
+        assert pane._indicator_enabled.get("wmref") is False
 
 
 # ---------------------------------------------------------------- UI state persistence（SQLite 記憶）

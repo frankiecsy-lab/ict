@@ -826,3 +826,68 @@ class TestSessionHighLow:
         assert self._count_in(img_on, QColor("#FF6E40")) > 0
         assert self._count_in(img_on, QColor("#9CCC65")) > 0
 
+
+class TestWMRefLines:
+    """Weekly/Monthly reference lines 圖層（Step 2 · Commit 24）：set_indicator("wmref") →
+    weekly_monthly_reference_lines() Prev Week/Month HLC 全寬線；weekly 青色系
+    #00ACC1/#0097A7/#26C6DA + monthly 紫色系 #9575CD/#7E57C2/#B39DDB 係 palette 唯一色 → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _wm_bars():
+        """5 ISO 週 + 2 個月；當前週 (b6) 範圍拉闊 → 六條線價全部嚴格喺整體 Y 範圍 [37,58] 內。"""
+        return (
+            ("2026-08-31 09:30", 45, 50, 40, 47, 1000.0),   # Aug / wk36 → prev month
+            ("2026-09-07 09:30", 47, 49, 44, 48, 1000.0),   # wk37
+            ("2026-09-14 09:30", 48, 52, 46, 50, 1000.0),   # wk38
+            ("2026-09-15 09:30", 50, 51, 47, 49, 1000.0),   # wk38
+            ("2026-09-21 09:30", 49, 55, 45, 53, 1000.0),   # wk39 → prev week
+            ("2026-09-22 09:30", 53, 54, 48, 52, 1000.0),   # wk39
+            ("2026-09-28 09:30", 52, 58, 37, 55, 1000.0),   # wk40 當前（範圍拉闊）
+        )
+
+    def test_wm_ref_lines_recomputes_immediately(self):
+        """set_indicator("wmref", True) → _wm_lines = Prev Week/Month HLC；toggle off → 清空。"""
+        from engine.indicators import RefLine
+        ch = CandleChart(Config())
+        ch.update_bars(self._wm_bars())
+        assert ch._wm_lines == ()                   # 預設全 off
+        ch.set_indicator("wmref", True)
+        assert ch._wm_lines == (
+            RefLine("pwh", 55.0, 0, None),
+            RefLine("pwl", 45.0, 0, None),
+            RefLine("pwc", 52.0, 0, None),
+            RefLine("pmh", 50.0, 0, None),
+            RefLine("pml", 40.0, 0, None),
+            RefLine("pmc", 47.0, 0, None),
+        )
+        ch.set_indicator("wmref", False)
+        assert ch._wm_lines == ()
+
+    def test_wm_ref_line_pixels_only_when_enabled(self):
+        """weekly 青色系 + monthly 紫色系 palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._wm_bars())
+        img_off = self._render(ch)
+        for c in ("#00ACC1", "#0097A7", "#26C6DA", "#9575CD", "#7E57C2", "#B39DDB"):
+            assert self._count_in(img_off, QColor(c)) == 0
+        ch.set_indicator("wmref", True)
+        img_on = self._render(ch)
+        for c in ("#00ACC1", "#0097A7", "#26C6DA", "#9575CD", "#7E57C2", "#B39DDB"):
+            assert self._count_in(img_on, QColor(c)) > 0
+

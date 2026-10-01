@@ -49,7 +49,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -74,8 +74,9 @@ class Zone:
 class RefLine:
     """水平參考線。
 
-    kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）或
-    {"sh", "sl"}（Session High/Low，per-day span）。
+    kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）、
+    {"sh", "sl"}（Session High/Low，per-day span）或
+    {"pwh", "pwl", "pwc"} / {"pmh", "pml", "pmc"}（Prev Week/Month HLC，全寬）。
     start_idx/end_idx = 線段覆蓋嘅 bar index 範圍；end_idx=None 表示全寬（畫到右緣）。
     """
 
@@ -448,6 +449,68 @@ def detect_session_high_low(bars) -> tuple[RefLine, ...]:
         sl = min(float(b[3]) for b in bars[s:e + 1])
         out.append(RefLine("sh", sh, s, e))
         out.append(RefLine("sl", sl, s, e))
+    return tuple(out)
+
+
+def _week_groups(bars) -> list[tuple[int, int]]:
+    """按 ISO 曆週分組 → [(first_idx, last_idx), ...]，O(n)。
+
+    用 time_key[:10]（'yyyy-MM-dd'）→ date.isocalendar()[:2]（(year, week)）。
+    假定 bars 非空且 key 有日期部分（長度 ≥ 10）；呼叫方自行 guard。
+    """
+    groups: list[tuple[int, int]] = []   # (first_idx, last_idx) per ISO week
+    prev_wk = None
+    for i, b in enumerate(bars):
+        k = b[0][:10]
+        wk = date(int(k[:4]), int(k[5:7]), int(k[8:10])).isocalendar()[:2]
+        if wk != prev_wk:
+            groups.append((i, i))
+            prev_wk = wk
+        else:
+            groups[-1] = (groups[-1][0], i)
+    return groups
+
+
+def _month_groups(bars) -> list[tuple[int, int]]:
+    """按月（time_key[:7] 'yyyy-MM'）分組 → [(first_idx, last_idx), ...]，O(n)。
+
+    假定 bars 非空且 key 有日期部分（長度 ≥ 10）；呼叫方自行 guard。
+    """
+    groups: list[tuple[int, int]] = []   # (first_idx, last_idx) per month
+    prev_mo = None
+    for i, b in enumerate(bars):
+        m = b[0][:7]
+        if m != prev_mo:
+            groups.append((i, i))
+            prev_mo = m
+        else:
+            groups[-1] = (groups[-1][0], i)
+    return groups
+
+
+def weekly_monthly_reference_lines(bars) -> tuple[RefLine, ...]:
+    """Prev Week / Prev Month HLC 全寬參考線。
+
+    PWH/PWL/PWC = 倒数第二個 ISO 週組嘅 max high / min low / 最後 close；
+    PMH/PML/PMC = 倒数第二個月組同。全部全寬（start=0、end=None）——「上一期」
+    係單一水平位，唔係 per-group span（同 PH/PL/PC 語義一致）。各需 ≥2 組
+    （不足 → 該級別唔畫）；非 intraday key（長度 < 10，如 K_MON 'yyyy-MM'）→ ()。
+    """
+    if not bars or len(bars[0][0]) < 10:
+        return ()
+    out: list[RefLine] = []
+    wgroups = _week_groups(bars)
+    if len(wgroups) >= 2:                 # PWH/PWL/PWC：上一 ISO 週（倒数第二組）全寬線
+        ws, we = wgroups[-2]
+        out.append(RefLine("pwh", max(float(b[2]) for b in bars[ws:we + 1]), 0, None))
+        out.append(RefLine("pwl", min(float(b[3]) for b in bars[ws:we + 1]), 0, None))
+        out.append(RefLine("pwc", float(bars[we][4]), 0, None))
+    mgroups = _month_groups(bars)
+    if len(mgroups) >= 2:                 # PMH/PML/PMC：上一個月（倒数第二組）全寬線
+        ms, me = mgroups[-2]
+        out.append(RefLine("pmh", max(float(b[2]) for b in bars[ms:me + 1]), 0, None))
+        out.append(RefLine("pml", min(float(b[3]) for b in bars[ms:me + 1]), 0, None))
+        out.append(RefLine("pmc", float(bars[me][4]), 0, None))
     return tuple(out)
 
 

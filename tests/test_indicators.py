@@ -6,7 +6,8 @@ confluence 同向重疊 / 無價格重疊 / 異向排除 / 時間區間無交集
 VOB 有效訂單塊 bullish/bearish + 無掃蕩拒收 + FVG 無重疊拒收 + OB 已失效拒收；
 Breaker bullish/bearish OB 翻轉 + mitigation + 冇失效唔算 breaker + dedup；
 Kill Zones EST/EDT（DST）session 分類 + band 分組 + 非 intraday skip；
-Daily ref lines DO 線段 + PH/PL/PC 全寬線 + 單日無 prev day + monthly key skip。
+Daily ref lines DO 線段 + PH/PL/PC 全寬線 + 單日無 prev day + monthly key skip；
+W/M ref lines Prev Week/Month HLC 全寬線（ISO 週分組 / 月分組 / 各需 ≥2 組）。
 
 Bar = (time_key, open, high, low, close, volume)——FVG/OB/Breaker 偵測邏輯唔用
 time_key（全部 case 共用同一 fake key）；Kill Zones / Daily ref lines 讀 time_key。
@@ -17,7 +18,8 @@ from engine.indicators import (Level, Marker, RefLine, Zone, confluence_zones, d
                                detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
                                detect_order_blocks, detect_ote_zones, detect_premium_discount,
                                detect_session_high_low, detect_structure_breaks,
-                               detect_valid_order_blocks, kill_zone_bands)
+                               detect_valid_order_blocks, kill_zone_bands,
+                               weekly_monthly_reference_lines)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -339,6 +341,77 @@ def test_session_high_low_monthly_keys_skipped():
 def test_session_high_low_empty():
     """空 bars → ()。"""
     assert detect_session_high_low(()) == ()
+
+
+# ---------------------------------------------------------------- Weekly/Monthly reference lines
+
+def _wm_bars():
+    """7 bars 跨 5 ISO 週 + 2 個月：Aug wk36(idx0) / Sep wk37(idx1) / wk38(idx2-3) /
+    wk39(idx4-5) / wk40(idx6)。Prev week = wk39、prev month = Aug。"""
+    return (bar(45, 50, 40, 47, t="2026-08-31 09:30"),   # b0 Aug / ISO wk36
+            bar(47, 49, 44, 48, t="2026-09-07 09:30"),   # b1 Sep / wk37
+            bar(48, 52, 46, 50, t="2026-09-14 09:30"),   # b2 wk38
+            bar(50, 51, 47, 49, t="2026-09-15 09:30"),   # b3 wk38
+            bar(49, 55, 45, 53, t="2026-09-21 09:30"),   # b4 wk39（prev week）
+            bar(53, 54, 48, 52, t="2026-09-22 09:30"),   # b5 wk39
+            bar(52, 56, 51, 55, t="2026-09-28 09:30"))   # b6 wk40（當前週）
+
+
+def test_wm_ref_lines_full():
+    """Prev Week = wk39 (idx4-5) → PWH=55/PWL=45/PWC=52；prev Month = Aug (idx0) →
+    PMH=50/PML=40/PMC=47。全部全寬（start=0、end=None），weekly 先 monthly 後。"""
+    assert weekly_monthly_reference_lines(_wm_bars()) == (
+        RefLine("pwh", 55.0, 0, None),
+        RefLine("pwl", 45.0, 0, None),
+        RefLine("pwc", 52.0, 0, None),
+        RefLine("pmh", 50.0, 0, None),
+        RefLine("pml", 40.0, 0, None),
+        RefLine("pmc", 47.0, 0, None),
+    )
+
+
+def test_wm_ref_lines_weekly_only_when_single_month():
+    """兩週但同月 → 只出 PWH/PWL/PWC（monthly 需 ≥2 組）。"""
+    bars = (bar(49, 55, 45, 53, t="2026-09-21 09:30"),   # wk39
+            bar(53, 54, 48, 52, t="2026-09-22 09:30"),   # wk39
+            bar(52, 56, 51, 55, t="2026-09-28 09:30"))   # wk40（全 September）
+    assert weekly_monthly_reference_lines(bars) == (
+        RefLine("pwh", 55.0, 0, None),
+        RefLine("pwl", 45.0, 0, None),
+        RefLine("pwc", 52.0, 0, None),
+    )
+
+
+def test_wm_ref_lines_single_week_and_month():
+    """只有一週 + 一個月 → ()（兩級別都需 ≥2 組）。"""
+    bars = (bar(48, 52, 46, 50, t="2026-09-14 09:30"),   # wk38 / Sep
+            bar(50, 51, 47, 49, t="2026-09-15 09:30"))   # 同週同月
+    assert weekly_monthly_reference_lines(bars) == ()
+
+
+def test_wm_ref_lines_daily_keys():
+    """Daily key（'yyyy-MM-dd' len-10）一樣 work：兩 bar 分屬不同 ISO 週 + 不同月 → 六線全出。"""
+    bars = (bar(45, 50, 40, 47, t="2026-09-30"),   # wk40 / Sep（prev week + prev month）
+            bar(48, 52, 46, 50, t="2026-10-07"))   # wk41 / Oct（當前）
+    assert weekly_monthly_reference_lines(bars) == (
+        RefLine("pwh", 50.0, 0, None),
+        RefLine("pwl", 40.0, 0, None),
+        RefLine("pwc", 47.0, 0, None),
+        RefLine("pmh", 50.0, 0, None),
+        RefLine("pml", 40.0, 0, None),
+        RefLine("pmc", 47.0, 0, None),
+    )
+
+
+def test_wm_ref_lines_monthly_keys_skipped():
+    """K_MON（'yyyy-MM'，長度 < 10）→ 無日期部分 → ()。"""
+    bars = (_kz_bar("2026-08"), _kz_bar("2026-09"))
+    assert weekly_monthly_reference_lines(bars) == ()
+
+
+def test_wm_ref_lines_empty():
+    """空 bars → ()。"""
+    assert weekly_monthly_reference_lines(()) == ()
 
 
 # ---------------------------------------------------------------- Valid Order Blocks (VOB)

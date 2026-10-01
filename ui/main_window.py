@@ -36,11 +36,11 @@ logger = logging.getLogger(__name__)
 
 # 指標開關註冊表（模組化擴展點）：加新指標 = 喺呢度加一行 → control bar 自動生成對應 checkable 按鍵。
 # 偵測邏輯喺 engine/indicators.py、繪製層喺 candle_chart._recompute_zones() / paintEvent；
-# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"）。
+# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"）。
 INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
     ("ob", "OB"), ("fvg", "FVG"), ("vob", "VOB"), ("brk", "BRK"), ("kz", "KZ"),
     ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS"), ("pd", "PD"), ("ote", "OTE"),
-    ("shl", "SHL")
+    ("shl", "SHL"), ("wmref", "W/M")
 )
 
 # OpenD 連線狀態指示色（獨立於市場慣例漲跌色——已連線恆綠、斷線恆紅，唔隨 convention 翻轉）
