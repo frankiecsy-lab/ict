@@ -29,7 +29,7 @@ import math
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -133,9 +133,12 @@ class _State:
     anchor_date: date | None
     periods: frozenset[str]
     aggregators: dict[str, CandleAggregator]
+    smt_code: str | None = None   # SMT Divergence 配對副標的（None = 功能關閉）
+    smt_aggregators: dict[str, CandleAggregator] = field(default_factory=dict)
 
     def bar_count(self) -> int:
-        return sum(len(a.bars()) for a in self.aggregators.values())
+        return sum(len(a.bars()) for a in self.aggregators.values()) + \
+            sum(len(a.bars()) for a in self.smt_aggregators.values())
 
 
 def _fallback_date(anchor: date | None, code: str) -> date:
@@ -182,9 +185,16 @@ class _QuoteHandler(StockQuoteHandlerBase):
             return ret_code, data
         fallback = _fallback_date(state.anchor_date, state.code)
         changed: set[str] = set()
+        smt_changed: set[str] = set()
         for row in data.itertuples(index=False):
-            # code filter：切換後舊標的嘅 in-flight push（unsubscribe 唔係硬停）一律 skip
-            if getattr(row, "code", state.code) != state.code:
+            # code routing：primary → aggregators；SMT 配對副標的 → smt_aggregators；
+            # 其他 code（切換後舊標的嘅 in-flight push，unsubscribe 唔係硬停）一律 skip
+            row_code = getattr(row, "code", None)
+            if row_code == state.code:
+                aggs, target = state.aggregators, changed
+            elif state.smt_code is not None and row_code == state.smt_code:
+                aggs, target = state.smt_aggregators, smt_changed
+            else:
                 continue
             dt = resolve_tick_datetime(row.data_time, fallback)
             if dt is None:
@@ -196,14 +206,16 @@ class _QuoteHandler(StockQuoteHandlerBase):
                 continue
             if not price > 0:  # NaN guard：nan > 0 係 False → skip
                 continue
-            for period, agg in state.aggregators.items():  # fan-out 入所有週期 aggregator
+            for period, agg in aggs.items():  # fan-out 入該 code 嘅所有週期 aggregator
                 if agg.apply_quote(dt, price, cum_vol):
-                    changed.add(period)
+                    target.add(period)
         if eng.cfg.debug and len(data):
             logger.debug("tick batch rows=%d", len(data))
         if state is eng._state:  # batch 中途 state 被 swap → 呢批 discard
             for period in sorted(changed):
                 eng.bars_changed.emit(period, state.aggregators[period].bars())
+            for period in sorted(smt_changed):
+                eng.smt_bars_changed.emit(period, state.smt_aggregators[period].bars())
         return ret_code, data
 
 
@@ -213,15 +225,19 @@ class FutuEngine(QObject):
     Signals（全部喺非 GUI thread emit；Qt auto-queue 去 GUI thread）:
     - history_ready(str, tuple[Bar]): seed / 切換完成後嘅完整 snapshot，(period, bars)
     - bars_changed(str, tuple[Bar]): tick 聚合後嘅新 snapshot，(period, bars)
+    - smt_history_ready / smt_bars_changed: SMT Divergence 配對副標的嘅 seed / tick snapshot（同 (period, bars)）
     - status(str) / error(str)
     - connection_state(bool, float): (connected, latency_ms) 定時 ping get_global_state RTT（右下角狀態）
 
-    運行時切換：switch(code=None, periods=None) spawn worker thread——code 變先 unsubscribe/subscribe、
-    periods 變先 fetch+seed 差集；全部驗證通過先 swap `_State`（單一 QUOTE 訂閱 → N aggregator）。
+    運行時切換：switch(code=None, periods=None, smt=None) spawn worker thread——code 變先 unsubscribe/subscribe、
+    periods 變先 fetch+seed 差集；smt=True/False 啟用/停用 SMT 配對副標的（雙訂閱）。全部驗證通過先 swap
+    `_State`（單一 QUOTE 訂閱 → N aggregator；SMT 活躍時 +1 訂閱 → M aggregator）。
     """
 
     history_ready = Signal(str, tuple)   # (period, bars)：多 pane 各週期獨立 seed snapshot
     bars_changed = Signal(str, tuple)    # (period, bars)：tick fan-out 後各週期新 snapshot
+    smt_history_ready = Signal(str, tuple)   # (period, bars)：SMT 配對副標的 seed snapshot
+    smt_bars_changed = Signal(str, tuple)    # (period, bars)：SMT 配對副標的 tick 新 snapshot
     status = Signal(str)
     error = Signal(str)
     catalog_ready = Signal(tuple)   # tuple[StockEntry]：HK+US 股票目錄（fuzzy autocomplete 用）
@@ -274,13 +290,14 @@ class FutuEngine(QObject):
         return _fallback_date(self._state.anchor_date, self._state.code)
 
     def start(self, cfg, db_path: str | Path | None = None, periods=None,
-              code: str | None = None) -> None:
+              code: str | None = None, smt: bool = False) -> None:
         """啟動連線 + 歷史 fetch + 訂閱（背景 daemon thread，立即返回）。
 
         db_path：SQLite 訂閱帳本路徑；None → default_db_path()。
         periods：初始活躍週期集合（多 pane）；None → 只 cfg.kline_type。setup thread 喺 subscribe
         前逐個 fetch+seed——開機一次到位，GUI 唔使事後重試 switch（setup thread alive 期間會被 reject）。
         code：初始標的編號；None → cfg.trading_code（.env）。GUI UI-state 記憶還原上次標的時傳入。
+        smt：SMT Divergence 開機即啟用（需 cfg.smt_code）→ setup thread 一併 fetch+seed+訂閱副標的。
         """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -292,7 +309,10 @@ class FutuEngine(QObject):
             initial = frozenset(p.strip().upper() for p in periods) if periods else frozenset({cfg.kline_type})
             aggregators = {p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
                            for p in sorted(initial)}
-            self._state = _State(code, None, initial, aggregators)
+            smt_code = _normalize_code(cfg.smt_code) if (smt and cfg.smt_code) else None
+            smt_aggregators = ({p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
+                                for p in sorted(initial)} if smt_code else {})
+            self._state = _State(code, None, initial, aggregators, smt_code, smt_aggregators)
             thread = threading.Thread(target=self._setup, name="futu-setup", daemon=True)
             self._thread = thread
         thread.start()
@@ -321,11 +341,12 @@ class FutuEngine(QObject):
         if ping_thread is not None and ping_thread.is_alive():
             ping_thread.join(timeout=5)
 
-    def switch(self, code: str | None = None, periods=None) -> None:
-        """運行時改標的 / 週期集合（worker thread，立即返回）。
+    def switch(self, code: str | None = None, periods=None, smt: bool | None = None) -> None:
+        """運行時改標的 / 週期集合 / SMT 配對開關（worker thread，立即返回）。
 
         `periods` = 活躍週期名 list（多 pane 各週期）；None → 沿用當前。code 變先 unsubscribe/subscribe、
-        periods 變先 fetch+seed 差集。校驗失敗 → error signal；setup/switch 進行中 → status 提示並 reject。
+        periods 變先 fetch+seed 差集。`smt`：True=啟用 SMT Divergence（需 cfg.smt_code）、False=停用、
+        None=沿用當前。校驗失敗 → error signal；setup/switch 進行中 → status 提示並 reject。
         """
         with self._lock:
             if self._closed or self._ctx is None:
@@ -346,6 +367,14 @@ class FutuEngine(QObject):
             valid = ", ".join(_KLTYPE_MAP)
             self.error.emit(f"未知 K 線週期 {bad}，可選：{valid}")
             return
+        # SMT 啟用校驗：.env 未設 SMT_CODE / 配對同主標的一樣 → reject（唔會打到 OpenD）
+        if smt is True:
+            if not self._cfg.smt_code:
+                self.error.emit("SMT Divergence 需要 .env 設定 SMT_CODE（配對副標的）")
+                return
+            if _normalize_code(self._cfg.smt_code) == new_code:
+                self.error.emit(f"SMT 配對唔可以同主標的一樣：{new_code}")
+                return
         with self._lock:
             if self._closed or self._ctx is None:
                 self.error.emit("未連線 OpenD，無法切換")
@@ -357,32 +386,38 @@ class FutuEngine(QObject):
                 self.status.emit("切換進行中，請稍候")
                 return
             self._switching = True
-            thread = threading.Thread(target=self._reconfigure, args=(new_code, new_periods),
+            thread = threading.Thread(target=self._reconfigure, args=(new_code, new_periods, smt),
                                       name="futu-switch", daemon=True)
             self._workers.append(thread)
         thread.start()
 
-    def _rollback(self, code: str, msg: str) -> None:
-        """切換失敗 → resubscribe 舊標的（state 未 swap，圖表保持 live）。"""
+    def _rollback(self, code: str, msg: str, smt_code: str | None = None) -> None:
+        """切換失敗 → resubscribe 舊標的（state 未 swap，圖表保持 live）；SMT 配對活躍時一併 resubscribe。"""
         ctx = self._ctx
         if ctx is not None and not self._closed:
+            codes = [code] + ([smt_code] if smt_code else [])
             try:
-                ret, info = ctx.subscribe([code], [SubType.QUOTE])
+                ret, info = ctx.subscribe(codes, [SubType.QUOTE])
                 if ret != RET_OK:
                     logger.error("rollback resubscribe %s 失敗: %s", code, info)
                 else:
-                    self._ensure_store().add(code)  # re-subscribe 成功 → 帳本重新計時
+                    for c in codes:
+                        self._ensure_store().add(c)  # re-subscribe 成功 → 帳本重新計時
             except Exception:  # noqa: BLE001 — rollback 唔好 propagate
                 logger.exception("rollback resubscribe exception")
         if not self._closed:
             self.error.emit(f"切換失敗：{msg}")
 
-    def _reconfigure(self, new_code: str, new_periods: frozenset[str]) -> None:
+    def _reconfigure(self, new_code: str, new_periods: frozenset[str], smt_on: bool | None = None) -> None:
         """Worker thread：（code 變先）unsubscribe 舊 → fetch+seed 各週期 → （code 變先）subscribe 新 → swap。
 
         **單一 QUOTE 訂閱 → N aggregator**：只 subscribe `new_code` 一次；tick fan-out 入所有週期
         aggregator。periods 差集處理——同 code 下未變嘅週期直接沿用舊 aggregator（保留 live bars，
         唔使重新 fetch）；code 變時全部重建（舊標的 bars 無意義）。
+
+        SMT 配對：`smt_on` True=啟用 / False=停用 / None=沿用當前。啟用 → 副標的逐週期
+        fetch+seed（同 primary 窗口）+ subscribe；停用 → unsubscribe 舊副標的。任何失敗 →
+        rollback resubscribe 切換前狀態（state 未 swap，訂閱集合保持一致）。
         """
         old_state = self._state
         try:
@@ -392,7 +427,14 @@ class FutuEngine(QObject):
             if ctx is None or old_state is None:
                 return
             code_changed = old_state.code != new_code
-            # 1) code 變 → unsubscribe 舊（唔係硬停——in-flight push 由 handler code filter 兜底）
+            # SMT 目標：smt_on=None → 沿用當前；True → cfg.smt_code（switch() 已校驗）；False → 關閉
+            if smt_on is None:
+                smt_target = old_state.smt_code
+            elif smt_on and self._cfg.smt_code:
+                smt_target = _normalize_code(self._cfg.smt_code)
+            else:
+                smt_target = None
+            # 1) code 變 → unsubscribe 舊主標的；SMT 停用 → unsubscribe 舊副標的（唔係硬停——in-flight push 由 handler code filter 兜底）
             if code_changed:
                 try:
                     ret, info = ctx.unsubscribe([old_state.code], [SubType.QUOTE])
@@ -403,6 +445,16 @@ class FutuEngine(QObject):
                         self._ensure_store().remove(old_state.code)
                 except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
                     logger.exception("unsubscribe exception")
+            if old_state.smt_code is not None and smt_target is None:
+                try:
+                    ret, info = ctx.unsubscribe([old_state.smt_code], [SubType.QUOTE])
+                    if ret != RET_OK:
+                        logger.warning("unsubscribe SMT %s 失敗: %s", old_state.smt_code, info)
+                        # 「訂閱未滿 1 分鐘」→ OpenD 拒收；帳本保留呢筆（pending），reconcile 稍後重試
+                    else:
+                        self._ensure_store().remove(old_state.smt_code)
+                except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
+                    logger.exception("SMT unsubscribe exception")
             # 2) build + seed 各週期 aggregator（同 code 未變嘅週期沿用舊 aggregator）
             anchor = old_state.anchor_date if not code_changed else None
             aggregators: dict[str, CandleAggregator] = {}
@@ -418,32 +470,61 @@ class FutuEngine(QObject):
                 agg = CandleAggregator(period_min)
                 n = agg.seed_from_history(rows)
                 if n == 0:
-                    self._rollback(old_state.code, f"{new_code} {p} 冇歷史數據")
+                    self._rollback(old_state.code, f"{new_code} {p} 冇歷史數據", old_state.smt_code)
                     return
                 aggregators[p] = agg
                 total += n
                 last_dt = parse_market_time(rows[-1][0])
                 if last_dt is not None and (anchor is None or last_dt.date() > anchor):
                     anchor = last_dt.date()
-            # 3) code 變 → subscribe 新（全部驗證通過先 swap）；同 code 只改週期 → 唔使再 subscribe
+            # 2b) SMT 配對副標的 aggregator（同 primary 週期集合；同 code 未變嘅週期沿用舊 aggregator）
+            smt_aggregators: dict[str, CandleAggregator] = {}
+            if smt_target is not None:
+                for p in sorted(new_periods):
+                    period_min = kline_period_minutes(p) or self._cfg.period_minutes
+                    if not code_changed and p in old_state.smt_aggregators:
+                        agg = old_state.smt_aggregators[p]   # 保留 live bars，唔重新 fetch
+                        smt_aggregators[p] = agg
+                        total += len(agg.bars())
+                        continue
+                    rows = self._fetch_history(ctx, smt_target, p)
+                    agg = CandleAggregator(period_min)
+                    n = agg.seed_from_history(rows)
+                    if n == 0:
+                        self._rollback(old_state.code, f"{smt_target} {p} 冇歷史數據", old_state.smt_code)
+                        return
+                    smt_aggregators[p] = agg
+                    total += n
+                    last_dt = parse_market_time(rows[-1][0])
+                    if last_dt is not None and (anchor is None or last_dt.date() > anchor):
+                        anchor = last_dt.date()
+            # 3) code 變 → subscribe 新主標的；SMT 新啟用/換配對 → subscribe 副標的（全部驗證通過先 swap）
             if code_changed:
                 ret, sub_info = ctx.subscribe([new_code], [SubType.QUOTE])
                 if ret != RET_OK:
-                    self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}")
+                    self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}", old_state.smt_code)
                     return
                 self._ensure_store().add(new_code)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
+            if smt_target is not None and old_state.smt_code != smt_target:
+                ret, sub_info = ctx.subscribe([smt_target], [SubType.QUOTE])
+                if ret != RET_OK:
+                    self._rollback(old_state.code, f"subscribe SMT {smt_target} 失敗: {sub_info}", old_state.smt_code)
+                    return
+                self._ensure_store().add(smt_target)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
             self._schedule_reconcile()               # 排程清理：舊 code 若 unsubscribe 失敗（pending）稍後重試
             # 4) atomic swap + per-period notify
-            new_state = _State(new_code, anchor, new_periods, aggregators)
+            new_state = _State(new_code, anchor, new_periods, aggregators, smt_target, smt_aggregators)
             self._state = new_state
             if not self._closed:
                 for p in sorted(new_periods):
                     self.history_ready.emit(p, aggregators[p].bars())
+                    if smt_target is not None:
+                        self.smt_history_ready.emit(p, smt_aggregators[p].bars())
                 self.status.emit(f"切換成功 · {new_code} · {len(new_periods)} 週期 · {total} 根")
         except Exception as exc:  # noqa: BLE001 — fetch 等任何失敗 → rollback + 回報
             logger.exception("FutuEngine reconfigure failed")
             if old_state is not None and not self._closed:
-                self._rollback(old_state.code, str(exc))
+                self._rollback(old_state.code, str(exc), old_state.smt_code)
         finally:
             self._switching = False
 
@@ -535,7 +616,7 @@ class FutuEngine(QObject):
 
         流程（獨立 daemon thread）：
         1. query_subscription() 攞 OpenD 端實際訂閱 code；失敗 → 跳過呢輪（下輪再試）。
-        2. store.due_for_cleanup(active_codes) = 帳本入面「唔係當前 state.code 且 age>=閾值」嘅條目。
+        2. store.due_for_cleanup(active_codes) = 帳本入面「唔喺 active codes（主標的 + SMT 配對）且 age>=閾值」嘅條目。
         3. 逐筆 unsubscribe：成功 → remove；失敗（例如仲未滿 1min）→ 保留，下輪再試。
         4. query 到但帳本冇記錄嘅 code（上次 crash 殘留、唔係當前 state）→ 直接 unsubscribe + 唔入帳本。
 
@@ -546,7 +627,9 @@ class FutuEngine(QObject):
                 return
             ctx = self._ctx
         state = self._state
-        active_codes = {state.code} if state else set()
+        active_codes = {state.code} if state else set()   # SMT 配對副標的亦係活躍訂閱（唔好當洩漏清走）
+        if state is not None and state.smt_code:
+            active_codes.add(state.smt_code)
 
         open_codes = self._query_open_subscriptions(ctx)
         if open_codes is None:
@@ -685,18 +768,34 @@ class FutuEngine(QObject):
                     last_dt = parse_market_time(rows[-1][0])
                     if last_dt is not None and (anchor is None or last_dt.date() > anchor):
                         anchor = last_dt.date()
+            # SMT 配對副標的：逐週期 fetch+seed（同 primary 窗口；失敗 → raise → 回報 + close ctx）
+            if cur_state.smt_code is not None:
+                for ktype in sorted(cur_state.periods):
+                    rows = self._fetch_history(ctx, cur_state.smt_code, ktype)
+                    agg = cur_state.smt_aggregators[ktype]
+                    n = agg.seed_from_history(rows)
+                    total += n
+                    if rows:
+                        last_dt = parse_market_time(rows[-1][0])
+                        if last_dt is not None and (anchor is None or last_dt.date() > anchor):
+                            anchor = last_dt.date()
             # seed 完成先 swap state（anchor 一齊入，無 None window）；per-period emit
-            self._state = _State(code, anchor, cur_state.periods, dict(cur_state.aggregators))
+            self._state = _State(code, anchor, cur_state.periods, dict(cur_state.aggregators),
+                                 cur_state.smt_code, dict(cur_state.smt_aggregators))
             if not self._closed:
                 for p in sorted(self._state.periods):
                     self.history_ready.emit(p, self._state.aggregators[p].bars())
+                    if self._state.smt_code is not None:
+                        self.smt_history_ready.emit(p, self._state.smt_aggregators[p].bars())
 
             ctx.set_handler(_QuoteHandler(self))
+            codes = [code] + ([cur_state.smt_code] if cur_state.smt_code else [])   # SMT 配對一併訂閱
             self.status.emit(f"訂閱 {code} QUOTE 中…")
-            ret, sub_info = ctx.subscribe([code], [SubType.QUOTE])
+            ret, sub_info = ctx.subscribe(codes, [SubType.QUOTE])
             if ret != RET_OK:
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
-            self._ensure_store().add(code)   # 初始訂閱入帳本
+            for c in codes:
+                self._ensure_store().add(c)   # 初始訂閱入帳本
             self._schedule_reconcile()       # 開機對帳：query_subscription 清理上次殘留訂閱
             self.status.emit(f"訂閱成功 · {len(cur_state.periods)} 週期 · 歷史 {total} 根 · 等待實時報價")
 

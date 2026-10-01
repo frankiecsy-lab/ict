@@ -7,7 +7,8 @@ VOB 有效訂單塊 bullish/bearish + 無掃蕩拒收 + FVG 無重疊拒收 + OB
 Breaker bullish/bearish OB 翻轉 + mitigation + 冇失效唔算 breaker + dedup；
 Kill Zones EST/EDT（DST）session 分類 + band 分組 + 非 intraday skip；
 Daily ref lines DO 線段 + PH/PL/PC 全寬線 + 單日無 prev day + monthly key skip；
-W/M ref lines Prev Week/Month HLC 全寬線（ISO 週分組 / 月分組 / 各需 ≥2 組）。
+W/M ref lines Prev Week/Month HLC 全寬線（ISO 週分組 / 月分組 / 各需 ≥2 組）；
+SMT Divergence bearish/bullish 背離 + secondary 確認唔計 + time_key 對齊缺失跳過。
 
 Bar = (time_key, open, high, low, close, volume)——FVG/OB/Breaker 偵測邏輯唔用
 time_key（全部 case 共用同一 fake key）；Kill Zones / Daily ref lines 讀 time_key。
@@ -17,7 +18,8 @@ from __future__ import annotations
 from engine.indicators import (Level, Marker, RefLine, Zone, confluence_zones, daily_reference_lines,
                                detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
                                detect_order_blocks, detect_ote_zones, detect_premium_discount,
-                               detect_session_high_low, detect_structure_breaks,
+                               detect_session_high_low, detect_smt_divergence,
+                               detect_structure_breaks,
                                detect_valid_order_blocks, kill_zone_bands,
                                weekly_monthly_reference_lines)
 
@@ -660,3 +662,51 @@ def test_ote_empty_and_short():
     assert detect_ote_zones(()) == ()
     six = tuple(bar(10 + i * 0.5, 11 + i * 0.5, 9 + i * 0.5, 10.5 + i * 0.5) for i in range(6))
     assert detect_ote_zones(six) == ()
+
+
+# ---------------------------------------------------------------- SMT Divergence
+
+def _smt_bars(highs, lows=None, prefix="t"):
+    """SMT 測試 bar：high/low 由序列給、open/close = (h+l)/2（detect_smt_divergence 只讀 high/low）。"""
+    if lows is None:
+        lows = [1.0] * len(highs)
+    return tuple((f"{prefix}{i}", (h + l) / 2, h, l, (h + l) / 2, 1000.0)
+                 for i, (h, l) in enumerate(zip(highs, lows)))
+
+
+def test_smt_bearish_divergence():
+    """primary HH（swing high 15→16）但 secondary 對應窗口 max 20→15 → bearish marker @7。"""
+    pri = _smt_bars([10, 11, 12, 15, 12, 11, 12, 16, 12, 11])          # swing highs (3,15),(7,16)
+    sec = _smt_bars([10, 14, 14, 20, 14, 13, 13, 15, 13, 12])          # win[1..5] max=20 > win[5..9] max=15
+    assert detect_smt_divergence(pri, sec) == (Marker("smt_bearish", "down", 7),)
+
+
+def test_smt_bullish_divergence():
+    """primary LL（swing low 5→4）但 secondary 對應窗口 min 2→5 → bullish marker @7。"""
+    pri = _smt_bars([20.0] * 10, [10, 9, 8, 5, 8, 9, 8, 4, 8, 9])      # swing lows (3,5),(7,4)
+    sec = _smt_bars([20.0] * 10, [10, 6, 6, 2, 6, 7, 7, 5, 7, 8])      # win[1..5] min=2 < win[5..9] min=5
+    assert detect_smt_divergence(pri, sec) == (Marker("smt_bullish", "up", 7),)
+
+
+def test_smt_no_divergence_when_secondary_confirms():
+    """secondary 同步創 HH（窗口 max 15→20）→ 無背離 → ()。"""
+    pri = _smt_bars([10, 11, 12, 15, 12, 11, 12, 16, 12, 11])
+    sec = _smt_bars([10, 12, 12, 15, 12, 11, 12, 20, 12, 11])          # win[5..9] max=20 > win[1..5] max=15
+    assert detect_smt_divergence(pri, sec) == ()
+
+
+def test_smt_misaligned_keys_skip():
+    """兩序列 time_key 全唔同 → 無對齊 secondary bar → 比較跳過 → ()。"""
+    pri = _smt_bars([10, 11, 12, 15, 12, 11, 12, 16, 12, 11], prefix="t")
+    sec = _smt_bars([10, 14, 14, 20, 14, 13, 13, 15, 13, 12], prefix="u")
+    assert detect_smt_divergence(pri, sec) == ()
+
+
+def test_smt_empty_and_short():
+    """空序列 / primary 少於 2k+1（k=2 → 5）bar（無 pivot 可確認）→ ()。"""
+    pri = _smt_bars([10, 11, 12, 15, 12, 11, 12, 16, 12, 11])
+    sec = _smt_bars([10, 14, 14, 20, 14, 13, 13, 15, 13, 12])
+    assert detect_smt_divergence((), sec) == ()
+    assert detect_smt_divergence(pri, ()) == ()
+    short = _smt_bars([10, 11, 12, 15])
+    assert detect_smt_divergence(short, short) == ()

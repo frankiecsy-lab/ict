@@ -1,8 +1,8 @@
 """futu_engine 單測：mock OpenQuoteContext + 真 pandas DataFrame（零真實連線）。
 
-覆蓋：_fetch_history 分頁/tail/NaN skip、on_recv_rsp tick 聚合（含 code filter）、
+覆蓋：_fetch_history 分頁/tail/NaN skip、on_recv_rsp tick 聚合（含 code filter + SMT 雙標的 routing）、
 tick_date / _fallback_date（市場時區）、_setup 編排、switch/_reconfigure 運行時切換
-+ rollback、start/stop lifecycle。
++ rollback、SMT Divergence 配對訂閱（enable/disable/threaded）、start/stop lifecycle。
 """
 from __future__ import annotations
 
@@ -861,6 +861,131 @@ class TestReconfigure:
         eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         assert not statuses and not history
+
+
+# ---------------------------------------------------------------- SMT Divergence（雙標的配對訂閱）
+
+class TestSmt:
+    def test_enable_smt_same_code(self):
+        """smt_on=True + cfg.smt_code → fetch+seed 副標的 + subscribe；primary aggregator 沿用（唔重新 fetch）。"""
+        eng = make_engine(history_count=2, smt_code="US.QQQ")
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])   # 1 page：淨係 secondary fetch 用
+        eng._ctx = ctx
+        history, smt_history = [], []
+        eng.history_ready.connect(lambda p, b: history.append((p, len(b))))
+        eng.smt_history_ready.connect(lambda p, b: smt_history.append((p, len(b))))
+
+        eng._reconfigure("HK.HSImain", frozenset({"K_1M"}), smt_on=True)
+
+        assert ctx.unsubscribed is None                          # 同 code → primary 唔會 unsub
+        assert [c["code"] for c in ctx.kline_calls] == ["US.QQQ"]   # 淨係 secondary fetch（primary 沿用）
+        assert ctx.subscribed == (["US.QQQ"], [SubType.QUOTE])
+        st = eng.state
+        assert st.code == "HK.HSImain" and st.smt_code == "US.QQQ"
+        assert set(st.aggregators) == {"K_1M"} and set(st.smt_aggregators) == {"K_1M"}
+        assert st.aggregators["K_1M"].bars() == ()               # primary aggregator 沿用（make_engine 未 seed）
+        assert len(st.smt_aggregators["K_1M"].bars()) == 2       # secondary seed from HIST_ROWS
+        assert history == [("K_1M", 0)] and smt_history == [("K_1M", 2)]
+
+    def test_disable_smt_unsubscribes_secondary(self):
+        """smt_on=False（舊 state 有 SMT）→ unsubscribe 副標的；aggregator 全部沿用、零 fetch。"""
+        eng = make_engine(history_count=2, smt_code="US.QQQ")
+        ctx1 = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx1
+        eng._reconfigure("HK.HSImain", frozenset({"K_1M"}), smt_on=True)   # 先啟用
+
+        ctx2 = FakeCtx([])                                                # 停用：唔應該有任何 fetch
+        eng._ctx = ctx2
+        history, smt_history = [], []
+        eng.history_ready.connect(lambda p, b: history.append((p, len(b))))
+        eng.smt_history_ready.connect(lambda p, b: smt_history.append((p, len(b))))
+
+        eng._reconfigure("HK.HSImain", frozenset({"K_1M"}), smt_on=False)
+
+        assert not ctx2.kline_calls                                       # 全部 aggregator 沿用
+        assert ctx2.unsubscribed == (["US.QQQ"], [SubType.QUOTE])         # 副標的 unsub
+        st = eng.state
+        assert st.smt_code is None and st.smt_aggregators == {}
+        assert history == [("K_1M", 0)] and not smt_history               # 停用後唔再 emit SMT
+
+    def test_smt_code_rows_route_to_smt_aggregator(self, monkeypatch):
+        """QUOTE push row code == state.smt_code → smt aggregator + smt_bars_changed（primary 唔受影響）。"""
+        eng = make_engine(smt_code="US.QQQ")
+        smt_agg = CandleAggregator(1)
+        eng._state = dataclasses.replace(eng.state, smt_code="US.QQQ", smt_aggregators={"K_1M": smt_agg})
+        set_anchor(eng, date(2030, 1, 1))
+        primary, smt_bars, errors = [], [], []
+        eng.bars_changed.connect(lambda p, b: primary.append((p, len(b))))
+        eng.smt_bars_changed.connect(lambda p, b: smt_bars.append((p, len(b))))
+        eng.error.connect(errors.append)
+
+        df = quote_df([("09:30:45.123", 200.0, 100)], code="US.QQQ")
+        monkeypatch.setattr(StockQuoteHandlerBase, "on_recv_rsp", lambda self, rsp_pb: (RET_OK, df))
+        _QuoteHandler(eng).on_recv_rsp(None)
+
+        assert not primary and not errors                                # primary aggregator 冇收到呢筆 tick
+        assert smt_bars == [("K_1M", 1)]                                 # secondary tick → smt aggregator
+        assert len(smt_agg.bars()) == 1
+
+    def test_mixed_code_rows_route_by_code(self, monkeypatch):
+        """同一 push 混合 primary + SMT code rows → 各入自己 aggregator（dual emit）；未知 code skip。"""
+        eng = make_engine(smt_code="US.QQQ")
+        smt_agg = CandleAggregator(1)
+        eng._state = dataclasses.replace(eng.state, smt_code="US.QQQ", smt_aggregators={"K_1M": smt_agg})
+        set_anchor(eng, date(2030, 1, 1))
+        primary, smt_bars, errors = [], [], []
+        eng.bars_changed.connect(lambda p, b: primary.append((p, len(b))))
+        eng.smt_bars_changed.connect(lambda p, b: smt_bars.append((p, len(b))))
+        eng.error.connect(errors.append)
+
+        df = pd.concat([quote_df([("09:30:45.123", 100.0, 100)]),
+                        quote_df([("09:30:46.123", 200.0, 200)], code="US.QQQ"),
+                        quote_df([("09:30:47.123", 300.0, 300)], code="US.TSLA")], ignore_index=True)
+        monkeypatch.setattr(StockQuoteHandlerBase, "on_recv_rsp", lambda self, rsp_pb: (RET_OK, df))
+        _QuoteHandler(eng).on_recv_rsp(None)
+
+        assert not errors
+        assert primary == [("K_1M", 1)] and smt_bars == [("K_1M", 1)]    # 各入自己 aggregator；US.TSLA skip
+
+    def test_switch_smt_requires_cfg(self):
+        """switch(smt=True) 但 .env 未設 SMT_CODE → error reject（唔會打到 OpenD）。"""
+        eng = make_engine(history_count=2)   # cfg.smt_code=None
+        eng._ctx = FakeCtx([])               # switch() 要求 ctx 非 None 先至行到校驗
+        errors = []
+        eng.error.connect(errors.append)
+
+        eng.switch(smt=True)
+
+        assert any("SMT_CODE" in e for e in errors)
+
+    def test_switch_smt_same_as_primary_rejected(self):
+        """SMT 配對同主標的一樣 → error reject（背離偵測無意義）。"""
+        eng = make_engine(history_count=2, smt_code="HK.HSImain")   # == trading_code
+        eng._ctx = FakeCtx([])               # switch() 要求 ctx 非 None 先至行到校驗
+        errors = []
+        eng.error.connect(errors.append)
+
+        eng.switch(smt=True)
+
+        assert any("唔可以同主標的一樣" in e for e in errors)
+
+    def test_switch_smt_threaded_enable(self):
+        """switch(smt=True) 真線程路徑：worker 行 _reconfigure(smt_on=True) → subscribe 副標的 + state swap。"""
+        eng = make_engine(history_count=2, smt_code="US.QQQ")
+        ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        eng._ctx = ctx
+
+        eng.switch(smt=True)   # code=None → 沿用 HK.HSImain；periods=None → 沿用 K_1M
+        assert wait_until(lambda: ctx.gate_waited)  # worker 行到 subscribe（gate 住）
+        ctx.gate.set()
+        assert wait_until(lambda: not eng._switching)
+
+        assert [c["code"] for c in ctx.kline_calls] == ["US.QQQ"]
+        assert ctx.subscribed == (["US.QQQ"], [SubType.QUOTE])
+        st = eng.state
+        assert st.code == "HK.HSImain" and st.smt_code == "US.QQQ"
+        assert len(st.smt_aggregators["K_1M"].bars()) == 2
+        eng.stop()
 
 
 # ---------------------------------------------------------------- switch 真線程（guard / lifecycle）

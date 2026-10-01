@@ -91,6 +91,7 @@ class Config:
     trading_code: str = "HK.HSImain"
     kline_type: str = "K_1M"
     history_count: int = 1000
+    smt_code: str | None = None       # SMT Divergence 配對副標的（None/空 = 功能關閉）
 
     # --- 圖表顯示 ---
     visible_bars: int = 120
@@ -133,6 +134,7 @@ class Config:
             trading_code=_str("TRADING_CODE", "HK.HSImain"),
             kline_type=kline_type,
             history_count=max(1, _int("HISTORY_COUNT", 1000)),
+            smt_code=_str("SMT_CODE", "") or None,   # SMT Divergence 配對副標的（空 = 關閉）
             visible_bars=max(1, _int("VISIBLE_BARS", 120)),
             convention=convention,
             color_up=_str("COLOR_UP", "") or None,

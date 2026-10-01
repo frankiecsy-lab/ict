@@ -12,7 +12,8 @@
 - F11 切換全屏幕；Esc 關閉（README Features）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
   history_ready / bars_changed → chart.update_bars；status / error → status bar；
-  catalog_ready → completer model rebuild + 名稱 LABEL 初始化；
+  smt_history_ready / smt_bars_changed → chart.set_smt_bars（SMT Divergence 配對副標的 snapshot，
+  同週期路由去各 pane）；catalog_ready → completer model rebuild + 名稱 LABEL 初始化；
   connection_state(bool, float) → **右下角**連線狀態 + 反應速度（µs/ms，addPermanentWidget）。
 """
 from __future__ import annotations
@@ -36,11 +37,12 @@ logger = logging.getLogger(__name__)
 
 # 指標開關註冊表（模組化擴展點）：加新指標 = 喺呢度加一行 → control bar 自動生成對應 checkable 按鍵。
 # 偵測邏輯喺 engine/indicators.py、繪製層喺 candle_chart._recompute_zones() / paintEvent；
-# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"）。
+# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"/"smt"）。
+# "smt" 條件顯示：.env 未設 SMT_CODE（無配對副標的）→ control bar 唔生成該按鍵。
 INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
     ("ob", "OB"), ("fvg", "FVG"), ("vob", "VOB"), ("brk", "BRK"), ("kz", "KZ"),
     ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS"), ("pd", "PD"), ("ote", "OTE"),
-    ("shl", "SHL"), ("wmref", "W/M")
+    ("shl", "SHL"), ("wmref", "W/M"), ("smt", "SMT")
 )
 
 # OpenD 連線狀態指示色（獨立於市場慣例漲跌色——已連線恆綠、斷線恆紅，唔隨 convention 翻轉）
@@ -96,6 +98,8 @@ class MainWindow(QMainWindow):
         self._engine = FutuEngine(self)
         self._engine.history_ready.connect(self._on_history_ready)
         self._engine.bars_changed.connect(self._on_bars_changed)
+        self._engine.smt_history_ready.connect(self._on_smt_bars)   # SMT 配對副標的 snapshot（seed/switch 完成）
+        self._engine.smt_bars_changed.connect(self._on_smt_bars)    # SMT tick 聚合更新
         self._engine.status.connect(lambda m: sb.showMessage(m, 8000))
         self._engine.error.connect(self._on_error)
         self._engine.catalog_ready.connect(self._on_catalog_ready)
@@ -127,8 +131,11 @@ class MainWindow(QMainWindow):
         # 讀 _desired_periods() + code= 一次到位（saved_code=None → cfg.trading_code）。
         self._state_store = UIStateStore(default_ui_state_path())
         saved_code = self._load_ui_state()
+        # SMT Divergence：還原後嘅按鍵 checked 狀態（.env 無 SMT_CODE → 冇按鍵 → False）→ start() 一次到位
+        smt_btn = self._indicator_btns.get("smt")
+        smt_on = bool(smt_btn.isChecked()) if smt_btn is not None else False
         # 開機即 fetch 全部 pane 週期（setup thread 內逐個 seed；GUI 唔使事後重試 switch）
-        self._engine.start(cfg, periods=list(self._desired_periods()), code=saved_code)
+        self._engine.start(cfg, periods=list(self._desired_periods()), code=saved_code, smt=smt_on)
 
     def _build_pane_widget(self, index: int) -> tuple[QWidget, QComboBox, CandleChart]:
         """單一 pane：頂部週期 combo + CandleChart。返回 (container, combo, chart)。"""
@@ -246,6 +253,8 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("指標"))
         self._indicator_btns: dict[str, QPushButton] = {}
         for key, label in INDICATOR_TOGGLES:
+            if key == "smt" and not self._cfg.smt_code:
+                continue   # .env 未設 SMT_CODE（無配對副標的）→ 唔生成 SMT 按鍵
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -485,6 +494,12 @@ class MainWindow(QMainWindow):
         """Tick 聚合更新 → 路由新 snapshot 去對應 pane。"""
         self._route_period_bars(period, bars)
 
+    def _on_smt_bars(self, period: str, bars) -> None:
+        """SMT 配對副標的 snapshot（seed/switch/tick）→ 同週期路由去各 pane（set_smt_bars 只存 + coalesce repaint）。"""
+        for i in range(len(self._panes)):
+            if self._pane_combos[i].currentText() == period:
+                self._panes[i].set_smt_bars(bars)
+
     def _on_pane_period_changed(self, i: int) -> None:
         """某 pane combo 換週期 → reset 該 pane 視圖 + engine switch（periods = 全 pane union）。
 
@@ -557,9 +572,16 @@ class MainWindow(QMainWindow):
             self._syncing = False
 
     def _on_indicator_toggled(self, key: str, on: bool) -> None:
-        """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。"""
+        """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。
+
+        "smt" 特殊：除圖層外仲要 engine 端訂閱配對副標的（雙訂閱）→ switch(smt=on/off)。
+        setup/switch 進行中時 engine 會 status 提示並 reject（pane 圖層狀態照樣翻轉，
+        下輪 toggle 或重開 app 會再同步）。
+        """
         for pane in self._panes:
             pane.set_indicator(key, on)
+        if key == "smt":
+            self._engine.switch(smt=on)   # 啟用/停用 SMT 配對副標的訂閱（worker thread）
         self._save_ui_state()   # 指標開關改變 → 記憶
 
     def shutdown(self) -> None:

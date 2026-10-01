@@ -104,8 +104,9 @@ class Level:
 class Marker:
     """結構突破標記（BOS / CHoCH）——畫喺特定 bar 上嘅箭頭/三角，唔係價格矩形。
 
-    kind ∈ {"bos", "choch"}：BOS=Break of Structure（順勢延續）、CHoCH=Change of
-    Character（首次逆勢 = 反轉訊號）。direction ∈ {"up", "down"}；idx = bar global index。
+    kind ∈ {"bos", "choch", "smt_bearish", "smt_bullish"}：BOS=Break of Structure（順勢延續）、
+    CHoCH=Change of Character（首次逆勢 = 反轉訊號）、SMT=Divergence 背離標記。
+    direction ∈ {"up", "down"}；idx = bar global index。
     """
 
     kind: str
@@ -716,3 +717,45 @@ def detect_ote_zones(bars, k: int = 3) -> tuple[Zone, ...]:
             out.append(Zone("ote", "bearish", lo_idx, None,
                             lo_price + 0.79 * span, lo_price + 0.62 * span))
     return tuple(out)
+
+
+def detect_smt_divergence(primary, secondary, k: int = 2) -> tuple[Marker, ...]:
+    """SMT Divergence（Smart Money Technique）：兩個高度相關標的嘅背離偵測。
+
+    primary 創更高 swing high 但 secondary 對應窗口冇創更高 high → bearish；primary 創更低
+    low 但 secondary 冇創更低 low → bullish（對稱）。兩序列必須同週期、以 time_key 對齊
+    （dict lookup）；swing 只取 primary（_swing_points(primary, k)）——secondary 只做價格
+    參考。連續 primary swing highs (j < i, price_i > price_j)：sec_max(i)=max(secondary.high
+    [i-k..i+k]) < sec_j → Marker("smt_bearish", "down", i)，其中 sec_j=sec_max(j)；lows 對稱：
+    price_i < price_j 且 sec_min(i) > sec_min(j) → Marker("smt_bullish", "up", i)。窗口內無
+    對齊 secondary bar（缺 key）→ 跳過該比較。O(n·k)。
+    """
+    if not primary or not secondary:
+        return ()
+    n = len(primary)
+    sec_by_key = {b[0]: b for b in secondary}
+
+    def _sec_window(idx: int, which: str) -> float | None:
+        """secondary high/low 喺 [idx-k..idx+k]（按 primary time_key 對齊）嘅 max/min；無對齊 bar → None。"""
+        vals = []
+        for t in range(max(0, idx - k), min(n - 1, idx + k) + 1):
+            sb = sec_by_key.get(primary[t][0])
+            if sb is not None:
+                vals.append(float(sb[2] if which == "high" else sb[3]))
+        return (max(vals) if which == "high" else min(vals)) if vals else None
+
+    out: list[Marker] = []
+    for which, kind, direction in (("high", "smt_bearish", "down"), ("low", "smt_bullish", "up")):
+        swings = _swing_points(primary, k, which)   # [(idx, price), ...] idx 遞增
+        for (j_idx, j_price), (i_idx, i_price) in zip(swings, swings[1:]):
+            if which == "high" and not i_price > j_price:    # 只比 HH/LL 對（flat 序列唔計）
+                continue
+            if which == "low" and not i_price < j_price:
+                continue
+            sec_i = _sec_window(i_idx, which)
+            sec_j = _sec_window(j_idx, which)
+            if sec_i is None or sec_j is None:               # 無對齊 secondary bar → 跳過
+                continue
+            if (which == "high" and sec_i < sec_j) or (which == "low" and sec_i > sec_j):
+                out.append(Marker(kind, direction, i_idx))
+    return tuple(sorted(out, key=lambda m: m.idx))

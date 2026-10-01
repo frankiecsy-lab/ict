@@ -891,3 +891,84 @@ class TestWMRefLines:
         for c in ("#00ACC1", "#0097A7", "#26C6DA", "#9575CD", "#7E57C2", "#B39DDB"):
             assert self._count_in(img_on, QColor(c)) > 0
 
+
+class TestSmtDivergence:
+    """SMT Divergence 圖層（Step 2 · Commit 25）：set_indicator("smt") + set_smt_bars() →
+    detect_smt_divergence(primary, secondary)；#FF4081（bearish 粉紅）/ #18FFFF（bullish 青）
+    係 palette 唯一色 → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _smt_pair():
+        """Bearish pair（同 test_indicators.test_smt_bearish_divergence）：primary HH 但 secondary
+        對應窗口 max 20→15 → bearish marker @7。兩序列 time_key 完全一致（對齊前提）。"""
+        pri_h = [10, 11, 12, 15, 12, 11, 12, 16, 12, 11]
+        sec_h = [10, 14, 14, 20, 14, 13, 13, 15, 13, 12]
+
+        def _mk(highs):
+            return tuple((f"2026-09-30 09:{i:02d}", (h + 1.0) / 2, h, 1.0, (h + 1.0) / 2, 1000.0)
+                         for i, h in enumerate(highs))
+
+        return _mk(pri_h), _mk(sec_h)
+
+    @staticmethod
+    def _bull_pair():
+        """Bullish pair（同 test_indicators.test_smt_bullish_divergence）：primary LL 但 secondary
+        對應窗口 min 2→5 → bullish marker @7。"""
+        pri_l = [10, 9, 8, 5, 8, 9, 8, 4, 8, 9]
+        sec_l = [10, 6, 6, 2, 6, 7, 7, 5, 7, 8]
+
+        def _mk(lows):
+            return tuple((f"2026-09-30 09:{i:02d}", (20.0 + l) / 2, 20.0, l, (20.0 + l) / 2, 1000.0)
+                         for i, l in enumerate(lows))
+
+        return _mk(pri_l), _mk(sec_l)
+
+    def test_smt_recomputes_immediately(self):
+        """set_indicator("smt", True)（set_smt_bars 已先行）→ _smt_markers = bearish @7；toggle off → 清空。"""
+        from engine.indicators import Marker
+        ch = CandleChart(Config())
+        pri, sec = self._smt_pair()
+        ch.update_bars(pri)
+        ch.set_smt_bars(sec)          # 只存 snapshot（indicator 未啟用 → 無 marker）
+        assert ch._smt_markers == ()  # 預設全 off
+        ch.set_indicator("smt", True)
+        assert ch._smt_markers == (Marker("smt_bearish", "down", 7),)
+        ch.set_indicator("smt", False)
+        assert ch._smt_markers == ()
+
+    def test_smt_pixels_only_when_enabled(self):
+        """#FF4081（bearish）/ #18FFFF（bullish）palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        pri, sec = self._smt_pair()
+        ch.update_bars(pri)
+        ch.set_smt_bars(sec)
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#FF4081")) == 0
+        assert self._count_in(img_off, QColor("#18FFFF")) == 0
+        ch.set_indicator("smt", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#FF4081")) > 0      # bearish 三角 @7
+        assert self._count_in(img_on, QColor("#18FFFF")) == 0     # 呢對無 bullish 背離
+        pri2, sec2 = self._bull_pair()
+        ch.update_bars(pri2)
+        ch.set_smt_bars(sec2)
+        ch.set_indicator("smt", True)   # 同步 recompute（render 唔會驅動 repaint timer）
+        img_bull = self._render(ch)
+        assert self._count_in(img_bull, QColor("#18FFFF")) > 0    # bullish 三角 @7
+

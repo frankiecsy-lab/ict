@@ -35,23 +35,31 @@ class FakeEngine(QObject):
     error = Signal(str)
     catalog_ready = Signal(tuple)
     connection_state = Signal(bool, float)   # (connected, latency_ms) — 右下角連線狀態 + 延遲
+    smt_history_ready = Signal(str, tuple)   # (period, bars) — SMT Divergence 配對副標的 seed snapshot
+    smt_bars_changed = Signal(str, tuple)    # (period, bars) — SMT tick 聚合更新
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.switch_calls: list[tuple[str | None, tuple[str, ...] | None]] = []
         self.start_periods: list[str] | None = None   # start(periods=...) 記錄
         self.start_code: str | None = None            # start(code=...) 記錄（UI-state 記憶還原）
+        self.start_smt: bool = False                  # start(smt=...) 記錄（SMT Divergence 開機啟用）
+        self.smt_switches: list[bool] = []            # switch(smt=on/off) 記錄（運行時啟用/停用副標的訂閱）
         self.state = None                              # _State | None——替身無活躍狀態
 
-    def start(self, cfg, db_path=None, periods=None, code=None) -> None:  # noqa: ARG002 — 替身唔連線
+    def start(self, cfg, db_path=None, periods=None, code=None, smt=False) -> None:  # noqa: ARG002 — 替身唔連線
         self.start_periods = list(periods) if periods else None
         self.start_code = code
+        self.start_smt = bool(smt)
 
     def stop(self) -> None:
         pass
 
-    def switch(self, code=None, periods=None) -> None:
+    def switch(self, code=None, periods=None, smt=None) -> None:
+        # switch_calls 保持 (code, periods) 2-tuple（既有斷言格式）；smt 另計
         self.switch_calls.append((code, tuple(sorted(periods)) if periods is not None else None))
+        if smt is not None:
+            self.smt_switches.append(bool(smt))
 
 
 class FakeStateStore:

@@ -29,7 +29,7 @@ from engine.indicators import (_KZ_LABELS, Level, Marker, RefLine, Zone, conflue
                                detect_fvg, detect_liquidity_levels,
                                detect_order_blocks, detect_ote_zones,
                                detect_premium_discount, detect_session_high_low,
-                               detect_structure_breaks,
+                               detect_smt_divergence, detect_structure_breaks,
                                detect_valid_order_blocks,
                                kill_zone_bands, weekly_monthly_reference_lines)
 from engine.timeutil import bar_key_to_dt
@@ -291,6 +291,8 @@ class CandleChart(QWidget):
         self._pd_zones: tuple[Zone, ...] = ()                    # Premium/Discount dealing range 帶（背景層）
         self._session_lines: tuple[RefLine, ...] = ()            # Session High/Low per-day 範圍線
         self._wm_lines: tuple[RefLine, ...] = ()                 # Prev Week/Month HLC 全寬參考線
+        self._smt_bars: tuple[Bar, ...] = ()                     # SMT Divergence 配對副標的 snapshot（time_key 對齊）
+        self._smt_markers: tuple[Marker, ...] = ()               # SMT bearish/bullish 背離標記
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -313,6 +315,12 @@ class CandleChart(QWidget):
         if not self._repaint_timer.isActive():
             self._repaint_timer.start()
 
+    def set_smt_bars(self, bars: tuple[Bar, ...]) -> None:
+        """接收 SMT Divergence 配對副標的 snapshot；同 update_bars 一樣 coalesce repaint。"""
+        self._smt_bars = tuple(bars)
+        if not self._repaint_timer.isActive():
+            self._repaint_timer.start()
+
     def add_overlay(self, fn: Callable[[QPainter, tuple[Bar, ...], QRectF], None]) -> None:
         """註冊 overlay 繪製函數（喺蠟燭之後、crosshair 之前畫）。"""
         self._overlays.append(fn)
@@ -320,7 +328,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"/"wmref"/"smt"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -337,9 +345,10 @@ class CandleChart(QWidget):
         VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
         唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels / structure
         markers / premium-discount 存獨立狀態（_kz_bands / _ref_lines / _levels /
-        _markers / _pd_zones / _session_lines / _wm_lines），唔入 zones dict；任何 recompute 都先重置
-        七者（toggle off → 清空，唔會殘留舊 band/line/level/marker/pd/session/wm）。OTE 入
-        zones["ote"]（同 FVG/OB 一樣價格錨定矩形、畫喺蠟燭上面）。
+        _markers / _pd_zones / _session_lines / _wm_lines / _smt_markers），唔入 zones dict；任何 recompute 都先重置
+        八者（toggle off → 清空，唔會殘留舊 band/line/level/marker/pd/session/wm/smt）。OTE 入
+        zones["ote"]（同 FVG/OB 一樣價格錨定矩形、畫喺蠟燭上面）。SMT Divergence 需要主標的 +
+        配對副標的兩份 snapshot（_smt_bars）——任一缺失 → 無 marker。
         """
         self._kz_bands = ()
         self._ref_lines = ()
@@ -348,6 +357,7 @@ class CandleChart(QWidget):
         self._pd_zones = ()
         self._session_lines = ()
         self._wm_lines = ()
+        self._smt_markers = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -382,6 +392,8 @@ class CandleChart(QWidget):
             self._pd_zones = detect_premium_discount(self._bars)  # Premium/Discount dealing range（獨立背景層）
         if self._indicator_enabled.get("ote"):
             zones["ote"] = detect_ote_zones(self._bars)          # OTE Fibonacci 回撤帶（價格錨定矩形，畫喺蠟燭上面）
+        if self._indicator_enabled.get("smt") and self._bars and self._smt_bars:
+            self._smt_markers = detect_smt_divergence(self._bars, self._smt_bars)  # SMT 背離標記（獨立圖層）
         self._zones = zones
 
     def reset_view(self) -> None:
@@ -793,12 +805,15 @@ class CandleChart(QWidget):
                 p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
                            Qt.AlignLeft | Qt.AlignBottom, lv.kind.upper())
 
-        # --- Structure Breaks（BOS/CHoCH 結構突破標記；畫喺 levels 之後、overlay 之前）
+        # --- Structure Breaks + SMT Divergence（結構突破/背離標記；畫喺 levels 之後、overlay 之前）
         #     每個 marker = 特定 bar 上嘅小三角：direction "up" → high 上方指上、「down」→ low 下方指下。
-        if self._markers:
+        all_markers = self._markers + self._smt_markers   # BOS/CHoCH + SMT bearish/bullish（同三角形樣式）
+        if all_markers:
             s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
-            marker_colors = {"bos": "#FF9100", "choch": "#E040FB"}   # BOS 橙 / CHoCH 品紅（palette 唯一）
-            for mk in self._markers:
+            marker_colors = {"bos": "#FF9100", "choch": "#E040FB",   # BOS 橙 / CHoCH 品紅（palette 唯一）
+                             "smt_bearish": "#FF4081",               # SMT bearish 粉紅（palette 唯一）
+                             "smt_bullish": "#18FFFF"}               # SMT bullish 青（palette 唯一）
+            for mk in all_markers:
                 li = mk.idx - s0
                 if li < 0 or li >= n:
                     continue                       # 標記喺可見視窗外 → skip
@@ -816,7 +831,7 @@ class CandleChart(QWidget):
                 p.setBrush(QBrush(color))
                 p.drawPolygon(QPolygonF([QPointF(x - half, y_base), QPointF(x + half, y_base),
                                          QPointF(x, y_apex)]))
-                label = "BOS" if mk.kind == "bos" else "CHoCH"
+                label = {"bos": "BOS", "choch": "CHoCH"}.get(mk.kind, "SMT")
                 p.setPen(color)
                 ly = (y_apex - 14) if mk.direction == "up" else (y_apex + 2)
                 p.drawText(QRectF(x - 20, ly, 40, 12), Qt.AlignHCenter | Qt.AlignVCenter, label)
