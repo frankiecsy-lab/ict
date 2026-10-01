@@ -246,3 +246,125 @@ class TestTimeWindowSyncRoundTrip:
         assert ch_b._view_count == 1
         assert round(ch_b._right_offset) == 1
 
+
+class TestIndicatorToggles:
+    """ICT 指標層（OB / FVG / Confluence）：set_indicator() 立即 recompute + pixel 級驗證。
+
+    crafted 5-bar 序列（手算驗證過嘅 zone 結果）：
+      b0 [8.8,9.5] c=9.4↑、b1 [9.3,9.6] c=9.5↑、b2 [10.5,12] c=11.9↑（強陽線）、
+      b3 [9.8,10.6] c=9.9↓（pullback）、b4 [9.9,13] c=12.8↑（BOS up trigger）
+    → FVG [9.5,10.5]@2 + FVG [9.6,9.8]@3、OB [9.9,10.4]@3（origin=b3 body）、
+      confluence = OB ∩ FVG@2 重疊帶 [9.9,10.4]@3。
+    """
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _diff_count(img_a, img_b, threshold: int = 32) -> int:
+        """兩張 render 差異像素數（alpha-blended fill 唔可以精確色計數 → 用 diff）。"""
+        n = 0
+        for y in range(img_a.height()):
+            for x in range(img_a.width()):
+                ca, cb = img_a.pixelColor(x, y), img_b.pixelColor(x, y)
+                if (abs(ca.red() - cb.red()) + abs(ca.green() - cb.green())
+                        + abs(ca.blue() - cb.blue())) > threshold:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _fvg_bars():
+        """3 bars 含已知 bullish FVG [10, 11]@2（c1.high=10 < c3.low=11）。"""
+        return (
+            ("2026-09-30 09:00", 9.0, 10.0, 8.5, 9.5, 1000.0),
+            ("2026-09-30 09:01", 9.5, 10.5, 9.0, 10.4, 1000.0),
+            ("2026-09-30 09:02", 10.5, 12.0, 11.0, 11.8, 1000.0),
+        )
+
+    @staticmethod
+    def _confluence_bars():
+        return (
+            ("2026-09-30 09:00", 9.0, 9.5, 8.8, 9.4, 1000.0),
+            ("2026-09-30 09:01", 9.4, 9.6, 9.3, 9.5, 1000.0),
+            ("2026-09-30 09:02", 9.7, 12.0, 10.5, 11.9, 1000.0),
+            ("2026-09-30 09:03", 10.4, 10.6, 9.8, 9.9, 1000.0),
+            ("2026-09-30 09:04", 10.0, 13.0, 9.9, 12.8, 1000.0),
+        )
+
+    def test_default_no_indicators_enabled(self):
+        ch = _chart(50)
+        assert ch._indicator_enabled == {}
+        assert ch._zones == {}
+
+    def test_set_indicator_fvg_recomputes_immediately(self):
+        """set_indicator() 同步重算（唔使等 30ms repaint timer）。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._fvg_bars())
+        assert ch._zones == {}                       # 預設全 off
+        ch.set_indicator("fvg", True)
+        assert ch._zones["fvg"] == (Zone("fvg", "bullish", 2, None, 11.0, 10.0),)
+
+    def test_set_indicator_off_clears_zones(self):
+        ch = CandleChart(Config())
+        ch.update_bars(self._fvg_bars())
+        ch.set_indicator("fvg", True)
+        assert "fvg" in ch._zones
+        ch.set_indicator("fvg", False)
+        assert ch._zones == {}
+
+    def test_ob_and_fvg_zone_values_on_crafted_sequence(self):
+        """5-bar 序列 → 手算驗證過嘅精確 zone（2 FVG + 1 OB）。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._confluence_bars())
+        ch.set_indicator("fvg", True)
+        ch.set_indicator("ob", True)
+        assert ch._zones["fvg"] == (
+            Zone("fvg", "bullish", 2, None, 10.5, 9.5),
+            Zone("fvg", "bullish", 3, None, 9.8, 9.6),
+        )
+        assert ch._zones["ob"] == (Zone("ob", "bullish", 3, None, 10.4, 9.9),)
+
+    def test_confluence_derived_only_when_both_enabled(self):
+        """confluence 唔係獨立開關——OB + FVG 同時啟用先自動派生。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._confluence_bars())
+        ch.set_indicator("fvg", True)
+        assert "confluence" not in ch._zones         # FVG 單開 → 無共鳴層
+        ch.set_indicator("ob", True)
+        assert ch._zones["confluence"] == (Zone("confluence", "bullish", 3, None, 10.4, 9.9),)
+
+    def test_render_differs_when_fvg_enabled(self):
+        """pixel diff：啟用 FVG 後 render 必須有差異（zone fill + 虛線邊框畫入圖）。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._fvg_bars())
+        img_off = self._render(ch)
+        ch.set_indicator("fvg", True)
+        img_on = self._render(ch)
+        assert self._diff_count(img_off, img_on) > 0
+
+    def test_confluence_border_pixels_only_with_both_enabled(self):
+        """confluence 邊框 #B388FF 係 palette 唯一色 → 可以精確計數：
+        FVG 單開 = 0、OB+FVG 同開 > 0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._confluence_bars())
+        ch.set_indicator("fvg", True)
+        assert self._count_in(self._render(ch), QColor("#B388FF")) == 0
+        ch.set_indicator("ob", True)
+        assert self._count_in(self._render(ch), QColor("#B388FF")) > 0
+

@@ -24,6 +24,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+from engine.indicators import Zone, confluence_zones, detect_fvg, detect_order_blocks
 from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
@@ -111,6 +112,21 @@ def _clamp_offset(off: float, total_bars: int, count: int) -> float:
     return max(0.0, min(float(off), float(total_bars - count)))
 
 
+def visible_slice_range(bars: tuple[Bar, ...], count: int, right_offset: float) -> tuple[int, int]:
+    """可見視窗嘅 global index 範圍 (start, end)——同 visible_window() 共用同一公式（DRY）。
+
+    ICT 指標 zone 用 global bar index 記錄，paintEvent 靠呢個映射返可見視窗 local index。
+    空輸入 / 非法 count → (0, 0)。
+    """
+    if not bars or count <= 0:
+        return (0, 0)
+    n = len(bars)
+    off = int(round(_clamp_offset(right_offset, n, count)))
+    end = n - off
+    start = max(0, end - count)
+    return start, end
+
+
 def visible_window(bars: tuple[Bar, ...], count: int, right_offset: float) -> tuple[Bar, ...]:
     """可見視窗（X 軸 pan/zoom 狀態 → slice）。
 
@@ -119,10 +135,7 @@ def visible_window(bars: tuple[Bar, ...], count: int, right_offset: float) -> tu
     """
     if not bars or count <= 0:
         return ()
-    n = len(bars)
-    off = int(round(_clamp_offset(right_offset, n, count)))
-    end = n - off
-    start = max(0, end - count)
+    start, end = visible_slice_range(bars, count, right_offset)
     return bars[start:end]
 
 
@@ -260,6 +273,10 @@ class CandleChart(QWidget):
         self._bars: tuple[Bar, ...] = ()
         self._mouse_pos: QPointF | None = None
         self._overlays: list[Callable[[QPainter, tuple[Bar, ...], QRectF], None]] = []
+        # ICT 指標層（OB / FVG / Confluence）：toggle key → 啟用；zones = per-key 偵測結果
+        # （Zone 用 global bar index，喺 repaint tick 重算——tick burst coalesce 內只算一次）
+        self._indicator_enabled: dict[str, bool] = {}
+        self._zones: dict[str, tuple[Zone, ...]] = {}
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -271,7 +288,7 @@ class CandleChart(QWidget):
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setSingleShot(True)
         self._repaint_timer.setInterval(30)  # backpressure：coalesce tick burst
-        self._repaint_timer.timeout.connect(self.update)
+        self._repaint_timer.timeout.connect(self._on_repaint_tick)
 
     # ------------------------------------------------------------- public API
 
@@ -285,6 +302,40 @@ class CandleChart(QWidget):
     def add_overlay(self, fn: Callable[[QPainter, tuple[Bar, ...], QRectF], None]) -> None:
         """註冊 overlay 繪製函數（喺蠟燭之後、crosshair 之前畫）。"""
         self._overlays.append(fn)
+
+    # ------------------------------------------------------------- ICT 指標層
+
+    def set_indicator(self, key: str, on: bool) -> None:
+        """開關一個指標圖層（"ob" / "fvg"）；立即重算 zones + repaint，唔使等下一 tick。"""
+        self._indicator_enabled[key] = bool(on)
+        self._recompute_zones()
+        self.update()
+
+    def _on_repaint_tick(self) -> None:
+        """30ms backpressure tick：先重算啟用中指標嘅 zones，再 repaint（coalesce 窗口內只算一次）。"""
+        self._recompute_zones()
+        self.update()
+
+    def _recompute_zones(self) -> None:
+        """對全部啟用指標用完整 snapshot 重算偵測結果；冇啟用 → 清空。
+
+        Confluence 唔係獨立開關——OB + FVG 同時啟用時自動派生（同向價格區間重疊帶）。
+        """
+        if not any(self._indicator_enabled.values()):
+            self._zones = {}
+            return
+        zones: dict[str, tuple[Zone, ...]] = {}
+        fvg_zones = ()
+        ob_zones = ()
+        if self._indicator_enabled.get("fvg"):
+            fvg_zones = detect_fvg(self._bars)
+            zones["fvg"] = fvg_zones
+        if self._indicator_enabled.get("ob"):
+            ob_zones = detect_order_blocks(self._bars)
+            zones["ob"] = ob_zones
+        if ob_zones and fvg_zones:
+            zones["confluence"] = confluence_zones(ob_zones, fvg_zones)
+        self._zones = zones
 
     def reset_view(self) -> None:
         """重置視圖狀態返預設（右 pin + auto-fit Y）；雙擊觸發，main_window 喺切換標的時亦調用。"""
@@ -525,7 +576,46 @@ class CandleChart(QWidget):
             p.setBrush(QBrush(color))
             p.drawRect(QRectF(x - body_w / 2, top, body_w, body_h))
 
-        # --- overlays（ICT FVG / Order Block / Kill Zone 擴展點）
+        # --- ICT 指標層（OB / FVG / Confluence）：價格錨定矩形畫喺蠟燭上面；zone index 係 global →
+        #     visible_slice_range() 映射返 local；完全喺視窗外 / Y 範圍外嘅 zone skip。
+        #     繪製順序 fvg → ob → confluence（confluence 最上層）
+        if self._zones:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            for kind in ("fvg", "ob", "confluence"):
+                for z in self._zones.get(kind, ()):
+                    if z.end_idx is not None and z.end_idx < s0:
+                        continue                       # 已喺視窗前填補/失效 → skip
+                    li = max(0, z.start_idx - s0)      # 左緣 local index
+                    re_ = n - 1 if z.end_idx is None else min(n - 1, z.end_idx - s0)
+                    if re_ < li:
+                        continue                       # 同可見視窗無重疊 → skip
+                    x_left = plot.left() + li * slot   # bar li slot 左緣
+                    x_right = plot.right() if z.end_idx is None else plot.left() + (re_ + 1) * slot
+                    y_t, y_b = y_price(z.top), y_price(z.bottom)
+                    top_y = max(y_t, price_r.top())    # clip 入 price 區（唔會畫去 volume subpane / margin）
+                    bot_y = min(y_b, price_r.bottom())
+                    if top_y >= bot_y:
+                        continue                       # zone 完全喺當前 Y 範圍上/下方 → 唔畫
+                    rect = QRectF(x_left, top_y, x_right - x_left, bot_y - top_y)
+                    if kind == "confluence":
+                        base = QColor("#B388FF")       # 紫色 accent：同橙色 last-price line、紅綠蠟燭易分辨
+                        alpha, dash = 100, Qt.SolidLine
+                    elif kind == "fvg":
+                        base = up_c if z.side == "bullish" else down_c
+                        alpha, dash = 45, Qt.DashLine  # 虛線邊框同 OB 視覺區分
+                    else:                              # ob
+                        base = up_c if z.side == "bullish" else down_c
+                        alpha, dash = 80, Qt.SolidLine
+                    fill = QColor(base)
+                    fill.setAlpha(alpha)
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QBrush(fill))
+                    p.drawRect(rect)
+                    p.setPen(QPen(base, 1, dash))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawRect(rect)
+
+        # --- overlays（通用擴展點；ICT FVG / Order Block 已係一級指標層，見上）
         for fn in self._overlays:
             fn(p, bars, price_r)
 

@@ -29,6 +29,11 @@ from engine.stock_catalog import name_text
 from .candle_chart import CandleChart
 from .stock_completer import StockCompleter, code_from_completion
 
+# 指標開關註冊表（模組化擴展點）：加新指標 = 喺呢度加一行 → control bar 自動生成對應 checkable 按鍵。
+# 偵測邏輯喺 engine/indicators.py、繪製層喺 candle_chart._recompute_zones() / paintEvent；
+# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob" / "fvg"）。
+INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (("ob", "OB"), ("fvg", "FVG"))
+
 
 class MainWindow(QMainWindow):
     def __init__(self, cfg):
@@ -197,6 +202,21 @@ class MainWindow(QMainWindow):
             if n == 1:
                 btn.setChecked(True)  # 先 set checked 再 connect（避免初始觸發 layout）
         self._layout_group.buttonClicked.connect(lambda _btn: self._on_layout_clicked())
+
+        # 指標開關（checkable、非 exclusive）：每個 INDICATOR_TOGGLES entry 一個按鍵；
+        # toggled → 全部 pane 同步（含隱藏——狀態同 pane 數據一樣保留）
+        h.addSpacing(16)
+        h.addWidget(QLabel("指標"))
+        self._indicator_btns: dict[str, QPushButton] = {}
+        for key, label in INDICATOR_TOGGLES:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # lambda 包參數：避開 signal overload 綁定陷阱（踩坑記錄見 AGENTS.md 附錄）；
+            # 預設 off → setChecked 唔會觸發，無初始觸發問題
+            btn.toggled.connect(lambda on, k=key: self._on_indicator_toggled(k, bool(on)))
+            h.addWidget(btn)
+            self._indicator_btns[key] = btn
 
         h.addStretch(1)
 
@@ -394,6 +414,11 @@ class MainWindow(QMainWindow):
                 self._panes[i].set_time_window(center - half, center + half)
         finally:
             self._syncing = False
+
+    def _on_indicator_toggled(self, key: str, on: bool) -> None:
+        """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。"""
+        for pane in self._panes:
+            pane.set_indicator(key, on)
 
     def shutdown(self) -> None:
         """Clean shutdown：close OpenD context + join setup/switch threads（idempotent）。"""
