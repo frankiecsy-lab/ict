@@ -24,7 +24,9 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from engine.indicators import Zone, confluence_zones, detect_fvg, detect_order_blocks
+from engine.indicators import (_KZ_LABELS, RefLine, Zone, confluence_zones,
+                               daily_reference_lines, detect_breaker_blocks,
+                               detect_fvg, detect_order_blocks, kill_zone_bands)
 from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
@@ -273,10 +275,12 @@ class CandleChart(QWidget):
         self._bars: tuple[Bar, ...] = ()
         self._mouse_pos: QPointF | None = None
         self._overlays: list[Callable[[QPainter, tuple[Bar, ...], QRectF], None]] = []
-        # ICT 指標層（OB / FVG / Confluence）：toggle key → 啟用；zones = per-key 偵測結果
+        # ICT 指標層（OB / FVG / Confluence / Breaker）：toggle key → 啟用；zones = per-key 偵測結果
         # （Zone 用 global bar index，喺 repaint tick 重算——tick burst coalesce 內只算一次）
         self._indicator_enabled: dict[str, bool] = {}
         self._zones: dict[str, tuple[Zone, ...]] = {}
+        self._kz_bands: tuple[tuple[int, int, str], ...] = ()   # Kill Zone session bands（global index 範圍）
+        self._ref_lines: tuple[RefLine, ...] = ()                # Daily Open / Prev Day HLC 參考線
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -306,7 +310,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob" / "fvg"）；立即重算 zones + repaint，唔使等下一 tick。"""
+        """開關一個指標圖層（"ob" / "fvg" / "brk" / "kz" / "ref"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -320,7 +324,11 @@ class CandleChart(QWidget):
         """對全部啟用指標用完整 snapshot 重算偵測結果；冇啟用 → 清空。
 
         Confluence 唔係獨立開關——OB + FVG 同時啟用時自動派生（同向價格區間重疊帶）。
+        KZ bands / ref lines 存獨立狀態（_kz_bands / _ref_lines），唔入 zones dict；
+        任何 recompute 都先重置兩者（toggle off → 清空，唔會殘留舊 band/line）。
         """
+        self._kz_bands = ()
+        self._ref_lines = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -333,8 +341,14 @@ class CandleChart(QWidget):
         if self._indicator_enabled.get("ob"):
             ob_zones = detect_order_blocks(self._bars)
             zones["ob"] = ob_zones
+        if self._indicator_enabled.get("brk"):
+            zones["breaker"] = detect_breaker_blocks(self._bars)
         if ob_zones and fvg_zones:
             zones["confluence"] = confluence_zones(ob_zones, fvg_zones)
+        if self._indicator_enabled.get("kz"):
+            self._kz_bands = kill_zone_bands(self._bars)
+        if self._indicator_enabled.get("ref"):
+            self._ref_lines = daily_reference_lines(self._bars)
         self._zones = zones
 
     def reset_view(self) -> None:
@@ -549,10 +563,34 @@ class CandleChart(QWidget):
             p.drawText(QRectF(x - 40, vol_r.bottom() + 4, 80, 16),
                        Qt.AlignHCenter | Qt.AlignTop, time_label(bars[i][0]))
 
-        # --- volume subpane（先畫，蠟燭層喺上面；bar 寬度同蠟燭 body 一致）
+        # --- Kill Zone session bands（背景層：volume/蠟燭之前畫；indigo fill + label）
         vmax = volume_max(bars)
         slot = self._bar_slot(n, plot)
         body_w = max(1.0, slot * 0.7)
+        if self._kz_bands:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            kz_c = QColor("#5C6BC0")
+            for start, end, key in self._kz_bands:
+                if end < s0:
+                    continue                       # band 完全喺視窗前 → skip
+                li = max(0, start - s0)
+                re_ = min(n - 1, end - s0)
+                x_left = plot.left() + li * slot
+                x_right = plot.left() + (re_ + 1) * slot
+                band = QRectF(x_left, plot.top(), x_right - x_left, plot.height())
+                fill = QColor(kz_c)
+                fill.setAlpha(30)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(fill))
+                p.drawRect(band)
+                if band.width() >= 34:             # 夠寬先畫 label（zoom out 避免擠塞）
+                    lab = QColor(kz_c)
+                    lab.setAlpha(150)
+                    p.setPen(lab)
+                    p.drawText(QRectF(x_left + 2, plot.top() + 2, band.width() - 4, 14),
+                               Qt.AlignLeft | Qt.AlignTop, _KZ_LABELS.get(key, key))
+
+        # --- volume subpane（先畫，蠟燭層喺上面；bar 寬度同蠟燭 body 一致）
         up_c = QColor(cfg.up_color)
         down_c = QColor(cfg.down_color)
         p.setPen(Qt.NoPen)
@@ -576,12 +614,12 @@ class CandleChart(QWidget):
             p.setBrush(QBrush(color))
             p.drawRect(QRectF(x - body_w / 2, top, body_w, body_h))
 
-        # --- ICT 指標層（OB / FVG / Confluence）：價格錨定矩形畫喺蠟燭上面；zone index 係 global →
+        # --- ICT 指標層（OB / FVG / Breaker / Confluence）：價格錨定矩形畫喺蠟燭上面；zone index 係 global →
         #     visible_slice_range() 映射返 local；完全喺視窗外 / Y 範圍外嘅 zone skip。
-        #     繪製順序 fvg → ob → confluence（confluence 最上層）
+        #     繪製順序 fvg → ob → breaker → confluence（confluence 最上層）
         if self._zones:
             s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
-            for kind in ("fvg", "ob", "confluence"):
+            for kind in ("fvg", "ob", "breaker", "confluence"):
                 for z in self._zones.get(kind, ()):
                     if z.end_idx is not None and z.end_idx < s0:
                         continue                       # 已喺視窗前填補/失效 → skip
@@ -603,6 +641,9 @@ class CandleChart(QWidget):
                     elif kind == "fvg":
                         base = up_c if z.side == "bullish" else down_c
                         alpha, dash = 45, Qt.DashLine  # 虛線邊框同 OB 視覺區分
+                    elif kind == "breaker":
+                        base = QColor("#4DD0E1")       # cyan accent：失效 OB 翻轉（獨立於 up/down 色）
+                        alpha, dash = 70, Qt.SolidLine
                     else:                              # ob
                         base = up_c if z.side == "bullish" else down_c
                         alpha, dash = 80, Qt.SolidLine
@@ -614,6 +655,27 @@ class CandleChart(QWidget):
                     p.setPen(QPen(base, 1, dash))
                     p.setBrush(Qt.NoBrush)
                     p.drawRect(rect)
+
+        # --- Daily reference lines（DO 線段 + PH/PL/PC 全寬水平線；畫喺 zone 之後、overlay 之前）
+        if self._ref_lines:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            ref_colors = {"do": "#90A4AE", "ph": "#FFD54F", "pl": "#64B5F6", "pc": "#E0E0E0"}
+            for rl in self._ref_lines:
+                if rl.end_idx is not None and rl.end_idx < s0:
+                    continue                       # 線段完全喺視窗前 → skip
+                y = y_price(rl.price)
+                if y < price_r.top() or y > price_r.bottom():
+                    continue                       # 超出當前 Y 範圍 → 唔畫
+                li = max(0, rl.start_idx - s0)
+                re_ = n - 1 if rl.end_idx is None else min(n - 1, rl.end_idx - s0)
+                x_left = plot.left() + li * slot
+                x_right = (plot.right() if rl.end_idx is None
+                           else plot.left() + (re_ + 1) * slot)
+                color = QColor(ref_colors[rl.kind])
+                p.setPen(QPen(color, 1, Qt.DashLine if rl.kind == "do" else Qt.SolidLine))
+                p.drawLine(int(x_left), int(y), int(x_right), int(y))
+                p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
+                           Qt.AlignLeft | Qt.AlignBottom, rl.kind.upper())
 
         # --- overlays（通用擴展點；ICT FVG / Order Block 已係一級指標層，見上）
         for fn in self._overlays:

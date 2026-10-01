@@ -2,14 +2,19 @@
 
 覆蓋：FVG bullish/bearish/無 gap（touching）/fill/unfilled/multiple；
 OB 觸發 + 最近反向線選擇 + body 邊界 + 失效 + doji skip + weak bar no-trigger + dedup；
-confluence 同向重疊 / 無價格重疊 / 異向排除 / 時間區間無交集 / end 邊界取 min。
+confluence 同向重疊 / 無價格重疊 / 異向排除 / 時間區間無交集 / end 邊界取 min；
+Breaker bullish/bearish OB 翻轉 + mitigation + 冇失效唔算 breaker + dedup；
+Kill Zones EST/EDT（DST）session 分類 + band 分組 + 非 intraday skip；
+Daily ref lines DO 線段 + PH/PL/PC 全寬線 + 單日無 prev day + monthly key skip。
 
-Bar = (time_key, open, high, low, close, volume)——偵測邏輯唔用 time_key，
-全部 case 共用同一 fake key（重複 key 合法）。
+Bar = (time_key, open, high, low, close, volume)——FVG/OB/Breaker 偵測邏輯唔用
+time_key（全部 case 共用同一 fake key）；Kill Zones / Daily ref lines 讀 time_key。
 """
 from __future__ import annotations
 
-from engine.indicators import Zone, confluence_zones, detect_fvg, detect_order_blocks
+from engine.indicators import (RefLine, Zone, confluence_zones, daily_reference_lines,
+                               detect_breaker_blocks, detect_fvg, detect_order_blocks,
+                               kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -158,3 +163,139 @@ def test_confluence_end_takes_min():
     ob = (Zone("ob", "bullish", 1, None, 10.2, 9.8),)
     fvg = (Zone("fvg", "bullish", 2, 7, 11.0, 10.0),)
     assert confluence_zones(ob, fvg) == (Zone("confluence", "bullish", 2, 7, 10.2, 10.0),)
+
+
+# ---------------------------------------------------------------- Breaker Block
+
+def test_breaker_bullish_ob_flips_to_bearish():
+    """bullish OB [10.1,10.4]（origin=b1 body）被 b3 close(9.6)<下界失效 → bearish breaker
+    start=3；b4 close(10.5)>上界 10.4 mitigation → end_idx=4。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2),
+            bar(10.4, 10.6, 10.0, 10.1),   # bearish origin，body [10.1, 10.4]
+            bar(10.1, 11.2, 10.0, 11.0),   # strong BOS up trigger（i=2）
+            bar(10.9, 11.0, 9.5, 9.6),     # close < 10.1 → 失效 k=3
+            bar(9.7, 10.6, 9.5, 10.5))     # close > 10.4 → mitigation end=4
+    assert detect_breaker_blocks(bars) == (Zone("breaker", "bearish", 3, 4, 10.4, 10.1),)
+
+
+def test_breaker_bearish_ob_flips_to_bullish():
+    """bearish OB [10.0,10.3]（origin=b1 body）被 b3 high(10.5)>上界失效 → bullish breaker
+    start=3；b4 close(9.8)<下界 10.0 mitigation → end_idx=4。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2),
+            bar(10.0, 10.4, 9.9, 10.3),    # bullish origin，body [10.0, 10.3]
+            bar(10.3, 10.4, 9.0, 9.2),     # strong BOS down trigger（i=2）
+            bar(9.3, 10.5, 9.2, 10.4),     # high > 10.3 → 失效 k=3
+            bar(10.2, 10.3, 9.7, 9.8))     # close < 10.0 → mitigation end=4
+    assert detect_breaker_blocks(bars) == (Zone("breaker", "bullish", 3, 4, 10.3, 10.0),)
+
+
+def test_breaker_unmitigated_stays_open():
+    """失效後冇 bar 收返去 zone 另一邊 → end_idx=None（畫到右緣）。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2),
+            bar(10.4, 10.6, 10.0, 10.1),   # bearish origin，body [10.1, 10.4]
+            bar(10.1, 11.2, 10.0, 11.0),   # trigger i=2
+            bar(10.9, 11.0, 9.5, 9.6))     # close < 10.1 → k=3、之後冇 bar → end=None
+    assert detect_breaker_blocks(bars) == (Zone("breaker", "bearish", 3, None, 10.4, 10.1),)
+
+
+def test_ob_without_invalidation_is_not_breaker():
+    """OB 觸發但後續冇失效（價格一直喺 body 上）→ 只係普通 OB、唔產生 breaker。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2),
+            bar(10.4, 10.6, 10.0, 10.1),   # bearish origin，body [10.1, 10.4]
+            bar(10.1, 11.2, 10.0, 11.0),   # trigger i=2
+            bar(10.5, 11.5, 10.4, 11.4))   # close > 下界 → 冇失效
+    assert detect_breaker_blocks(bars) == ()
+
+
+def test_breaker_dedup_same_origin():
+    """兩根強線指向同一 origin j=1 → 只記錄一次；失效喺 b4（close 9.7<10.1）→ k=4、end=None。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2),
+            bar(10.4, 10.6, 10.0, 10.1),   # bearish origin，body [10.1, 10.4]
+            bar(10.1, 11.2, 10.0, 11.0),   # trigger i=2 → origin j=1
+            bar(11.0, 12.4, 10.9, 12.3),   # trigger i=3 → 同 origin → dedup
+            bar(12.0, 12.5, 9.6, 9.7))     # close < 10.1 → k=4
+    assert detect_breaker_blocks(bars) == (Zone("breaker", "bearish", 4, None, 10.4, 10.1),)
+
+
+def test_breaker_empty_and_single_bar():
+    """空 / 單根 → 無 trigger 可能 → ()。"""
+    assert detect_breaker_blocks(()) == ()
+    assert detect_breaker_blocks((bar(1, 2, 0.5, 1.5),)) == ()
+
+
+# ---------------------------------------------------------------- Kill Zones
+
+def _kz_bar(t: str):
+    """Kill Zone bar（time_key = HKT naive 'yyyy-MM-dd HH:mm'）。"""
+    return (t, 100.0, 101.0, 99.5, 100.5, 1000.0)
+
+
+def test_kill_zones_est_winter_sessions():
+    """EST（HKT−ET=780min）：09:30→ET20:30 asia、12:00→ET23:00 asia、13:00→ET00:00 無、
+    15:00→ET02:00 london、17:30→ET04:30 london、18:00→ET05:00 無 → 兩個 band。"""
+    bars = tuple(_kz_bar(f"2026-01-15 {t}") for t in
+                 ("09:30", "12:00", "13:00", "15:00", "17:30", "18:00"))
+    assert kill_zone_bands(bars) == ((0, 1, "asia"), (3, 4, "london"))
+
+
+def test_kill_zones_edt_summer_sessions():
+    """EDT（HKT−ET=720min，DST）：09:30→ET21:30 asia、14:00→ET02:00 london。"""
+    bars = (_kz_bar("2026-07-15 09:30"), _kz_bar("2026-07-15 14:00"))
+    assert kill_zone_bands(bars) == ((0, 0, "asia"), (1, 1, "london"))
+
+
+def test_kill_zones_all_four_sessions():
+    """EST 一日覆蓋全部四個 session：asia / new_york / london_close（隔日）/ london。"""
+    bars = (_kz_bar("2026-01-15 09:30"),   # ET 20:30 → asia
+            _kz_bar("2026-01-15 20:30"),   # ET 07:30 → new_york
+            _kz_bar("2026-01-15 23:30"),   # ET 10:30 → london_close
+            _kz_bar("2026-01-16 15:00"))   # ET 02:00 → london（隔日、session 變化開新 band）
+    assert kill_zone_bands(bars) == (
+        (0, 0, "asia"), (1, 1, "new_york"), (2, 2, "london_close"), (3, 3, "london"))
+
+
+def test_kill_zones_non_intraday_keys_skipped():
+    """K_DAY（'yyyy-MM-dd'，長度 10）/ K_MON（'yyyy-MM'，長度 7）→ session 無意義 → ()。"""
+    day_bars = tuple(_kz_bar(f"2026-09-{d:02d}") for d in (28, 29, 30))
+    mon_bars = (_kz_bar("2026-08"), _kz_bar("2026-09"))
+    assert kill_zone_bands(day_bars) == ()
+    assert kill_zone_bands(mon_bars) == ()
+
+
+def test_kill_zones_empty():
+    """空 bars → ()。"""
+    assert kill_zone_bands(()) == ()
+
+
+# ---------------------------------------------------------------- Daily reference lines
+
+def test_daily_ref_lines_multi_day():
+    """兩日數據：DO 線段各跨當日；PH/PL/PC = 前一交易日（09-30）high max / low min / close。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2, t="2026-09-30 09:30"),
+            bar(10.2, 10.6, 10.0, 10.4, t="2026-09-30 10:00"),
+            bar(10.5, 10.7, 10.1, 10.6, t="2026-10-01 09:30"))
+    assert daily_reference_lines(bars) == (
+        RefLine("do", 10.0, 0, 1),
+        RefLine("do", 10.5, 2, 2),
+        RefLine("ph", 10.6, 0, None),
+        RefLine("pl", 9.8, 0, None),
+        RefLine("pc", 10.4, 0, None),
+    )
+
+
+def test_daily_ref_lines_single_day_no_prev():
+    """單日 → 只有 DO（無前一交易日 → PH/PL/PC 唔存在）。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2, t="2026-09-30 09:30"),
+            bar(10.2, 10.6, 10.0, 10.4, t="2026-09-30 10:00"))
+    assert daily_reference_lines(bars) == (RefLine("do", 10.0, 0, 1),)
+
+
+def test_daily_ref_lines_monthly_keys_skipped():
+    """K_MON（'yyyy-MM'，長度 < 10）→ 無日級概念 → ()。"""
+    bars = (_kz_bar("2026-08"), _kz_bar("2026-09"))
+    assert daily_reference_lines(bars) == ()
+
+
+def test_daily_ref_lines_empty():
+    """空 bars → ()。"""
+    assert daily_reference_lines(()) == ()

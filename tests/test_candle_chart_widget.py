@@ -368,3 +368,121 @@ class TestIndicatorToggles:
         ch.set_indicator("ob", True)
         assert self._count_in(self._render(ch), QColor("#B388FF")) > 0
 
+
+class TestSecondBatchIndicators:
+    """ICT 指標第二批（Breaker / Kill Zones / Daily ref lines）：set_indicator() recompute + pixel 驗證。
+
+    - Breaker：crafted 5-bar 序列 → bearish breaker [10.1,10.4]@3..4；邊框 #4DD0E1 係
+      palette 唯一色 → 精確計數（off=0 / on>0）。
+    - Kill Zones：HKT intraday bars → EST session bands（zoneinfo DST-aware）；fill 係
+      alpha blend → render diff 驗證。
+    - Ref lines：兩日 bars → DO×2 + PH/PL/PC 全寬線；PH #FFD54F 唯一色 → 精確計數。
+    """
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _diff_count(img_a, img_b, threshold: int = 32) -> int:
+        n = 0
+        for y in range(img_a.height()):
+            for x in range(img_a.width()):
+                ca, cb = img_a.pixelColor(x, y), img_b.pixelColor(x, y)
+                if (abs(ca.red() - cb.red()) + abs(ca.green() - cb.green())
+                        + abs(ca.blue() - cb.blue())) > threshold:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _breaker_bars():
+        """5-bar 序列 → bearish breaker [10.1,10.4] start=3 end=4（手算驗證過）。"""
+        return (
+            ("2026-09-30 09:00", 10.0, 10.5, 9.8, 10.2, 1000.0),
+            ("2026-09-30 09:01", 10.4, 10.6, 10.0, 10.1, 1000.0),   # bearish origin body [10.1,10.4]
+            ("2026-09-30 09:02", 10.1, 11.2, 10.0, 11.0, 1000.0),   # strong BOS up trigger i=2
+            ("2026-09-30 09:03", 10.9, 11.0, 9.5, 9.6, 1000.0),     # close < 10.1 → 失效 k=3
+            ("2026-09-30 09:04", 9.7, 10.6, 9.5, 10.5, 1000.0),     # close > 10.4 → mitigation end=4
+        )
+
+    @staticmethod
+    def _kz_bars():
+        """EST（HKT−ET=780min）：asia [0,1] + london [3,4]（純邏輯測試同款數據）。"""
+        return tuple((f"2026-01-15 {t}", 100.0, 101.0, 99.5, 100.5, 1000.0) for t in
+                     ("09:30", "12:00", "13:00", "15:00", "17:30", "18:00"))
+
+    @staticmethod
+    def _ref_bars():
+        """兩日 intraday bars → DO×2 + PH/PL/PC（純邏輯測試同款數據）。"""
+        return (
+            ("2026-09-30 09:30", 10.0, 10.5, 9.8, 10.2, 1000.0),
+            ("2026-09-30 10:00", 10.2, 10.6, 10.0, 10.4, 1000.0),
+            ("2026-10-01 09:30", 10.5, 10.7, 10.1, 10.6, 1000.0),
+        )
+
+    def test_breaker_recomputes_immediately(self):
+        """set_indicator("brk") 同步重算 → _zones["breaker"] = 手算驗證過嘅 zone。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._breaker_bars())
+        assert ch._zones == {}                       # 預設全 off
+        ch.set_indicator("brk", True)
+        assert ch._zones["breaker"] == (Zone("breaker", "bearish", 3, 4, 10.4, 10.1),)
+
+    def test_breaker_border_pixels_only_when_enabled(self):
+        """Breaker 邊框 #4DD0E1 係 palette 唯一色 → off=0、on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._breaker_bars())
+        assert self._count_in(self._render(ch), QColor("#4DD0E1")) == 0
+        ch.set_indicator("brk", True)
+        assert self._count_in(self._render(ch), QColor("#4DD0E1")) > 0
+
+    def test_kz_bands_recompute_and_render_differs(self):
+        """set_indicator("kz") → _kz_bands = EST session bands；alpha fill → render diff > 0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._kz_bars())
+        assert ch._kz_bands == ()                    # 預設 off
+        img_off = self._render(ch)
+        ch.set_indicator("kz", True)
+        assert ch._kz_bands == ((0, 1, "asia"), (3, 4, "london"))
+        img_on = self._render(ch)
+        assert self._diff_count(img_off, img_on) > 0
+
+    def test_kz_off_clears_bands(self):
+        """toggle off → _kz_bands 清空（recompute 重置邏輯，唔會殘留舊 band）。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._kz_bars())
+        ch.set_indicator("kz", True)
+        assert len(ch._kz_bands) == 2
+        ch.set_indicator("kz", False)
+        assert ch._kz_bands == ()
+
+    def test_ref_lines_recompute_and_ph_pixels(self):
+        """set_indicator("ref") → _ref_lines = DO×2 + PH/PL/PC；PH #FFD54F 唯一色 → off=0、on>0。"""
+        from engine.indicators import RefLine
+        ch = CandleChart(Config())
+        ch.update_bars(self._ref_bars())
+        assert ch._ref_lines == ()                   # 預設 off
+        assert self._count_in(self._render(ch), QColor("#FFD54F")) == 0
+        ch.set_indicator("ref", True)
+        assert ch._ref_lines == (
+            RefLine("do", 10.0, 0, 1),
+            RefLine("do", 10.5, 2, 2),
+            RefLine("ph", 10.6, 0, None),
+            RefLine("pl", 9.8, 0, None),
+            RefLine("pc", 10.4, 0, None),
+        )
+        assert self._count_in(self._render(ch), QColor("#FFD54F")) > 0
+

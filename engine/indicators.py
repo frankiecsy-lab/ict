@@ -10,6 +10,15 @@
   [min(o,c), max(o,c)] 做矩形。後續 bar close 跌穿 body 遠端邊界 → 失效。
 - **Confluence（共鳴）**：同方向 OB ∩ FVG 價格區間重疊 → 重疊帶高亮
   （兩個開關同時開啟時由 CandleChart 自動派生）。
+- **Breaker Block**：「失效咗嘅 OB」——bullish OB 被後續 bar close 跌穿 body 下界後
+  翻轉做 bearish 阻力；bearish 對稱（high 升穿上界 → 翻轉 bullish 支持）。矩形 = 原 OB
+  body，自失效 bar 向右延伸直到價格收返去 zone 另一邊（mitigation 完成）。
+- **Kill Zone**：標準 ICT session 時間帶（ET wall clock）：Asia 20:00–24:00 /
+  London KZ 02:00–05:00 / NY KZ 07:00–10:00 / London Close 10:00–12:00。bar time_key
+  係 HKT naive（見 engine/timeutil.py 時區鐵律）→ stdlib zoneinfo 轉 America/New_York
+  （DST-aware）做分類；呢個轉換只供顯示，永遠唔涉及 bar key 產生。
+- **Daily reference lines**：DO = 每日開市價線段（只跨當日）；PH/PL/PC = 前一交易日
+  high/low/close 全寬水平線。
 
 全部 O(n) 純函數；bars = tuple[Bar, ...]，Bar = (time_key, open, high, low, close, volume)
 （同 ui/candle_chart.py / engine/candle_aggregator.py 定義）。
@@ -17,13 +26,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
 class Zone:
     """價格錨定指標矩形。
 
-    kind ∈ {"ob", "fvg", "confluence"}；side ∈ {"bullish", "bearish"}。
+    kind ∈ {"ob", "fvg", "confluence", "breaker"}；side ∈ {"bullish", "bearish"}。
     start_idx = origin bar 嘅 global index（矩形左緣）；end_idx=None 表示仍活躍
     （畫到 plot 右緣），否則喺該 bar 被填補/失效。top/bottom 係價格（top > bottom）。
     """
@@ -34,6 +44,20 @@ class Zone:
     end_idx: int | None
     top: float
     bottom: float
+
+
+@dataclass(frozen=True)
+class RefLine:
+    """水平參考線。
+
+    kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）。
+    start_idx/end_idx = 線段覆蓋嘅 bar index 範圍；end_idx=None 表示全寬（畫到右緣）。
+    """
+
+    kind: str
+    price: float
+    start_idx: int
+    end_idx: int | None
 
 
 def detect_fvg(bars) -> tuple[Zone, ...]:
@@ -105,6 +129,57 @@ def detect_order_blocks(bars) -> tuple[Zone, ...]:
     return tuple(zones)
 
 
+def detect_breaker_blocks(bars) -> tuple[Zone, ...]:
+    """偵測全部 Breaker Block（失效 OB 翻轉）。
+
+    觸發條件同 Order Block（強陽/陰線 BOS + body ≥ range 50% → origin = 最近反向 K 線
+    body），但 zone 唔喺 trigger 時記錄——要等**失效**先成立：bullish OB 被後續 bar
+    close < body 下界（k）→ 翻轉 bearish breaker；bearish OB 被 high > body 上界 →
+    翻轉 bullish。矩形 = 原 OB body，start_idx=k（失效 bar），向右延伸直到價格收返去
+    zone 另一邊（mitigation：bearish close > top / bullish close < bottom）→ end_idx；
+    未收返 → None。同一 origin candle 只記錄一次（dedup）。
+    """
+    if len(bars) < 2:
+        return ()
+    zones: list[Zone] = []
+    seen_origins: set[int] = set()
+    prior_high = float(bars[0][2])   # bars[:i] running high/low（同 detect_order_blocks）
+    prior_low = float(bars[0][3])
+    for i in range(1, len(bars)):
+        o, h_, l_, c = (float(v) for v in bars[i][1:5])
+        body = abs(c - o)
+        if body >= 0.5 * (h_ - l_) and (c > prior_high or c < prior_low):
+            side = "bullish" if c > prior_high else "bearish"
+            j = i - 1                # 向前找最近一根反向 K 線（同 OB）
+            while j >= 0:
+                if (side == "bullish" and bars[j][4] < bars[j][1]) or \
+                   (side == "bearish" and bars[j][4] > bars[j][1]):
+                    break
+                j -= 1
+            if j >= 0 and j not in seen_origins:
+                ob_o, ob_c = float(bars[j][1]), float(bars[j][4])
+                top, bottom = max(ob_o, ob_c), min(ob_o, ob_c)
+                k = None             # 失效 bar：close 跌穿下界（bullish）/ high 升穿上界（bearish）
+                for m in range(i + 1, len(bars)):
+                    if (side == "bullish" and bars[m][4] < bottom) or \
+                       (side == "bearish" and bars[m][2] > top):
+                        k = m
+                        break
+                if k is not None:    # 冇失效 → 唔係 breaker（只係普通 OB）
+                    seen_origins.add(j)
+                    brk_side = "bearish" if side == "bullish" else "bullish"
+                    end_idx = None   # mitigation：收返去 zone 另一邊
+                    for m in range(k + 1, len(bars)):
+                        if (brk_side == "bearish" and bars[m][4] > top) or \
+                           (brk_side == "bullish" and bars[m][4] < bottom):
+                            end_idx = m
+                            break
+                    zones.append(Zone("breaker", brk_side, k, end_idx, top, bottom))
+        prior_high = max(prior_high, h_)
+        prior_low = min(prior_low, l_)
+    return tuple(zones)
+
+
 def confluence_zones(ob_zones: tuple[Zone, ...], fvg_zones: tuple[Zone, ...]) -> tuple[Zone, ...]:
     """Confluence：同方向 OB ∩ FVG 價格區間重疊 → 重疊帶。
 
@@ -133,3 +208,100 @@ def _min_end(a: int | None, b: int | None) -> int | None:
     if a is None or b is None:
         return b if a is None else a
     return min(a, b)
+
+
+# ---------------------------------------------------------------- Kill Zones
+
+#: ICT session 時間帶（ET wall clock，分鐘）：(key, start_min, end_min)。
+KILL_ZONES: tuple[tuple[str, int, int], ...] = (
+    ("asia", 20 * 60, 24 * 60),        # Asia / Sydney session
+    ("london", 2 * 60, 5 * 60),        # London Kill Zone
+    ("new_york", 7 * 60, 10 * 60),     # New York Kill Zone（含 AM open）
+    ("london_close", 10 * 60, 12 * 60)  # London Close / PM session
+)
+
+#: band label（畫喺圖上嘅短名）。
+_KZ_LABELS: dict[str, str] = {
+    "asia": "ASIA", "london": "LDN", "new_york": "NY", "london_close": "LDC"
+}
+
+
+def kill_zone_bands(bars) -> tuple[tuple[int, int, str], ...]:
+    """將 bars 分組成連續 Kill Zone band：tuple[(start_idx, end_idx, session_key), ...]。
+
+    bar time_key 係 HKT naive（engine/timeutil.py 時區鐵律）→ stdlib zoneinfo 轉
+    America/New_York（DST-aware）做**顯示分類**；轉換只讀 key、永遠唔涉及 bar key
+    產生。非 intraday key（長度 ≠ 16，如 K_DAY/K_MON）自動 skip（session 概念只對
+    分鐘級有意義）。zoneinfo 不可用（無 tzdata）→ 優雅降級 ()。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        hkt = ZoneInfo("Asia/Hong_Kong")
+        et = ZoneInfo("America/New_York")
+    except Exception:                 # ZoneInfoNotFoundError / tzdata 缺失 → 無 band
+        return ()
+    bands: list[tuple[int, int, str]] = []
+    cur_key: str | None = None
+    cur_start = 0
+    offset_cache: dict[str, int] = {}   # date → HKT−ET 分鐘（DST 一年最多變兩次）
+    for i, b in enumerate(bars):
+        key = b[0]
+        if len(key) != 16:             # 'yyyy-MM-dd HH:mm' 先有 session 意義
+            session = None
+        else:
+            try:
+                dt = datetime(int(key[:4]), int(key[5:7]), int(key[8:10]),
+                              int(key[11:13]), int(key[14:16]))
+            except ValueError:         # 畸形 key → skip（唔會 crash）
+                session = None
+            else:
+                date_s = key[:10]
+                off = offset_cache.get(date_s)
+                if off is None:        # HKT naive → aware → ET wall clock
+                    et_wall = dt.replace(tzinfo=hkt).astimezone(et)
+                    off = int((dt - et_wall.replace(tzinfo=None)).total_seconds() // 60)
+                    offset_cache[date_s] = off
+                m = (dt.hour * 60 + dt.minute - off) % 1440   # ET wall-clock 分鐘
+                session = next((k for k, s, e in KILL_ZONES if s <= m < e), None)
+        if session != cur_key:         # session 變化 → 收前一段、開新段
+            if cur_key is not None:
+                bands.append((cur_start, i - 1, cur_key))
+            cur_key = session
+            cur_start = i
+    if cur_key is not None:
+        bands.append((cur_start, len(bars) - 1, cur_key))
+    return tuple(bands)
+
+
+# ---------------------------------------------------------------- Daily reference lines
+
+def daily_reference_lines(bars) -> tuple[RefLine, ...]:
+    """Daily Open / Prev Day HLC 參考線。
+
+    DO：每日第一根 bar 嘅 open → 只跨當日嘅線段（start/end = 當日首尾 index）。
+    PH/PL/PC：前一交易日（倒数第二個日組）high max / low min / close → 全寬水平線
+    （start=0、end=None）。非 intraday key（長度 < 10，如 K_MON 'yyyy-MM'）→ ()。
+    """
+    if not bars or len(bars[0][0]) < 10:
+        return ()
+    groups: list[tuple[int, int]] = []   # (first_idx, last_idx) per date
+    prev_date = None
+    for i, b in enumerate(bars):
+        d = b[0][:10]
+        if d != prev_date:
+            groups.append((i, i))
+            prev_date = d
+        else:
+            groups[-1] = (groups[-1][0], i)
+    out: list[RefLine] = []
+    for s, e in groups:                  # DO：每日開市價線段
+        out.append(RefLine("do", float(bars[s][1]), s, e))
+    if len(groups) >= 2:                 # PH/PL/PC：前一交易日（倒数第二組）全寬線
+        ps, pe = groups[-2]
+        ph = max(float(b[2]) for b in bars[ps:pe + 1])
+        pl = min(float(b[3]) for b in bars[ps:pe + 1])
+        pc = float(bars[pe][4])
+        out.append(RefLine("ph", ph, 0, None))
+        out.append(RefLine("pl", pl, 0, None))
+        out.append(RefLine("pc", pc, 0, None))
+    return tuple(out)
