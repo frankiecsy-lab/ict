@@ -1,19 +1,23 @@
 """candle_chart 純 layout 函數單測（零 Qt app 依賴）。"""
 import math
+from datetime import datetime
 
 import pytest
 
 from ui.candle_chart import (
     fmt_price,
+    infer_period_minutes,
     nice_step,
     pan_x,
     pan_y,
     price_range,
     time_label,
+    time_window_indices,
     visible_slice,
     visible_window,
     volume_max,
     wheel_notches,
+    window_time_range,
     zoom_x,
     zoom_y,
 )
@@ -262,3 +266,106 @@ class TestTimeLabel:
 class TestFmtPrice:
     def test_two_decimals(self):
         assert fmt_price(25340.5) == "25340.50"
+
+
+class TestWindowTimeRange:
+    """window_time_range：可見視窗 → (start_dt, end_dt)，end = 尾根 bar **結束**（含 period）。"""
+
+    def test_right_pinned_window(self):
+        bars = _bars(10)  # keys 09:00..09:09，period=1min
+        rng = window_time_range(bars, 4, 0.0, 1)
+        assert rng == (datetime(2026, 9, 30, 9, 6), datetime(2026, 9, 30, 9, 10))
+
+    def test_panned_window(self):
+        bars = _bars(10)
+        # offset=4 → 可見 09:00..09:05（尾根 start 09:05）→ end = 09:06
+        rng = window_time_range(bars, 6, 4.0, 1)
+        assert rng == (datetime(2026, 9, 30, 9, 0), datetime(2026, 9, 30, 9, 6))
+
+    def test_end_includes_period(self):
+        # period=5min：尾根 start 09:09 → end = 09:14（完整覆蓋視窗）
+        bars = _bars(10)
+        rng = window_time_range(bars, 2, 0.0, 5)
+        assert rng == (datetime(2026, 9, 30, 9, 8), datetime(2026, 9, 30, 9, 14))
+
+    def test_empty_bars_returns_none(self):
+        assert window_time_range((), 10, 0.0, 1) is None
+
+    def test_invalid_count_returns_none(self):
+        assert window_time_range(_bars(5), 0, 0.0, 1) is None
+
+    def test_unparseable_key_returns_none(self):
+        bars = tuple(_bar("not-a-date") for _ in range(3))
+        assert window_time_range(bars, 3, 0.0, 1) is None
+
+
+class TestTimeWindowIndices:
+    """time_window_indices：span-overlap → [s, e]（含尾）；無 overlap → None。"""
+
+    def test_exact_match(self):
+        bars = _bars(10)  # keys 09:00..09:09，period=1min
+        # span-overlap：bar [09:02,09:03)..[09:06,09:07) overlap 視窗 [09:02,09:07)；
+        # bar 09:01（end=09:02）只觸及邊界點 → 半開區間唔算 overlap。
+        idx = time_window_indices(bars, datetime(2026, 9, 30, 9, 2), datetime(2026, 9, 30, 9, 7), 1)
+        assert idx == (2, 6)
+
+    def test_partial_overlap_clips_to_bars(self):
+        bars = _bars(10)
+        # start 喺 bar 中間（09:01）→ 首根 overlap 係 09:01；end 越尾 → 最後一根 09:09
+        idx = time_window_indices(bars, datetime(2026, 9, 30, 9, 1), datetime(2026, 9, 30, 9, 59), 1)
+        assert idx == (1, 9)
+
+    def test_no_overlap_returns_none(self):
+        bars = _bars(10)
+        assert time_window_indices(bars, datetime(2026, 9, 30, 10, 0), datetime(2026, 9, 30, 10, 5), 1) is None
+
+    def test_empty_bars_returns_none(self):
+        assert time_window_indices((), datetime(2026, 9, 30, 9, 0), datetime(2026, 9, 30, 9, 5), 1) is None
+
+    def test_none_bounds_return_none(self):
+        bars = _bars(10)
+        assert time_window_indices(bars, None, datetime(2026, 9, 30, 9, 5), 1) is None
+        assert time_window_indices(bars, datetime(2026, 9, 30, 9, 0), None, 1) is None
+
+    def test_single_bar_match(self):
+        bars = _bars(10)
+        idx = time_window_indices(bars, datetime(2026, 9, 30, 9, 4), datetime(2026, 9, 30, 9, 5), 1)
+        assert idx == (4, 4)
+
+    def test_cross_period_alignment(self):
+        """跨週期對齊：intraday pane 視窗套去日線 bars → 只匹配當日一根（span-overlap）。"""
+        day_bars = tuple(_bar("2026-09-30") for _ in range(1)) + tuple(_bar(f"2026-10-{d:02d}") for d in (1, 2, 3))
+        # intraday pane 視窗：2026-09-30 09:30 → 14:56（全喺 09-30 當日）；日線 period=1440min
+        idx = time_window_indices(day_bars, datetime(2026, 9, 30, 9, 30), datetime(2026, 9, 30, 14, 56), 1440)
+        assert idx == (0, 0)
+
+    def test_coarser_bar_starting_before_window_still_overlaps(self):
+        """較粗 pane bar start 早於視窗 start（日線 09-30 00:00 < intraday 視窗 10:00）→ 仍 overlap。"""
+        day_bars = tuple(_bar(f"2026-09-{d:02d}") for d in (28, 29, 30))
+        idx = time_window_indices(day_bars, datetime(2026, 9, 30, 10, 0), datetime(2026, 9, 30, 10, 30), 1440)
+        assert idx == (2, 2)
+
+
+class TestInferPeriodMinutes:
+    """infer_period_minutes：由 bar key 間隔推斷本 pane 週期。"""
+
+    def test_minute_bars(self):
+        bars = tuple(_bar(f"2026-09-30 09:{i:02d}") for i in range(10))
+        assert infer_period_minutes(bars) == 1
+
+    def test_five_minute_bars(self):
+        bars = tuple(_bar(f"2026-09-30 {9 + (i * 5) // 60:02d}:{(i * 5) % 60:02d}") for i in range(10))
+        assert infer_period_minutes(bars) == 5
+
+    def test_daily_bars(self):
+        bars = tuple(_bar(f"2026-09-{d:02d}") for d in (24, 25, 28, 29, 30))
+        assert infer_period_minutes(bars) == 1440
+
+    def test_fewer_than_two_bars_defaults_to_one(self):
+        assert infer_period_minutes(()) == 1
+        assert infer_period_minutes((_bar("2026-09-30"),)) == 1
+
+    def test_unparseable_keys_default_to_one(self):
+        bars = tuple(_bar("not-a-date") for _ in range(5))
+        assert infer_period_minutes(bars) == 1
+

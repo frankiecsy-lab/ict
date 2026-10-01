@@ -6,9 +6,11 @@ Threading model（見 README Architecture）:
 - futu-api 每個 context 只有一條 callback thread → on_recv_rsp 必須快：parse + aggregate + emit，唔做重活；
 - 跨線程傳 immutable tuple-of-tuples snapshot（pyqtSignal queued），GUI 負責 render。
 
-運行時切換一致性：engine 只持一個 immutable `_State(agg, code, kline_type, anchor_date)` reference；
-handler 每 batch load 一次 + per-row `row.code != state.code → skip`（unsubscribe 唔係硬停，
-in-flight push 會喺 swap 後先至到）+ emit 前確認 `state is eng._state`。
+運行時切換一致性：engine 只持一個 immutable `_State(code, anchor_date, periods, aggregators)`
+reference——**單一 QUOTE 訂閱 → N 個 aggregator（每週期一個）**，多 pane 同時看同一標的嘅
+多個週期。handler 每 batch load 一次 state + per-row `row.code != state.code → skip`
+（unsubscribe 唔係硬停，in-flight push 會喺 swap 後先至到）+ emit 前確認 `state is eng._state`；
+tick fan-out 入所有 aggregator，各週期獨立 emit `(period, bars)`。
 
 實測驗證嘅 OpenD 行為（2026-09-29/30, HK.HSImain）:
 1. no-window request_history_kline 返回一年前舊數據 → 必須用 now() 計算嘅明確 start/end 窗口；
@@ -116,12 +118,20 @@ _MARKET_TZ: dict[str, str] = {
 
 @dataclass(frozen=True)
 class _State:
-    """當前行情狀態（immutable reference；切換時一次過 swap，handler 靠 identity check）。"""
+    """當前行情狀態（immutable reference；切換時一次過 swap，handler 靠 identity check）。
 
-    aggregator: CandleAggregator
+    **單一 QUOTE 訂閱 → N 個 aggregator**：`periods` = 活躍週期集合、`aggregators` =
+    {週期名 → CandleAggregator}。多 pane 同時看同一標的嘅多個週期——tick fan-out 入所有
+    aggregator，各週期獨立 emit `(period, bars)`。
+    """
+
     code: str
-    kline_type: str
-    anchor_date: date | None = None
+    anchor_date: date | None
+    periods: frozenset[str]
+    aggregators: dict[str, CandleAggregator]
+
+    def bar_count(self) -> int:
+        return sum(len(a.bars()) for a in self.aggregators.values())
 
 
 def _fallback_date(anchor: date | None, code: str) -> date:
@@ -157,7 +167,7 @@ class _QuoteHandler(StockQuoteHandlerBase):
         if state is None:
             return ret_code, data
         fallback = _fallback_date(state.anchor_date, state.code)
-        changed = False
+        changed: set[str] = set()
         for row in data.itertuples(index=False):
             # code filter：切換後舊標的嘅 in-flight push（unsubscribe 唔係硬停）一律 skip
             if getattr(row, "code", state.code) != state.code:
@@ -172,11 +182,14 @@ class _QuoteHandler(StockQuoteHandlerBase):
                 continue
             if not price > 0:  # NaN guard：nan > 0 係 False → skip
                 continue
-            changed |= state.aggregator.apply_quote(dt, price, cum_vol)
+            for period, agg in state.aggregators.items():  # fan-out 入所有週期 aggregator
+                if agg.apply_quote(dt, price, cum_vol):
+                    changed.add(period)
         if eng.cfg.debug and len(data):
             logger.debug("tick batch rows=%d", len(data))
-        if changed and state is eng._state:  # batch 中途 state 被 swap → 呢批 discard
-            eng.bars_changed.emit(state.aggregator.bars())
+        if state is eng._state:  # batch 中途 state 被 swap → 呢批 discard
+            for period in sorted(changed):
+                eng.bars_changed.emit(period, state.aggregators[period].bars())
         return ret_code, data
 
 
@@ -184,16 +197,16 @@ class FutuEngine(QObject):
     """futu 行情 pipeline 嘅 QObject 包裝。
 
     Signals（全部喺非 GUI thread emit；Qt auto-queue 去 GUI thread）:
-    - history_ready(tuple[Bar]): seed / 切換完成後嘅完整 snapshot
-    - bars_changed(tuple[Bar]): tick 聚合後嘅新 snapshot
+    - history_ready(str, tuple[Bar]): seed / 切換完成後嘅完整 snapshot，(period, bars)
+    - bars_changed(str, tuple[Bar]): tick 聚合後嘅新 snapshot，(period, bars)
     - status(str) / error(str)
 
-    運行時切換：switch(code, kline_type) spawn worker thread 做 unsubscribe → fetch →
-    seed → subscribe，全部驗證通過先 swap `_State`；任何失敗 rollback（resubscribe 舊標的）。
+    運行時切換：switch(code=None, periods=None) spawn worker thread——code 變先 unsubscribe/subscribe、
+    periods 變先 fetch+seed 差集；全部驗證通過先 swap `_State`（單一 QUOTE 訂閱 → N aggregator）。
     """
 
-    history_ready = Signal(tuple)
-    bars_changed = Signal(tuple)
+    history_ready = Signal(str, tuple)   # (period, bars)：多 pane 各週期獨立 seed snapshot
+    bars_changed = Signal(str, tuple)    # (period, bars)：tick fan-out 後各週期新 snapshot
     status = Signal(str)
     error = Signal(str)
     catalog_ready = Signal(tuple)   # tuple[StockEntry]：HK+US 股票目錄（fuzzy autocomplete 用）
@@ -229,10 +242,11 @@ class FutuEngine(QObject):
         return self._state
 
     @property
-    def aggregator(self) -> CandleAggregator:
+    def aggregators(self) -> dict[str, CandleAggregator]:
+        """{週期名 → aggregator}；start() 未呼叫 → RuntimeError。"""
         if self._state is None:
             raise RuntimeError("FutuEngine.start() 未呼叫")
-        return self._state.aggregator
+        return self._state.aggregators
 
     def tick_date(self) -> date:
         """time-only tick 要補嘅日期（讀當前 state；handler 用 _fallback_date(captured state)）。"""
@@ -240,10 +254,12 @@ class FutuEngine(QObject):
             return _fallback_date(None, "HK")
         return _fallback_date(self._state.anchor_date, self._state.code)
 
-    def start(self, cfg, db_path: str | Path | None = None) -> None:
+    def start(self, cfg, db_path: str | Path | None = None, periods=None) -> None:
         """啟動連線 + 歷史 fetch + 訂閱（背景 daemon thread，立即返回）。
 
         db_path：SQLite 訂閱帳本路徑；None → default_db_path()。
+        periods：初始活躍週期集合（多 pane）；None → 只 cfg.kline_type。setup thread 喺 subscribe
+        前逐個 fetch+seed——開機一次到位，GUI 唔使事後重試 switch（setup thread alive 期間會被 reject）。
         """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -251,8 +267,11 @@ class FutuEngine(QObject):
             self._closed = False
             self._cfg = cfg
             self._db_path = db_path
-            self._state = _State(CandleAggregator(cfg.period_minutes),
-                                 _normalize_code(cfg.trading_code), cfg.kline_type, None)
+            code = _normalize_code(cfg.trading_code)
+            initial = frozenset(p.strip().upper() for p in periods) if periods else frozenset({cfg.kline_type})
+            aggregators = {p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
+                           for p in sorted(initial)}
+            self._state = _State(code, None, initial, aggregators)
             thread = threading.Thread(target=self._setup, name="futu-setup", daemon=True)
             self._thread = thread
         thread.start()
@@ -276,26 +295,30 @@ class FutuEngine(QObject):
             if t is not None and t.is_alive():
                 t.join(timeout=10)
 
-    def switch(self, code: str | None = None, kline_type: str | None = None) -> None:
-        """運行時改標的/週期（worker thread，立即返回）。
+    def switch(self, code: str | None = None, periods=None) -> None:
+        """運行時改標的 / 週期集合（worker thread，立即返回）。
 
-        校驗失敗 → error signal；setup/switch 進行中 → status 提示並 reject。
-        任一參數為 None → 沿用當前值（UI 一律傳齊兩個）。
+        `periods` = 活躍週期名 list（多 pane 各週期）；None → 沿用當前。code 變先 unsubscribe/subscribe、
+        periods 變先 fetch+seed 差集。校驗失敗 → error signal；setup/switch 進行中 → status 提示並 reject。
         """
         with self._lock:
             if self._closed or self._ctx is None:
                 return
             cur = self._state
         new_code = _normalize_code(code) if code else (cur.code if cur else None)
-        new_ktype = kline_type.strip().upper() if kline_type else (cur.kline_type if cur else None)
-        if new_code is None or new_ktype is None:
+        if periods is not None:
+            new_periods = frozenset(p.strip().upper() for p in periods)
+        else:
+            new_periods = cur.periods if cur else frozenset()
+        if new_code is None or not new_periods:
             return  # start() 未行過 / 無當前狀態 → 冇嘢可以切
         if code and not _CODE_RE.match(new_code):
             self.error.emit(f"股票編號格式錯誤：{code!r}（例：HK.00700 / US.AAPL）")
             return
-        if kline_type and new_ktype not in _KLTYPE_MAP:
+        bad = [p for p in new_periods if p not in _KLTYPE_MAP]
+        if bad:
             valid = ", ".join(_KLTYPE_MAP)
-            self.error.emit(f"未知 K 線週期 {kline_type!r}，可選：{valid}")
+            self.error.emit(f"未知 K 線週期 {bad}，可選：{valid}")
             return
         with self._lock:
             if self._closed or self._ctx is None:
@@ -308,7 +331,7 @@ class FutuEngine(QObject):
                 self.status.emit("切換進行中，請稍候")
                 return
             self._switching = True
-            thread = threading.Thread(target=self._reconfigure, args=(new_code, new_ktype),
+            thread = threading.Thread(target=self._reconfigure, args=(new_code, new_periods),
                                       name="futu-switch", daemon=True)
             self._workers.append(thread)
         thread.start()
@@ -328,51 +351,69 @@ class FutuEngine(QObject):
         if not self._closed:
             self.error.emit(f"切換失敗：{msg}")
 
-    def _reconfigure(self, new_code: str, new_ktype: str) -> None:
-        """Worker thread：unsubscribe 舊 → fetch+seed 新 → subscribe 新 → swap state。"""
+    def _reconfigure(self, new_code: str, new_periods: frozenset[str]) -> None:
+        """Worker thread：（code 變先）unsubscribe 舊 → fetch+seed 各週期 → （code 變先）subscribe 新 → swap。
+
+        **單一 QUOTE 訂閱 → N aggregator**：只 subscribe `new_code` 一次；tick fan-out 入所有週期
+        aggregator。periods 差集處理——同 code 下未變嘅週期直接沿用舊 aggregator（保留 live bars，
+        唔使重新 fetch）；code 變時全部重建（舊標的 bars 無意義）。
+        """
         old_state = self._state
         try:
             if not self._closed and old_state is not None:
-                self.status.emit(f"切換中 {new_code} {new_ktype}…")
+                self.status.emit(f"切換中 {new_code} · {len(new_periods)} 週期…")
             ctx = self._ctx
             if ctx is None or old_state is None:
                 return
-            # 1) unsubscribe 舊（唔係硬停——in-flight push 由 handler code filter 兜底）
-            try:
-                ret, info = ctx.unsubscribe([old_state.code], [SubType.QUOTE])
+            code_changed = old_state.code != new_code
+            # 1) code 變 → unsubscribe 舊（唔係硬停——in-flight push 由 handler code filter 兜底）
+            if code_changed:
+                try:
+                    ret, info = ctx.unsubscribe([old_state.code], [SubType.QUOTE])
+                    if ret != RET_OK:
+                        logger.warning("unsubscribe %s 失敗: %s", old_state.code, info)
+                        # 「訂閱未滿 1 分鐘」→ OpenD 拒收；帳本保留呢筆（pending），reconcile 稍後重試
+                    else:
+                        self._ensure_store().remove(old_state.code)
+                except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
+                    logger.exception("unsubscribe exception")
+            # 2) build + seed 各週期 aggregator（同 code 未變嘅週期沿用舊 aggregator）
+            anchor = old_state.anchor_date if not code_changed else None
+            aggregators: dict[str, CandleAggregator] = {}
+            total = 0
+            for p in sorted(new_periods):
+                period_min = kline_period_minutes(p) or self._cfg.period_minutes
+                if not code_changed and p in old_state.aggregators:
+                    agg = old_state.aggregators[p]   # 保留 live bars，唔重新 fetch
+                    aggregators[p] = agg
+                    total += len(agg.bars())
+                    continue
+                rows = self._fetch_history(ctx, new_code, p)   # 明確窗口 + 分頁；失敗 raise → rollback
+                agg = CandleAggregator(period_min)
+                n = agg.seed_from_history(rows)
+                if n == 0:
+                    self._rollback(old_state.code, f"{new_code} {p} 冇歷史數據")
+                    return
+                aggregators[p] = agg
+                total += n
+                last_dt = parse_market_time(rows[-1][0])
+                if last_dt is not None and (anchor is None or last_dt.date() > anchor):
+                    anchor = last_dt.date()
+            # 3) code 變 → subscribe 新（全部驗證通過先 swap）；同 code 只改週期 → 唔使再 subscribe
+            if code_changed:
+                ret, sub_info = ctx.subscribe([new_code], [SubType.QUOTE])
                 if ret != RET_OK:
-                    logger.warning("unsubscribe %s 失敗: %s", old_state.code, info)
-                    # 「訂閱未滿 1 分鐘」→ OpenD 拒收；帳本保留呢筆（pending），reconcile 稍後重試
-                else:
-                    self._ensure_store().remove(old_state.code)
-            except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
-                logger.exception("unsubscribe exception")
-            # 2) fetch 新歷史（明確窗口 + 分頁；失敗 raise → rollback）
-            rows = self._fetch_history(ctx, new_code, new_ktype)
-            # 3) build + seed 新 aggregator
-            period = kline_period_minutes(new_ktype)
-            agg = CandleAggregator(period)
-            n = agg.seed_from_history(rows)
-            if n == 0:
-                self._rollback(old_state.code, f"{new_code} {new_ktype} 冇歷史數據")
-                return
-            anchor = None
-            last_dt = parse_market_time(rows[-1][0])
-            if last_dt is not None:
-                anchor = last_dt.date()
-            # 4) subscribe 新（全部驗證通過先 swap）
-            ret, sub_info = ctx.subscribe([new_code], [SubType.QUOTE])
-            if ret != RET_OK:
-                self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}")
-                return
-            self._ensure_store().add(new_code)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
-            self._schedule_reconcile()           # 排程清理：舊 code 若 unsubscribe 失敗（pending）稍後重試
-            # 5) atomic swap + notify
-            new_state = _State(agg, new_code, new_ktype, anchor)
+                    self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}")
+                    return
+                self._ensure_store().add(new_code)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
+            self._schedule_reconcile()               # 排程清理：舊 code 若 unsubscribe 失敗（pending）稍後重試
+            # 4) atomic swap + per-period notify
+            new_state = _State(new_code, anchor, new_periods, aggregators)
             self._state = new_state
             if not self._closed:
-                self.history_ready.emit(new_state.aggregator.bars())
-                self.status.emit(f"切換成功 · {new_code} {new_ktype} · {n} 根")
+                for p in sorted(new_periods):
+                    self.history_ready.emit(p, aggregators[p].bars())
+                self.status.emit(f"切換成功 · {new_code} · {len(new_periods)} 週期 · {total} 根")
         except Exception as exc:  # noqa: BLE001 — fetch 等任何失敗 → rollback + 回報
             logger.exception("FutuEngine reconfigure failed")
             if old_state is not None and not self._closed:
@@ -556,18 +597,23 @@ class FutuEngine(QObject):
             self.status.emit("OpenD 連線成功")
 
             code = _normalize_code(cfg.trading_code)  # .env 小寫/全 upper 輸入都映返正規形式
-            rows = self._fetch_history(ctx, code, cfg.kline_type)
             cur_state = self._state
-            n = cur_state.aggregator.seed_from_history(rows)
             anchor = None
-            if rows:
-                last_dt = parse_market_time(rows[-1][0])
-                if last_dt is not None:
-                    anchor = last_dt.date()
-            # seed 完成先 swap state（anchor 一齊入，無 None window）
-            self._state = _State(cur_state.aggregator, code, cfg.kline_type, anchor)
+            total = 0
+            for ktype in sorted(cur_state.periods):   # 多 pane：逐週期 fetch+seed（單一 QUOTE 訂閱共用）
+                rows = self._fetch_history(ctx, code, ktype)
+                agg = cur_state.aggregators[ktype]
+                n = agg.seed_from_history(rows)
+                total += n
+                if rows:
+                    last_dt = parse_market_time(rows[-1][0])
+                    if last_dt is not None and (anchor is None or last_dt.date() > anchor):
+                        anchor = last_dt.date()
+            # seed 完成先 swap state（anchor 一齊入，無 None window）；per-period emit
+            self._state = _State(code, anchor, cur_state.periods, dict(cur_state.aggregators))
             if not self._closed:
-                self.history_ready.emit(self._state.aggregator.bars())
+                for p in sorted(self._state.periods):
+                    self.history_ready.emit(p, self._state.aggregators[p].bars())
 
             ctx.set_handler(_QuoteHandler(self))
             self.status.emit(f"訂閱 {code} QUOTE 中…")
@@ -576,7 +622,7 @@ class FutuEngine(QObject):
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
             self._ensure_store().add(code)   # 初始訂閱入帳本
             self._schedule_reconcile()       # 開機對帳：query_subscription 清理上次殘留訂閱
-            self.status.emit(f"訂閱成功 · 歷史 {n} 根 · 等待實時報價")
+            self.status.emit(f"訂閱成功 · {len(cur_state.periods)} 週期 · 歷史 {total} 根 · 等待實時報價")
 
             # 股票目錄 fetch（autocomplete 輔助功能）：獨立 try/except——失敗唔影響主流程、唔 close ctx
             try:

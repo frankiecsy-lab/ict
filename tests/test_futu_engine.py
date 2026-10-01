@@ -16,7 +16,7 @@ import pytest
 from futu import Market, RET_OK, SubType, StockQuoteHandlerBase
 
 import engine.futu_engine as fe
-from config import Config
+from config import Config, kline_period_minutes
 from engine.candle_aggregator import CandleAggregator
 from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
                                 _State, _fallback_date, _normalize_code)
@@ -126,12 +126,16 @@ def basic_df(rows) -> pd.DataFrame:
 
 
 def make_engine(**cfg_overrides) -> FutuEngine:
-    """Whitebox：直接注入 cfg + _State，唔行 start()（避免真實連線/線程）。"""
+    """Whitebox：直接注入 cfg + _State，唔行 start()（避免真實連線/線程）。
+
+    新多 pane API：_State(code, anchor_date, periods, aggregators)——單一週期 {kline_type}。
+    """
     eng = FutuEngine()
     cfg = make_cfg(**cfg_overrides)
     eng._cfg = cfg
-    eng._state = _State(CandleAggregator(cfg.period_minutes),
-                        cfg.trading_code, cfg.kline_type, None)
+    ktype = cfg.kline_type
+    agg = CandleAggregator(kline_period_minutes(ktype) or cfg.period_minutes)
+    eng._state = _State(cfg.trading_code, None, frozenset({ktype}), {ktype: agg})
     return eng
 
 
@@ -324,7 +328,7 @@ class TestFetchCatalog:
 class TestQuoteHandler:
     def _run(self, monkeypatch, eng, df, ret=RET_OK):
         emitted, errors = [], []
-        eng.bars_changed.connect(emitted.append)
+        eng.bars_changed.connect(lambda p, b: emitted.append((p, b)))  # (period, bars) per-period signal
         eng.error.connect(errors.append)
         # patch SDK base class 嘅 parse 入口（我哋測自己嘅聚合邏輯，唔係 protobuf 層）
         monkeypatch.setattr(StockQuoteHandlerBase, "on_recv_rsp", lambda self, rsp_pb: (ret, df))
@@ -339,7 +343,8 @@ class TestQuoteHandler:
         emitted, errors, ret_out, data_out = self._run(monkeypatch, eng, df)
         assert not errors and ret_out == RET_OK and data_out is df
         assert len(emitted) == 1
-        snap = emitted[0]
+        period, snap = emitted[0]   # 新 API：(period, bars) per-period signal
+        assert period == "K_1M"
         assert isinstance(snap, tuple)  # immutable snapshot（pyqtSignal 跨線程契約）
         (key, o, h, l, c, v), = snap
         assert key == "2030-01-01 09:30"
@@ -349,22 +354,23 @@ class TestQuoteHandler:
     def test_updates_seeded_bar(self, monkeypatch):
         eng = make_engine()
         set_anchor(eng, date(2030, 1, 1))
-        eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
+        eng.state.aggregators["K_1M"].seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
         df = quote_df([("09:30:10.000", 100.0, 100)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
-        (key, o, h, l, c, v), = emitted[0]
+        _period, snap = emitted[0]   # (period, bars) per-period signal
+        (key, o, h, l, c, v), = snap
         # open 保留 seed 值；high=max(99.5,100)=100；low=min(98.5,100)=98.5；volume delta=0（seed 後首筆）
         assert (key, o, h, l, c, v) == ("2030-01-01 09:30", 99.0, 100.0, 98.5, 100.0, 800.0)
 
     def test_new_bar_after_period_rollover(self, monkeypatch):
         eng = make_engine()
         set_anchor(eng, date(2030, 1, 1))
-        eng.aggregator.seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
+        eng.state.aggregators["K_1M"].seed_from_history([("2030-01-01 09:30", 99.0, 99.5, 98.5, 99.2, 800)])
         df = quote_df([("09:30:10.000", 100.0, 100), ("09:31:02.000", 102.0, 500)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
-        bars = emitted[0]
+        _period, bars = emitted[0]   # (period, bars) per-period signal
         assert len(bars) == 2
         assert bars[0][0] == "2030-01-01 09:30"
         key, o, h, l, c, v = bars[1]
@@ -389,7 +395,8 @@ class TestQuoteHandler:
         df = quote_df([("09:30:05.000", float("nan"), 100), ("09:30:06.000", 100.0, 200)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
-        (key, o, h, l, c, v), = emitted[0]
+        _period, snap = emitted[0]   # (period, bars) per-period signal
+        (key, o, h, l, c, v), = snap
         assert (o, h, l, c) == (100.0, 100.0, 100.0, 100.0) and v == 0.0
 
     def test_garbage_data_time_row_skipped(self, monkeypatch):
@@ -398,7 +405,8 @@ class TestQuoteHandler:
         df = quote_df([("garbage", 100.0, 100), ("09:30:05.000", 101.0, 200)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
-        (key, o, h, l, c, v), = emitted[0]
+        _period, snap = emitted[0]   # (period, bars) per-period signal
+        (key, o, h, l, c, v), = snap
         assert key == "2030-01-01 09:30" and c == 101.0
 
     def test_duplicate_tick_no_reemit(self, monkeypatch):
@@ -417,7 +425,7 @@ class TestQuoteHandler:
         df = quote_df([("09:31:00.000", 100.0, 100), ("09:30:59.000", 99.0, 90)])
         emitted, errors, _, _ = self._run(monkeypatch, eng, df)
         assert not errors and len(emitted) == 1
-        bars = emitted[0]
+        _period, bars = emitted[0]   # (period, bars) per-period signal
         assert len(bars) == 1 and bars[0][0] == "2030-01-01 09:31" and bars[0][4] == 100.0
 
     def test_inflight_old_code_row_skipped(self, monkeypatch):
@@ -437,8 +445,8 @@ class TestQuoteHandler:
         assert len(emitted) == 1
         # 模擬切換：處理第一筆 tick 時 swap 去新 state（_reconfigure 完成嘅瞬間）
         s = eng.state
-        new_state = dataclasses.replace(s, aggregator=CandleAggregator(1))
-        orig_apply = s.aggregator.apply_quote
+        new_state = dataclasses.replace(s, aggregators={"K_1M": CandleAggregator(1)})
+        orig_apply = s.aggregators["K_1M"].apply_quote
 
         def apply_and_swap(self_agg, dt, price, cum):
             eng._state = new_state  # mid-batch switch
@@ -544,18 +552,21 @@ class TestSetup:
         statuses, errors, history = [], [], []
         eng.status.connect(statuses.append)
         eng.error.connect(errors.append)
-        eng.history_ready.connect(history.append)
+        eng.history_ready.connect(lambda p, b: history.append((p, b)))  # (period, bars) per-period signal
         eng._setup()  # test thread 同步行 → signal 直接遞送
 
         assert created == {"host": "127.0.0.1", "port": 11111}
         assert not errors
-        assert len(history) == 1 and len(history[0]) == 2
+        assert len(history) == 1   # per-period signal：(period, bars)
+        _p, bars = history[0]
+        assert _p == "K_1M" and len(bars) == 2
         assert ctx.handler is not None  # set_handler 已呼叫
         assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
         assert eng._ctx is ctx
         # seed 完成先 swap state：anchor = seed 最後一根 bar 嘅日期
         assert eng.state.anchor_date == date(2026, 9, 30)
-        assert (eng.state.code, eng.state.kline_type) == ("HK.HSImain", "K_1M")
+        assert eng.state.code == "HK.HSImain"
+        assert eng.state.periods == frozenset({"K_1M"})
         assert any(s.startswith("訂閱成功") for s in statuses)  # catalog status 會喺跟住 emit
 
     def test_env_lowercase_hsimain_normalized(self, monkeypatch):
@@ -673,7 +684,7 @@ class TestSwitchValidation:
         errors, statuses = [], []
         eng.error.connect(errors.append)
         eng.status.connect(statuses.append)
-        eng.switch(code="AAPL", kline_type="K_1M")  # 缺市場 prefix
+        eng.switch(code="AAPL", periods=["K_1M"])  # 缺市場 prefix
         assert len(errors) == 1 and "格式錯誤" in errors[0]
         assert not statuses and not eng._switching
 
@@ -681,7 +692,7 @@ class TestSwitchValidation:
         eng = self._connected()
         errors = []
         eng.error.connect(errors.append)
-        eng.switch(code="HK.00700", kline_type="K_2M")
+        eng.switch(code="HK.00700", periods=["K_2M"])
         assert len(errors) == 1 and "未知 K 線週期" in errors[0]
 
     def test_not_connected_silent_return(self):
@@ -689,7 +700,7 @@ class TestSwitchValidation:
         errors, statuses = [], []
         eng.error.connect(errors.append)
         eng.status.connect(statuses.append)
-        eng.switch(code="US.AAPL", kline_type="K_5M")
+        eng.switch(code="US.AAPL", periods=["K_5M"])
         assert not errors and not statuses and not eng._switching
 
     def test_closed_rejects_silently(self):
@@ -698,7 +709,7 @@ class TestSwitchValidation:
         errors, statuses = [], []
         eng.error.connect(errors.append)
         eng.status.connect(statuses.append)
-        eng.switch(code="US.AAPL", kline_type="K_5M")
+        eng.switch(code="US.AAPL", periods=["K_5M"])
         assert not errors and not statuses
 
 
@@ -716,10 +727,10 @@ class TestReconfigure:
         statuses, errors, history = [], [], []
         eng.status.connect(statuses.append)
         eng.error.connect(errors.append)
-        eng.history_ready.connect(history.append)
+        eng.history_ready.connect(lambda p, b: history.append((p, b)))  # (period, bars) per-period signal
         old_state = eng.state
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         # 1) unsubscribe 舊 → 2) fetch 新 code/ktype → 3) subscribe 新
         assert ctx.unsubscribed == (["HK.HSImain"], [SubType.QUOTE])
@@ -729,21 +740,23 @@ class TestReconfigure:
         # state swap：新 aggregator + anchor（seed 最後一根 bar 日期）
         st = eng.state
         assert st is not old_state
-        assert (st.code, st.kline_type) == ("US.AAPL", "K_5M")
+        assert st.code == "US.AAPL"
+        assert st.periods == frozenset({"K_5M"})
         assert st.anchor_date == date(2026, 9, 30)
-        assert len(st.aggregator.bars()) == 2
-        # signals：history_ready 新 snapshot + status 切換成功（test thread → 同步遞送）
-        assert not errors and len(history) == 1 and len(history[0]) == 2
+        assert len(st.aggregators["K_5M"].bars()) == 2
+        # signals：history_ready 新 snapshot (period, bars) + status 切換成功（test thread → 同步遞送）
+        _p, bars = history[0]
+        assert not errors and len(history) == 1 and _p == "K_5M" and len(bars) == 2
         assert any("切換成功" in s for s in statuses)
 
     def test_no_history_rolls_back(self):
         eng, ctx = self._setup_eng([(RET_OK, kline_df([]), None)])
         errors, history = [], []
         eng.error.connect(errors.append)
-        eng.history_ready.connect(history.append)
+        eng.history_ready.connect(lambda p, b: history.append((p, b)))  # (period, bars) per-period signal
         old_state = eng.state
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         assert any("冇歷史數據" in e for e in errors)
         assert not history
@@ -756,7 +769,7 @@ class TestReconfigure:
         eng.error.connect(errors.append)
         old_state = eng.state
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         assert any("切換失敗" in e and "request_history_kline" in e for e in errors)
         assert eng.state is old_state
@@ -769,7 +782,7 @@ class TestReconfigure:
         eng.error.connect(errors.append)
         old_state = eng.state
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         assert any("subscribe US.AAPL 失敗" in e for e in errors)
         assert eng.state is old_state  # subscribe 失敗 → 唔 swap
@@ -785,7 +798,7 @@ class TestReconfigure:
         ctx.unsubscribe = bad_unsub
         errors = []
         eng.error.connect(errors.append)
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
         assert not errors and eng.state.code == "US.AAPL"
 
     def test_closed_suppresses_signals(self):
@@ -794,9 +807,9 @@ class TestReconfigure:
         eng._closed = True
         statuses, history = [], []
         eng.status.connect(statuses.append)
-        eng.history_ready.connect(history.append)
+        eng.history_ready.connect(lambda p, b: history.append((p, b)))  # (period, bars) per-period signal
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         assert not statuses and not history
 
@@ -812,14 +825,14 @@ class TestSwitchThreaded:
         statuses = []
         eng.status.connect(statuses.append)
 
-        eng.switch(code="US.AAPL", kline_type="K_5M")
+        eng.switch(code="US.AAPL", periods=["K_5M"])
         assert wait_until(lambda: ctx.gate_waited)  # worker 行到 subscribe（gate 住）
-        eng.switch(code="HK.00700", kline_type="K_1M")  # → reject
+        eng.switch(code="HK.00700", periods=["K_1M"])  # → reject
         assert any("切換進行中" in s for s in statuses)  # switch() 喺 test thread → 同步遞送
 
         ctx.gate.set()
         assert wait_until(lambda: not eng._switching)
-        assert (eng.state.code, eng.state.kline_type) == ("US.AAPL", "K_5M")
+        assert eng.state.code == "US.AAPL" and eng.state.periods == frozenset({"K_5M"})
         eng.stop()
 
     def test_code_normalized_to_upper(self):
@@ -828,21 +841,25 @@ class TestSwitchThreaded:
         ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
         eng._ctx = ctx
 
-        eng.switch(code="hk.00700", kline_type="k_5m")
+        eng.switch(code="hk.00700", periods=["k_5m"])  # 小寫 → upper() 正規化
         assert wait_until(lambda: ctx.gate_waited)
         ctx.gate.set()
         assert wait_until(lambda: not eng._switching)
-        assert (eng.state.code, eng.state.kline_type) == ("HK.00700", "K_5M")
+        assert eng.state.code == "HK.00700" and eng.state.periods == frozenset({"K_5M"})
         assert ctx.subscribed == (["HK.00700"], [SubType.QUOTE])
         eng.stop()
 
     def test_hsimain_alias_flows_through_switch(self):
-        """小寫 hk.hsimain → 正規形式 HK.HSImain（fetch/subscribe/state 全部用 alias）。"""
-        eng = make_engine(history_count=2)
+        """小寫 hk.hsimain → 正規形式 HK.HSImain（fetch/subscribe/state 全部用 alias）。
+
+        當前標的設做另一隻（HK.00700）→ 行 code-change 路徑先至有 fetch/subscribe 可斷言
+        （同 code 切換喺新 engine 係 no-op：沿用 aggregator、唔重新 subscribe）。
+        """
+        eng = make_engine(history_count=2, trading_code="HK.00700")
         ctx = GatedCtx([(RET_OK, kline_df(HIST_ROWS), None)])
         eng._ctx = ctx
 
-        eng.switch(code="hk.hsimain", kline_type="K_1M")
+        eng.switch(code="hk.hsimain", periods=["K_1M"])
         assert wait_until(lambda: ctx.gate_waited)
         ctx.gate.set()
         assert wait_until(lambda: not eng._switching)
@@ -861,7 +878,7 @@ class TestSwitchThreaded:
 
         statuses = []
         eng.status.connect(statuses.append)
-        eng.switch(code="US.AAPL", kline_type="K_5M")
+        eng.switch(code="US.AAPL", periods=["K_5M"])
         assert any("連線中" in s for s in statuses)
         assert not eng._switching  # 冇 spawn worker
 
@@ -919,9 +936,9 @@ class TestStartStop:
     def test_stop_without_start_is_safe(self):
         FutuEngine().stop()  # 唔好炸
 
-    def test_aggregator_before_start_raises(self):
+    def test_aggregators_before_start_raises(self):
         with pytest.raises(RuntimeError, match="start"):
-            FutuEngine().aggregator
+            FutuEngine().aggregators
 
 
 # ---------------------------------------------------------------- 訂閱帳本 reconcile（自動清理洩漏）
@@ -1083,7 +1100,7 @@ class TestSubscriptionLedgerIntegration:
         ctx.unsubscribe = short_unsub
         eng._ctx = ctx
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         # 舊 code unsubscribe 失敗 → 保留 pending；新 code subscribe 成功 → 入帳
         remaining = {c for c, _s, _ts in store.list_active()}
@@ -1101,7 +1118,7 @@ class TestSubscriptionLedgerIntegration:
         store.add("HK.HSImain", ts=_time.time())
         eng._ctx = ctx
 
-        eng._reconfigure("US.AAPL", "K_5M")
+        eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         remaining = {c for c, _s, _ts in store.list_active()}
         assert "HK.HSImain" not in remaining and "US.AAPL" in remaining

@@ -17,11 +17,14 @@ ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
 from __future__ import annotations
 
 import math
+from datetime import timedelta
 from typing import Callable
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
+
+from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
 Bar = tuple[str, float, float, float, float, float]
@@ -170,10 +173,86 @@ def pan_y(lo: float, hi: float, delta_price: float):
     return lo + delta_price, hi + delta_price
 
 
+# ---------------------------------------------------------------- 時間視窗純函數（多 pane 時間軸同步，可獨立單測）
+
+def window_time_range(bars: tuple[Bar, ...], count: int, right_offset: float, period_minutes: int) -> tuple | None:
+    """可見視窗 → (start_dt, end_dt)：首根 bar 起始時間、尾根 bar **結束**時間（= 尾根 start + period）。
+
+    多 pane 時間軸同步用——各 pane 週期不同（bar 密度不同），必須用**時間**而唔係 bar index
+    對齊。end_dt 取「完整覆蓋」視窗嘅時刻（尾根 bar 結束），令較粗週期嘅 pane 套入嚟時
+    該日/該週 bar 一定 overlap 到。無數據 / 視窗空 → None。
+    """
+    vis = visible_window(bars, count, right_offset)
+    if not vis:
+        return None
+    start_dt = bar_key_to_dt(vis[0][0])
+    end_start = bar_key_to_dt(vis[-1][0])
+    if start_dt is None or end_start is None:
+        return None
+    end_dt = end_start + timedelta(minutes=period_minutes)
+    return start_dt, end_dt
+
+
+def infer_period_minutes(bars: tuple[Bar, ...]) -> int:
+    """由 bar key 間隔推斷本 pane 週期（分鐘）——多 pane 時間軸同步用。
+
+    取相鄰 bar start 嘅**中位數**間隔（robust：跳過休市/夜期缺口）。bar <2 根 → 1（單根視窗
+    只需 +period 算 end，推唔到就用最小值兜底）。各 pane 週期不同，必須各自推斷自己嘅 bar 密度。
+    """
+    if len(bars) < 2:
+        return 1
+    gaps = []
+    prev = None
+    for b in bars:
+        dt = bar_key_to_dt(b[0])
+        if dt is None:
+            continue
+        if prev is not None:
+            g = (dt - prev).total_seconds() / 60.0
+            if g > 0:
+                gaps.append(g)
+        prev = dt
+    if not gaps:
+        return 1
+    gaps.sort()
+    med = gaps[len(gaps) // 2]
+    return max(1, int(round(med)))
+
+
+def time_window_indices(bars: tuple[Bar, ...], start_dt, end_dt, period_minutes: int) -> tuple[int, int] | None:
+    """(start_dt, end_dt) → bars 內 [start_idx, end_idx]（含尾）；無 overlap bar → None。
+
+    **span-overlap** 語義：取「bar 時間跨度 [key_start, key_start+period) 同視窗 [start_dt, end_dt)
+    有交集」嘅連續區間——即 `key_start < end_dt and key_start + period > start_dt`。用 span（唔係
+    bar start ∈ window）先至跨週期對齊得返：較粗 pane 嘅 bar start 會早於較細 pane 視窗 start，
+    純「start ∈」永遠 match 唔到。供 set_time_window() 將外部時間視窗映射返本 pane 嘅 bar slice。
+    """
+    if not bars or start_dt is None or end_dt is None:
+        return None
+    period = timedelta(minutes=period_minutes)
+    n = len(bars)
+    s = e = -1
+    for i, b in enumerate(bars):
+        dt = bar_key_to_dt(b[0])
+        if dt is None:
+            continue
+        if dt < end_dt and dt + period > start_dt:  # span overlap（半開區間）
+            if s < 0:
+                s = i
+            e = i
+    if s < 0:
+        return None
+    return s, e
+
+
 # ---------------------------------------------------------------- widget
 
 class CandleChart(QWidget):
     """蠟燭 + volume subpane + crosshair + last-price line；數據源係 immutable snapshot。"""
+
+    # 用戶 pan/zoom X 軸（時間視窗改變）→ emit (start_dt, end_dt)；供多 pane 時間軸同步。
+    # set_time_window()（程序化同步）唔會再 emit → 無回授循環。
+    view_changed = Signal(object, object)
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
@@ -187,6 +266,8 @@ class CandleChart(QWidget):
         self._y_range: tuple[float, float] | None = None  # Y 手動範圍；None=auto-fit
         self._drag_mode: str | None = None                # 'x'/'y'/None
         self._last_drag_pos: QPointF | None = None
+        self._syncing = False                             # set_time_window() 程序化同步中（抑制 view_changed）
+        self._period_minutes = 1                          # 本 pane bar 週期（分鐘），update_bars 時由 key 間隔推斷
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setSingleShot(True)
         self._repaint_timer.setInterval(30)  # backpressure：coalesce tick burst
@@ -195,8 +276,9 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- public API
 
     def update_bars(self, bars: tuple[Bar, ...]) -> None:
-        """接收新 snapshot（pyqtSignal queued 過嚟）；30ms 內多次調用只 repaint 一次。"""
+        """接收新 snapshot（Signal queued 過嚟）；30ms 內多次調用只 repaint 一次。"""
         self._bars = tuple(bars)
+        self._period_minutes = infer_period_minutes(self._bars)  # 本 pane bar 密度（時間視窗同步用）
         if not self._repaint_timer.isActive():
             self._repaint_timer.start()
 
@@ -210,6 +292,8 @@ class CandleChart(QWidget):
         self._right_offset = 0.0
         self._y_range = None
         self.update()
+        if self._bars:
+            self._emit_view_changed()  # 重置後時間視窗改變 → 同步其他 pane
 
     def zoom_in(self, steps: int = 1) -> None:
         """放大 N 階（可見根數減少）；俾 control bar「放大」按鍵。每階 ×/÷1.25、中心錨定。"""
@@ -226,6 +310,48 @@ class CandleChart(QWidget):
         self._view_count, self._right_offset = zoom_x(
             self._view_count, self._right_offset, len(self._bars), 0.5, float(delta))
         self.update()
+        self._emit_view_changed()  # X 軸縮放 → 同步其他 pane
+
+    # ------------------------------------------------------------- 時間視窗（多 pane 同步）
+
+    def time_window(self) -> tuple | None:
+        """當前可見視窗嘅 (start_dt, end_dt)；無數據 → None。end = 尾根 bar 結束（含本 pane period）。"""
+        return window_time_range(self._bars, self._view_count, self._right_offset, self._period_minutes)
+
+    def set_time_window(self, start_dt, end_dt) -> bool:
+        """程序化將本 pane 可見視窗對齊到 (start_dt, end_dt)（多 pane 時間軸同步）。
+
+        依 bar key **span-overlap** 映射返本 pane 嘅 bar slice（各週期 bar 密度不同，用時間對齊）；
+        **唔會 emit view_changed**（程序化、非用戶操作 → 無回授循環）。範圍內無 overlap bar → no-op。
+        返回有冇實際改動視圖。
+        """
+        if not self._bars or start_dt is None or end_dt is None:
+            return False
+        idx = time_window_indices(self._bars, start_dt, end_dt, self._period_minutes)
+        if idx is None:
+            return False
+        s, e = idx
+        n = len(self._bars)
+        new_count = max(1, e - s + 1)
+        new_offset = float(n - 1 - e)  # 尾根可見 bar = e → right_offset = n-1-e
+        if (new_count, round(new_offset)) == (self._view_count, int(round(self._right_offset))):
+            return False
+        self._syncing = True
+        try:
+            self._view_count = new_count
+            self._right_offset = new_offset
+        finally:
+            self._syncing = False
+        self.update()
+        return True
+
+    def _emit_view_changed(self) -> None:
+        """用戶 X 軸 pan/zoom 後 emit 當前時間視窗（程序化同步中 / 無數據 → 唔 emit）。"""
+        if self._syncing or not self._bars:
+            return
+        rng = window_time_range(self._bars, self._view_count, self._right_offset, self._period_minutes)
+        if rng is not None:
+            self.view_changed.emit(rng[0], rng[1])
 
     # ------------------------------------------------------------- geometry helpers
 
@@ -267,6 +393,8 @@ class CandleChart(QWidget):
             f = (pos.x() - plot.left()) / max(1e-9, plot.width()) if plot.contains(pos) else 0.5
             self._view_count, self._right_offset = zoom_x(self._view_count, self._right_offset, len(self._bars), f, delta)
         self.update()
+        if not (event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+            self._emit_view_changed()  # X 軸縮放 → 同步其他 pane（Y 軸唔影響時間視窗）
 
     def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
         if not self._bars:
@@ -280,6 +408,7 @@ class CandleChart(QWidget):
 
     def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
         pos = event.position()
+        moved_x = False
         if self._drag_mode and self._last_drag_pos is not None and self._bars:
             plot, price_r, _vol = self._panes()
             dx = pos.x() - self._last_drag_pos.x()
@@ -288,6 +417,7 @@ class CandleChart(QWidget):
                 slot = self._bar_slot(len(visible_window(self._bars, self._view_count, self._right_offset)), plot)
                 # 拖右（dx>0）→ 視窗移向舊數據（offset 增加）
                 self._view_count, self._right_offset = pan_x(self._view_count, self._right_offset, len(self._bars), dx / max(1e-9, slot))
+                moved_x = True
             else:
                 rng = self._y_range or price_range(visible_window(self._bars, self._view_count, self._right_offset)) or (0.0, 1.0)
                 span = max(1e-9, rng[1] - rng[0])
@@ -296,6 +426,8 @@ class CandleChart(QWidget):
             self._last_drag_pos = pos
         self._mouse_pos = pos
         self.update()
+        if moved_x:
+            self._emit_view_changed()  # X 軸平移 → 同步其他 pane（Y 軸唔影響時間視窗）
 
     def mouseReleaseEvent(self, event):  # noqa: N802 (Qt naming)
         if event.button() in (Qt.LeftButton, Qt.RightButton):

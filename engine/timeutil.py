@@ -71,6 +71,26 @@ def bar_key(dt: datetime, period_minutes: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def bar_key_to_dt(key: str) -> datetime | None:
+    """bar key → 該 bar **起始**嘅 naive datetime（跨週期時間視窗對齊用）。
+
+    逆映射 `bar_key()`：intraday 'yyyy-MM-dd HH:mm' → 嗰分鐘；K_DAY|K_WEEK 'yyyy-MM-dd' →
+    當日/當週一 00:00；K_MON 'yyyy-MM' → 該月 1 號 00:00。格式唔認得 → None。
+
+    用途：多 pane 時間軸同步——將某 pane 嘅可見視窗（bar key 範圍）轉做 (start_dt, end_dt)，
+    再套去其他週期嘅 bars（各 pane bar 密度不同，必須用時間而唔係 bar index 對齊）。
+    """
+    if not isinstance(key, str):
+        return None
+    s = key.strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y-%m"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def is_up(open_: float, close: float) -> bool:
     """蠟燭方向：close >= open 視為漲（doji 畫作漲色）。"""
     return close >= open_

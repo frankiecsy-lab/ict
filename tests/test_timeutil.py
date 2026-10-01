@@ -7,6 +7,7 @@ import pytest
 from engine.timeutil import (
     _MAX_WINDOW_DAYS,
     bar_key,
+    bar_key_to_dt,
     floor_to_period,
     history_window,
     is_up,
@@ -185,3 +186,40 @@ class TestHistoryWindow:
     def test_invalid_raises(self, period, count):
         with pytest.raises(ValueError):
             history_window(period, count)
+
+
+class TestBarKeyToDt:
+    """bar_key_to_dt：bar key → bar 起始 naive datetime（跨週期時間視窗對齊）。"""
+
+    def test_intraday_minute(self):
+        assert bar_key_to_dt("2026-09-30 09:31") == datetime(2026, 9, 30, 9, 31)
+
+    def test_day_and_week_same_format(self):
+        # K_DAY / K_WEEK key 都係 'yyyy-MM-dd' → 當日 00:00（週期邊界由 floor_to_period 決定，呢度只還原日期）
+        assert bar_key_to_dt("2026-09-30") == datetime(2026, 9, 30)
+
+    def test_month(self):
+        assert bar_key_to_dt("2026-09") == datetime(2026, 9, 1)
+
+    def test_roundtrip_with_bar_key(self):
+        """bar_key(floor_to_period(dt, period), period) → bar_key_to_dt 應還原到 floor_to_period(dt, period)。
+
+        （實際用法：key 永遠由已 floor 嘅 dt 產生，所以 roundtrip 先 floor。）
+        """
+        for dt, period in [
+            (datetime(2026, 9, 30, 9, 47), 5),      # intraday 5min → 09:45
+            (datetime(2026, 9, 30, 15, 30), 24 * 60),   # K_DAY → 當日 00:00
+            (datetime(2026, 9, 30, 15, 30), 7 * 24 * 60),  # K_WEEK → 週一 00:00
+            (datetime(2026, 9, 30, 15, 30), 30 * 24 * 60),  # K_MON → 月 1 號 00:00
+        ]:
+            floored = floor_to_period(dt, period)
+            key = bar_key(floored, period)
+            assert bar_key_to_dt(key) == floored
+
+    @pytest.mark.parametrize("bad", ["", "   ", "not-a-date", "2026/09/30 09:31"])
+    def test_invalid_returns_none(self, bad):
+        assert bar_key_to_dt(bad) is None
+
+    def test_non_string_returns_none(self):
+        assert bar_key_to_dt(None) is None
+        assert bar_key_to_dt(20260930) is None

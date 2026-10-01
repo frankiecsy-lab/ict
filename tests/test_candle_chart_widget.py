@@ -8,6 +8,7 @@ min/max 可見根數 clamp、無數據 no-op；last-price 虛線 + 右軸 tag �
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -131,3 +132,117 @@ class TestLastPriceLine:
         ch._y_range = (90.0, 130.0)
         img = self._render(ch)
         assert self._count_in(img, QColor("#FFB020"), 0, ch.width() - 1, 0, ch.height() - 1) == 0
+
+
+class TestTimeWindowApi:
+    """time_window()/set_time_window()/view_changed——多 pane 時間軸同步 API。"""
+
+    def test_time_window_right_pinned(self):
+        # 30 bars 10:00..10:29（period=1min）；count=10 右 pin → 可見 index 20..29（10:20..10:29）。
+        # end = 尾根 start(10:29) + period(1min) = 10:30。
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        assert ch._period_minutes == 1
+        ch._view_count = 10
+        ch._right_offset = 0.0
+        rng = ch.time_window()
+        assert rng == (datetime(2026, 9, 30, 10, 20), datetime(2026, 9, 30, 10, 30))
+
+    def test_time_window_no_bars_returns_none(self):
+        ch = CandleChart(Config())
+        assert ch.time_window() is None
+
+    def test_set_time_window_aligns_view(self):
+        # 30 bars 10:00..10:29（period=1min）；對齊到 (10:05, 10:14) → span-overlap index 5..13。
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        ok = ch.set_time_window(datetime(2026, 9, 30, 10, 5), datetime(2026, 9, 30, 10, 14))
+        assert ok is True
+        assert ch._view_count == 9          # index 5..13（含尾）= 9 根
+        assert round(ch._right_offset) == 16  # n-1-e = 29-13
+
+    def test_set_time_window_no_match_is_noop(self):
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        before = (ch._view_count, ch._right_offset)
+        ok = ch.set_time_window(datetime(2026, 9, 30, 15, 0), datetime(2026, 9, 30, 15, 5))
+        assert ok is False
+        assert (ch._view_count, ch._right_offset) == before
+
+    def test_set_time_window_no_bars_is_noop(self):
+        ch = CandleChart(Config())
+        assert ch.set_time_window(datetime(2026, 9, 30, 10, 5), datetime(2026, 9, 30, 10, 14)) is False
+
+    def test_set_time_window_does_not_emit_view_changed(self):
+        """程序化同步唔 emit view_changed（防回授循環）。"""
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        emitted = []
+        ch.view_changed.connect(lambda s, e: emitted.append((s, e)))
+        ch.set_time_window(datetime(2026, 9, 30, 10, 5), datetime(2026, 9, 30, 10, 14))
+        assert emitted == []
+
+    def test_zoom_in_emits_view_changed(self):
+        """用戶 zoom（按鍵）→ emit view_changed。"""
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        emitted = []
+        ch.view_changed.connect(lambda s, e: emitted.append((s, e)))
+        ch.zoom_in()
+        assert len(emitted) == 1
+        start_dt, end_dt = emitted[0]
+        # zoom in 後視窗收窄、右 pin → end = 尾根 bar start(10:29) + period(1min) = 10:30
+        assert end_dt == datetime(2026, 9, 30, 10, 30)
+
+    def test_reset_view_emits_view_changed(self):
+        """reset_view() 重置視窗 → emit view_changed。"""
+        ch = CandleChart(Config())
+        bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                     for i in range(30))
+        ch.update_bars(bars)
+        ch._view_count = 8
+        ch._right_offset = 20.0
+        emitted = []
+        ch.view_changed.connect(lambda s, e: emitted.append((s, e)))
+        ch.reset_view()
+        assert len(emitted) == 1
+
+    def test_reset_view_no_bars_does_not_emit(self):
+        ch = CandleChart(Config())
+        emitted = []
+        ch.view_changed.connect(lambda s, e: emitted.append((s, e)))
+        ch.reset_view()
+        assert emitted == []
+
+
+class TestTimeWindowSyncRoundTrip:
+    """跨 pane 同步：pane A 嘅 time_window → pane B set_time_window（不同週期 bar 密度）。"""
+
+    def test_minute_to_day_alignment(self):
+        # pane A = 5min bars、pane B = 日線 bars；A 視窗套去 B 應對齊到當日一根。
+        ch_a = CandleChart(Config())
+        a_bars = tuple((f"2026-09-30 {10 + i // 60:02d}:{i % 60:02d}", 100.0, 101.0, 99.5, 100.5, 1000.0)
+                       for i in range(30))  # 10:00..10:29（全喺 09-30）
+        ch_a.update_bars(a_bars)
+        rng = ch_a.time_window()
+        assert rng is not None
+
+        ch_b = CandleChart(Config())
+        b_bars = tuple((f"2026-{m:02d}-15", 100.0, 101.0, 99.5, 100.5, 1000.0) for m in (8, 9, 10))
+        ch_b.update_bars(b_bars)
+        ok = ch_b.set_time_window(rng[0], rng[1])
+        assert ok is True
+        # B 只匹配到 2026-09-15（當日）一根 → count=1、offset=n-1-e=3-1-1=1
+        assert ch_b._view_count == 1
+        assert round(ch_b._right_offset) == 1
+

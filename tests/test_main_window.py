@@ -23,26 +23,32 @@ _app = QApplication.instance() or QApplication([])
 
 
 class FakeEngine(QObject):
-    """替身 engine：記錄 switch 呼叫，唔 spawn thread / 唔連 OpenD。"""
+    """替身 engine：記錄 switch 呼叫，唔 spawn thread / 唔連 OpenD。
 
-    history_ready = Signal(tuple)
-    bars_changed = Signal(tuple)
+    Signal 簽名跟新多 pane API：history_ready/bars_changed = (period, bars)；
+    switch(code=..., periods=[...])——periods 係全 pane combo union（排序 tuple 方便斷言）。
+    """
+
+    history_ready = Signal(str, tuple)   # (period, bars) — per-period signal
+    bars_changed = Signal(str, tuple)
     status = Signal(str)
     error = Signal(str)
     catalog_ready = Signal(tuple)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.switch_calls: list[tuple[str | None, str | None]] = []
+        self.switch_calls: list[tuple[str | None, tuple[str, ...] | None]] = []
+        self.start_periods: list[str] | None = None   # start(periods=...) 記錄
+        self.state = None                              # _State | None——替身無活躍狀態
 
-    def start(self, cfg) -> None:  # noqa: ARG002 — 替身唔連線
-        pass
+    def start(self, cfg, db_path=None, periods=None) -> None:  # noqa: ARG002 — 替身唔連線
+        self.start_periods = list(periods) if periods else None
 
     def stop(self) -> None:
         pass
 
-    def switch(self, code=None, kline_type=None) -> None:
-        self.switch_calls.append((code, kline_type))
+    def switch(self, code=None, periods=None) -> None:
+        self.switch_calls.append((code, tuple(sorted(periods)) if periods is not None else None))
 
 
 def _entries():
@@ -68,7 +74,7 @@ def test_do_switch_rejects_name_in_field(monkeypatch):
     # guard 已將欄位剝離返純 code（名稱唔會殘留）
     assert win.code_edit.text() == "HK.00700"
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", "K_1M")]
+    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
 
 
 def test_do_switch_rejects_empty_field(monkeypatch):
@@ -93,7 +99,7 @@ def test_do_switch_valid_code_normalizes_case_and_updates_name(monkeypatch):
     win._on_catalog_ready(_entries())
     win.code_edit.setText("hk.00700")
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", "K_1M")]
+    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
     assert win.code_edit.text() == "HK.00700"
     assert win.name_label.text() == name_text(_entries()[1])  # "腾讯控股 TENCENT"
 
@@ -103,7 +109,7 @@ def test_do_switch_before_catalog_passthrough(monkeypatch):
     win, engine = _make_window(monkeypatch)
     win.code_edit.setText("HK.00700")
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", "K_1M")]
+    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
 
 
 def test_catalog_ready_initializes_name_label(monkeypatch):
@@ -115,15 +121,76 @@ def test_catalog_ready_initializes_name_label(monkeypatch):
 
 
 def test_zoom_buttons_wired_to_chart(monkeypatch):
-    """control bar 放大/縮小按鍵 → chart 分步 X 軸縮放（每點擊一階 ×/÷1.25）。"""
+    """control bar 放大/縮小按鍵 → 全部可見 pane 時間視窗 ×/÷1.25（中心錨定）。
+
+    用**真實分鐘 datetime key**：_zoom_all 走 time_window()/set_time_window() 時間空間路徑，
+    fake key（bar_key_to_dt parse 唔到）會令 zoom no-op。
+    """
+    from datetime import datetime, timedelta
     win, _engine = _make_window(monkeypatch)
-    # 先餵數據（chart 無 bars 時 zoom no-op）
-    win.chart.update_bars(tuple((f"k{i}", 100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200)))
+    base = datetime(2026, 1, 5, 9, 30)
+    bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                  100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200))
+    win.chart.update_bars(bars)   # 先餵數據（chart 無 bars 時 zoom no-op）
     assert win.chart._view_count == 120  # Config 預設 visible_bars
     win.zoom_in_btn.click()
-    assert win.chart._view_count == 96   # round(120 / 1.25)
+    assert win.chart._view_count == 96   # 120min 視窗 ×0.8 → 96 根分鐘 bar
     win.zoom_out_btn.click()
-    assert win.chart._view_count == 120  # round-trip 還原
+    assert win.chart._view_count == 120  # round-trip 還原（×1.25）
+
+
+def test_pane_view_changed_broadcasts_time_window(monkeypatch):
+    """用戶喺 pane 0 pan/zoom → 時間視窗廣播去其他可見 pane（跨週期 span-overlap 對齊）。"""
+    from datetime import datetime, timedelta
+    win, _engine = _make_window(monkeypatch)
+    base = datetime(2026, 1, 5, 9, 30)
+    m_bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                    100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200))
+    w_bars = tuple(((base + timedelta(minutes=3 * j)).strftime("%Y-%m-%d %H:%M"),
+                    100.0, 101.0, 99.5, 100.5, 1.0) for j in range(100))
+    win._panes[0].update_bars(m_bars)   # pane 0 = K_1M（200 根分鐘 bar）
+    win._panes[1].update_bars(w_bars)   # pane 1 = K_3M（100 根 3 分鐘 bar）
+    win._set_pane_count(2)              # 顯示 2 pane
+    start = base + timedelta(minutes=80)
+    end = base + timedelta(minutes=200)
+    win._on_pane_view_changed(0, start, end)   # 模擬用戶喺 pane 0 zoom/pan
+    assert win._panes[1]._view_count == 41      # [B+80,B+200) ∩ 3min bars = j∈[26..66]
+    assert round(win._panes[1]._right_offset) == 33   # 尾根可見 bar = j=66 → offset = 99-66
+
+
+def test_pane_period_change_pushes_active_snapshot(monkeypatch):
+    """combo 換週期 → 目標週期已活躍（其他 pane 用緊）→ 直接推當前 snapshot，唔使等 tick。"""
+    from datetime import datetime, timedelta
+    win, engine = _make_window(monkeypatch)
+    base = datetime(2026, 1, 5, 9, 30)
+    five_bars = tuple(((base + timedelta(minutes=5 * j)).strftime("%Y-%m-%d %H:%M"),
+                       100.0, 101.0, 99.5, 100.5, 1.0) for j in range(50))
+
+    class _Agg:
+        def bars(self): return five_bars
+
+    class _State:
+        periods = frozenset({"K_1M", "K_5M", "K_15M"})
+        aggregators = {"K_5M": _Agg()}
+
+    engine.state = _State()
+    win._pane_combos[1].setCurrentText("K_5M")   # pane 1: K_3M → K_5M（desired == current）
+    assert engine.switch_calls == []             # 週期集合未變 → 唔使 fetch
+    assert win._panes[1]._bars == five_bars      # 直接推 snapshot
+
+
+def test_route_period_bars_routes_to_matching_panes(monkeypatch):
+    """(period, bars) signal → 路由去所有 combo 顯示該週期嘅 pane（多 pane 同週期都收到）。"""
+    from datetime import datetime, timedelta
+    win, _engine = _make_window(monkeypatch)
+    base = datetime(2026, 1, 5, 9, 30)
+    bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                  1.0, 2.0, 0.5, 1.5, 1.0) for i in range(10))
+    win._pane_combos[1].setCurrentText("K_1M")   # pane 1 同 pane 0 一樣 K_1M
+    win._on_history_ready("K_1M", bars)
+    assert win._panes[0]._bars == bars
+    assert win._panes[1]._bars == bars
+    assert win._panes[2]._bars == ()             # pane 2 = K_5M → 唔收到
 
 
 def test_on_code_activated_sets_code_and_name(monkeypatch):
@@ -134,7 +201,7 @@ def test_on_code_activated_sets_code_and_name(monkeypatch):
     aapl = entries[2]
     win._on_code_activated(display_text(aapl))
     assert win.code_edit.text() == "US.AAPL"  # 名稱唔入輸入欄
-    assert engine.switch_calls == [("US.AAPL", "K_1M")]
+    assert engine.switch_calls == [("US.AAPL", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
     assert win.name_label.text() == name_text(aapl)
 
 
