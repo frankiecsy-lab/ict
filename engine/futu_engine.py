@@ -254,12 +254,14 @@ class FutuEngine(QObject):
             return _fallback_date(None, "HK")
         return _fallback_date(self._state.anchor_date, self._state.code)
 
-    def start(self, cfg, db_path: str | Path | None = None, periods=None) -> None:
+    def start(self, cfg, db_path: str | Path | None = None, periods=None,
+              code: str | None = None) -> None:
         """啟動連線 + 歷史 fetch + 訂閱（背景 daemon thread，立即返回）。
 
         db_path：SQLite 訂閱帳本路徑；None → default_db_path()。
         periods：初始活躍週期集合（多 pane）；None → 只 cfg.kline_type。setup thread 喺 subscribe
         前逐個 fetch+seed——開機一次到位，GUI 唔使事後重試 switch（setup thread alive 期間會被 reject）。
+        code：初始標的編號；None → cfg.trading_code（.env）。GUI UI-state 記憶還原上次標的時傳入。
         """
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -267,7 +269,7 @@ class FutuEngine(QObject):
             self._closed = False
             self._cfg = cfg
             self._db_path = db_path
-            code = _normalize_code(cfg.trading_code)
+            code = _normalize_code(code if code is not None else cfg.trading_code)
             initial = frozenset(p.strip().upper() for p in periods) if periods else frozenset({cfg.kline_type})
             aggregators = {p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
                            for p in sorted(initial)}
@@ -596,8 +598,8 @@ class FutuEngine(QObject):
         try:
             self.status.emit("OpenD 連線成功")
 
-            code = _normalize_code(cfg.trading_code)  # .env 小寫/全 upper 輸入都映返正規形式
             cur_state = self._state
+            code = cur_state.code   # start() 已正規化（cfg.trading_code 或 GUI UI-state 記憶還原嘅 code）
             anchor = None
             total = 0
             for ktype in sorted(cur_state.periods):   # 多 pane：逐週期 fetch+seed（單一 QUOTE 訂閱共用）

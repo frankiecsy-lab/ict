@@ -39,16 +39,40 @@ class FakeEngine(QObject):
         super().__init__(parent)
         self.switch_calls: list[tuple[str | None, tuple[str, ...] | None]] = []
         self.start_periods: list[str] | None = None   # start(periods=...) 記錄
+        self.start_code: str | None = None            # start(code=...) 記錄（UI-state 記憶還原）
         self.state = None                              # _State | None——替身無活躍狀態
 
-    def start(self, cfg, db_path=None, periods=None) -> None:  # noqa: ARG002 — 替身唔連線
+    def start(self, cfg, db_path=None, periods=None, code=None) -> None:  # noqa: ARG002 — 替身唔連線
         self.start_periods = list(periods) if periods else None
+        self.start_code = code
 
     def stop(self) -> None:
         pass
 
     def switch(self, code=None, periods=None) -> None:
         self.switch_calls.append((code, tuple(sorted(periods)) if periods is not None else None))
+
+
+class FakeStateStore:
+    """替身 UI state store：記錄 save 呼叫、返回預設 load（唔觸碰真實 SQLite）。
+
+    `_load_value` 預設 None = 無記憶（startup fallback 預設值）；測試可喺構造 window **前**
+    set `store._load_value = {...}` 模擬「上次有保存過嘅狀態」。save() 每次記錄一份快照。
+    """
+
+    def __init__(self, path=None) -> None:   # noqa: ARG002 — 替身唔開 DB
+        self.path = path
+        self.saved: list[dict] = []          # 每次 save() 記錄一份 dict 快照
+        self._load_value: dict | None = None
+
+    def save(self, state: dict) -> None:
+        self.saved.append(dict(state))
+
+    def load(self):
+        return self._load_value
+
+    def clear(self) -> None:
+        self._load_value = None
 
 
 def _entries():
@@ -59,9 +83,18 @@ def _entries():
     ]
 
 
-def _make_window(monkeypatch) -> tuple[MainWindow, FakeEngine]:
+def _make_window(monkeypatch, saved_state: dict | None = None) -> tuple[MainWindow, FakeEngine]:
+    """構造 MainWindow（fake engine + fake UI state store）。
+
+    `saved_state` 預設 None = 無記憶（startup fallback 預設值）；傳入 dict → 模擬「上次保存過」
+    嘅狀態俾 `_load_ui_state()` 還原。fake store 可經 `win._state_store` 存取（斷言 save）。
+    """
     engine = FakeEngine()
     monkeypatch.setattr(mw_module, "FutuEngine", lambda parent=None: engine)
+    store = FakeStateStore()
+    if saved_state is not None:
+        store._load_value = dict(saved_state)
+    monkeypatch.setattr(mw_module, "UIStateStore", lambda path=None: store)
     win = MainWindow(Config())  # 預設 trading_code=HK.HSImain、kline_type=K_1M
     return win, engine
 
@@ -310,3 +343,101 @@ def test_bos_toggle_applies_to_all_panes(monkeypatch):
     win._indicator_btns["bos"].click()
     for pane in win._panes:
         assert pane._indicator_enabled.get("bos") is False
+
+
+# ---------------------------------------------------------------- UI state persistence（SQLite 記憶）
+
+def test_startup_loads_saved_state(monkeypatch):
+    """開機還原上次 UI 狀態：code / pane count / per-pane periods / indicator toggles。"""
+    saved = {
+        "code": "US.AAPL",
+        "pane_count": 4,
+        "periods": ["K_5M", "K_15M", "K_30M", "K_60M"],
+        "indicators": ["ob", "fvg"],
+    }
+    win, engine = _make_window(monkeypatch, saved_state=saved)
+    # code → 輸入欄 + start(code=...)（engine 用還原嘅標的，唔係 cfg.trading_code）
+    assert win.code_edit.text() == "US.AAPL"
+    assert engine.start_code == "US.AAPL"
+    # pane count / layout
+    assert win._pane_count == 4
+    # per-pane periods（combo 還原）+ start(periods=...) = 全 pane union
+    assert [c.currentText() for c in win._pane_combos] == ["K_5M", "K_15M", "K_30M", "K_60M"]
+    assert sorted(engine.start_periods) == ["K_15M", "K_30M", "K_5M", "K_60M"]
+    # indicator toggles（button checked + 全部 pane enabled）
+    assert win._indicator_btns["ob"].isChecked()
+    assert win._indicator_btns["fvg"].isChecked()
+    assert not win._indicator_btns["vob"].isChecked()
+    for pane in win._panes:
+        assert pane._indicator_enabled.get("ob") is True
+        assert pane._indicator_enabled.get("fvg") is True
+        assert pane._indicator_enabled.get("vob") is False
+
+
+def test_startup_no_saved_state_uses_defaults(monkeypatch):
+    """無記憶（load → None）→ 全部 fallback 預設值：cfg.trading_code / 單 pane / indicators off。"""
+    win, engine = _make_window(monkeypatch)   # saved_state=None
+    assert win.code_edit.text() == "HK.HSImain"   # cfg.trading_code 預設
+    assert engine.start_code is None              # → engine fallback cfg.trading_code
+    assert win._pane_count == 1
+    for btn in win._indicator_btns.values():
+        assert not btn.isChecked()
+
+
+def test_startup_ignores_malformed_saved_state(monkeypatch):
+    """損壞 / 缺字段嘅 saved state → 靜默跳過該字段（唔 crash、fallback 預設）。"""
+    # code 有效；pane_count=3 非法、periods 長度錯配、indicators 非 list → 全部忽略
+    win, engine = _make_window(monkeypatch, saved_state={
+        "code": "US.AAPL",
+        "pane_count": 3,
+        "periods": ["K_5M"],
+        "indicators": "ob",
+    })
+    assert win.code_edit.text() == "US.AAPL"      # code 有效 → 還原
+    assert engine.start_code == "US.AAPL"
+    assert win._pane_count == 1                   # pane_count=3 非法 → 保持預設 1
+    for btn in win._indicator_btns.values():
+        assert not btn.isChecked()                # indicators 非 list → 全 off
+
+
+def test_save_on_indicator_toggle(monkeypatch):
+    """click 指標開關 → _save_ui_state 寫入快照（indicators 含該 key）；startup load 唔會 save。"""
+    win, _engine = _make_window(monkeypatch)
+    assert win._state_store.saved == []   # startup load（無記憶）唔觸發 save
+    win._indicator_btns["ob"].click()
+    assert len(win._state_store.saved) == 1
+    snap = win._state_store.saved[-1]
+    assert "ob" in snap["indicators"]
+    assert snap["pane_count"] == 1
+
+
+def test_save_on_layout_change(monkeypatch):
+    """click layout「4」→ _save_ui_state 寫入 pane_count=4。"""
+    win, _engine = _make_window(monkeypatch)
+    btn4 = next(b for b in win._layout_group.buttons() if b.text() == "4")
+    btn4.click()
+    assert win._pane_count == 4
+    snap = win._state_store.saved[-1]
+    assert snap["pane_count"] == 4
+
+
+def test_save_on_pane_period_change(monkeypatch):
+    """換某 pane combo 週期 → _save_ui_state 寫入新 periods。"""
+    win, engine = _make_window(monkeypatch)
+    win._pane_combos[0].setCurrentText("K_5M")   # currentTextChanged → _on_pane_period_changed(0)
+    assert len(win._state_store.saved) == 1
+    snap = win._state_store.saved[-1]
+    assert snap["periods"][0] == "K_5M"
+    # engine switch 收到新 union（含 K_5M）
+    assert any("K_5M" in (p or ()) for _c, p in engine.switch_calls)
+
+
+def test_save_on_code_switch(monkeypatch):
+    """切換標的 → _save_ui_state 寫入新 code。"""
+    win, engine = _make_window(monkeypatch)
+    win.code_edit.setText("US.AAPL")   # textChanged guard：無空白 → no-op
+    win._do_switch()                    # catalog 空 → 放行 → _apply_code_switch → switch + save
+    assert len(win._state_store.saved) == 1
+    snap = win._state_store.saved[-1]
+    assert snap["code"] == "US.AAPL"
+    assert engine.switch_calls and engine.switch_calls[-1][0] == "US.AAPL"

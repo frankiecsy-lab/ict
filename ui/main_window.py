@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 from PySide6.QtCore import Qt
@@ -26,8 +27,11 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QGridLayout, QHB
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
 from engine.stock_catalog import name_text
+from engine.ui_state_store import UIStateStore, default_ui_state_path
 from .candle_chart import CandleChart
 from .stock_completer import StockCompleter, code_from_completion
+
+logger = logging.getLogger(__name__)
 
 # 指標開關註冊表（模組化擴展點）：加新指標 = 喺呢度加一行 → control bar 自動生成對應 checkable 按鍵。
 # 偵測邏輯喺 engine/indicators.py、繪製層喺 candle_chart._recompute_zones() / paintEvent；
@@ -93,8 +97,13 @@ class MainWindow(QMainWindow):
         self._pane_count = 1
         self._set_pane_count(1)   # 初始單 pane（self.chart）
         self._layout_panes()      # grid 初始排布（pane 0 @ (0,0)）
+        # UI 狀態記憶：開機還原上次嘅 code / layout / periods / indicators。喺 engine.start()
+        # **之前**——set combos/layout/indicators 時 engine 未 start，唔會觸發 switch；start()
+        # 讀 _desired_periods() + code= 一次到位（saved_code=None → cfg.trading_code）。
+        self._state_store = UIStateStore(default_ui_state_path())
+        saved_code = self._load_ui_state()
         # 開機即 fetch 全部 pane 週期（setup thread 內逐個 seed；GUI 唔使事後重試 switch）
-        self._engine.start(cfg, periods=list(self._desired_periods()))
+        self._engine.start(cfg, periods=list(self._desired_periods()), code=saved_code)
 
     def _build_pane_widget(self, index: int) -> tuple[QWidget, QComboBox, CandleChart]:
         """單一 pane：頂部週期 combo + CandleChart。返回 (container, combo, chart)。"""
@@ -245,6 +254,86 @@ class MainWindow(QMainWindow):
         """
         return frozenset(c.currentText() for c in self._pane_combos)
 
+    # ------------------------------------------------------------- UI state persistence（SQLite 記憶）
+
+    def _load_ui_state(self) -> str | None:
+        """開機還原上次 UI 狀態：code / pane count / per-pane periods / indicator toggles。
+
+        喺 engine.start() **之前**呼叫——set combos/layout/indicators 時 engine 未 start，
+        唔會觸發 switch；start() 讀 _desired_periods() + code= 一次到位。返回 saved code
+        （None → engine fallback cfg.trading_code）。任何字段缺失 / 損壞 → 靜默跳過該字段
+        （記憶係輔助功能，唔應該阻斷啟動）。
+        """
+        state = self._state_store.load()
+        if not isinstance(state, dict):
+            return None
+
+        # pane count / layout（1/2/4）：set + relayout（同 _on_layout_clicked 一樣搬位）
+        n = state.get("pane_count")
+        if n in (1, 2, 4) and n != self._pane_count:
+            self._set_pane_count(n)
+            for i in range(4):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
+                self._pane_grid.removeWidget(self._pane_widgets[i])
+            self._layout_panes()
+
+        # per-pane periods：blockSignals——engine 未 start，setCurrentText 唔會觸發 switch
+        periods = state.get("periods")
+        if isinstance(periods, list) and len(periods) == len(self._pane_combos):
+            for i, combo in enumerate(self._pane_combos):
+                p = periods[i]
+                if p in KLINE_TYPES:
+                    combo.blockSignals(True)
+                    try:
+                        combo.setCurrentText(p)
+                    finally:
+                        combo.blockSignals(False)
+
+        # indicator toggles：setChecked（blockSignals 避免觸發 handler）+ 直接同步 pane
+        indicators = state.get("indicators")
+        if isinstance(indicators, list):
+            want_set = set(indicators)
+            for key, btn in self._indicator_btns.items():
+                want = key in want_set
+                if btn.isChecked() != want:
+                    btn.blockSignals(True)
+                    try:
+                        btn.setChecked(want)
+                    finally:
+                        btn.blockSignals(False)
+                # 直接同步 pane（唔經 handler → load 期間唔會觸發 save）；pane 預設全 off
+                for pane in self._panes:
+                    pane.set_indicator(key, want)
+
+        # code：set 輸入欄（blockSignals 避免觸發 textChanged guard）+ 返回俾 start()
+        code = state.get("code")
+        if isinstance(code, str) and code.strip():
+            self.code_edit.blockSignals(True)
+            try:
+                self.code_edit.setText(code)
+            finally:
+                self.code_edit.blockSignals(False)
+            return code
+        return None
+
+    def _save_ui_state(self) -> None:
+        """寫入當前 UI 狀態快照（code / pane count / per-pane periods / indicator toggles）。
+
+        由四個 change handler 呼叫（用戶操作、低頻、極小寫入）→ on-change save，唔需要 debounce。
+        store 失敗 → 靜默忽略（記憶係輔助功能，唔應該阻斷主流程）。
+        """
+        try:
+            state = {
+                "pane_count": self._pane_count,
+                "periods": [c.currentText() for c in self._pane_combos],
+                "indicators": [k for k, b in self._indicator_btns.items() if b.isChecked()],
+            }
+            code = self.code_edit.text().strip()
+            if code:
+                state["code"] = code
+            self._state_store.save(state)
+        except Exception:  # noqa: BLE001 — persistence is best-effort，唔阻斷主流程
+            logger.exception("UI state save failed")
+
     def _do_switch(self):
         """ReturnPressed / 週期按鍵 → 驗證輸入欄純編號存在先 switch（名稱唔入輸入欄）。
 
@@ -282,6 +371,7 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing = False
         self._engine.switch(code=code, periods=list(self._desired_periods()))
+        self._save_ui_state()   # 標的改變 → 記憶（code + 當前 layout/periods/indicators）
 
     def _on_code_text_changed(self, text: str) -> None:
         """onChange guard：欄位出現「code + 名稱」（含空白）→ 即刻剝離返純 code。
@@ -370,6 +460,7 @@ class MainWindow(QMainWindow):
         elif state is not None and new_period in state.aggregators:
             # 該週期已活躍（其他 pane 用緊）→ 直接推當前 snapshot，唔使等下一筆 tick
             self._panes[i].update_bars(state.aggregators[new_period].bars())
+        self._save_ui_state()   # per-pane 週期改變 → 記憶
 
     def _on_pane_view_changed(self, i: int, start_dt, end_dt) -> None:
         """用戶喺某 pane pan/zoom → 廣播時間視窗去其他可見 pane（時間軸同步）。"""
@@ -391,6 +482,7 @@ class MainWindow(QMainWindow):
         for i in range(4):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
             self._pane_grid.removeWidget(self._pane_widgets[i])
         self._layout_panes()
+        self._save_ui_state()   # layout 改變 → 記憶（early return 已確保只喺真改變時 save）
 
     def _zoom_all(self, factor: float) -> None:
         """放大/縮小按鍵 → 對所有可見 pane 統一縮放時間視窗（factor<1=放大 / >1=縮小），中心錨定。
@@ -422,6 +514,7 @@ class MainWindow(QMainWindow):
         """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。"""
         for pane in self._panes:
             pane.set_indicator(key, on)
+        self._save_ui_state()   # 指標開關改變 → 記憶
 
     def shutdown(self) -> None:
         """Clean shutdown：close OpenD context + join setup/switch threads（idempotent）。"""

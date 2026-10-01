@@ -135,7 +135,8 @@ def make_engine(**cfg_overrides) -> FutuEngine:
     eng._cfg = cfg
     ktype = cfg.kline_type
     agg = CandleAggregator(kline_period_minutes(ktype) or cfg.period_minutes)
-    eng._state = _State(cfg.trading_code, None, frozenset({ktype}), {ktype: agg})
+    # 跟 production start() 一致：state.code 永遠係正規化後形式（_setup/_reconfigure 信任輸入、唔再 normalize）
+    eng._state = _State(_normalize_code(cfg.trading_code), None, frozenset({ktype}), {ktype: agg})
     return eng
 
 
@@ -1122,3 +1123,36 @@ class TestSubscriptionLedgerIntegration:
 
         remaining = {c for c, _s, _ts in store.list_active()}
         assert "HK.HSImain" not in remaining and "US.AAPL" in remaining
+
+
+# ---------------------------------------------------------------- start(code=...)（UI-state 記憶還原標的）
+
+class TestStartCodeParam:
+    """start(code=...) → state.code = 正規化後嘅 code；None → fallback cfg.trading_code。
+
+    patch `_setup` 做 no-op（唔 spawn 真實 OpenD 連線），只驗證 start() **同步**設定 state 嗰段邏輯
+    （line: `self._state = _State(code, ...)` 喺 thread.start() 之前，所以 start() 返回後 state 已定）。
+    """
+
+    def test_start_with_explicit_code_normalizes(self, monkeypatch):
+        eng = FutuEngine()
+        monkeypatch.setattr(eng, "_setup", lambda: None)   # no-op：唔連 OpenD
+        cfg = make_cfg(trading_code="HK.HSImain")
+        eng.start(cfg, periods=["K_1M"], code="us.aapl")
+        assert eng.state.code == "US.AAPL"   # 小寫 → canonical upper
+
+    def test_start_without_code_falls_back_to_env(self, monkeypatch):
+        """code=None（GUI 無記憶）→ fallback cfg.trading_code（.env）。"""
+        eng = FutuEngine()
+        monkeypatch.setattr(eng, "_setup", lambda: None)
+        cfg = make_cfg(trading_code="hk.hsimain")   # .env 小寫 → normalize
+        eng.start(cfg, periods=["K_1M"])            # code=None（預設）
+        assert eng.state.code == "HK.HSImain"
+
+    def test_start_respects_saved_periods(self, monkeypatch):
+        """start(periods=[...]) → state.periods = 傳入 union（多 pane，upper + dedup）。"""
+        eng = FutuEngine()
+        monkeypatch.setattr(eng, "_setup", lambda: None)
+        cfg = make_cfg(trading_code="HK.HSImain")
+        eng.start(cfg, periods=["K_5M", "k_15m"], code="US.AAPL")
+        assert eng.state.periods == frozenset({"K_5M", "K_15M"})
