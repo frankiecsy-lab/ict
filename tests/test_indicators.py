@@ -16,7 +16,8 @@ from __future__ import annotations
 from engine.indicators import (Level, Marker, RefLine, Zone, confluence_zones, daily_reference_lines,
                                detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
                                detect_order_blocks, detect_ote_zones, detect_premium_discount,
-                               detect_structure_breaks, detect_valid_order_blocks, kill_zone_bands)
+                               detect_session_high_low, detect_structure_breaks,
+                               detect_valid_order_blocks, kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -301,6 +302,43 @@ def test_daily_ref_lines_monthly_keys_skipped():
 def test_daily_ref_lines_empty():
     """空 bars → ()。"""
     assert daily_reference_lines(()) == ()
+
+
+# ---------------------------------------------------------------- Session High/Low
+
+def test_session_high_low_multi_day():
+    """兩日數據：sh/sl 各跨當日（per-day span，唔係全寬）。
+    Day1 (idx0-1): sh=max(10.5,10.6)=10.6、sl=min(9.8,10.0)=9.8；Day2 (idx2): sh=11.0、sl=10.3。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2, t="2026-09-30 09:30"),
+            bar(10.2, 10.6, 10.0, 10.4, t="2026-09-30 10:00"),
+            bar(10.5, 11.0, 10.3, 10.8, t="2026-10-01 09:30"))
+    assert detect_session_high_low(bars) == (
+        RefLine("sh", 10.6, 0, 1),
+        RefLine("sl", 9.8, 0, 1),
+        RefLine("sh", 11.0, 2, 2),
+        RefLine("sl", 10.3, 2, 2),
+    )
+
+
+def test_session_high_low_single_day():
+    """單日 → 一對 sh/sl，線段跨當日首尾 index。"""
+    bars = (bar(10.0, 10.5, 9.8, 10.2, t="2026-09-30 09:30"),
+            bar(10.2, 10.6, 10.0, 10.4, t="2026-09-30 10:00"))
+    assert detect_session_high_low(bars) == (
+        RefLine("sh", 10.6, 0, 1),
+        RefLine("sl", 9.8, 0, 1),
+    )
+
+
+def test_session_high_low_monthly_keys_skipped():
+    """K_MON（'yyyy-MM'，長度 < 10）→ 無日級概念 → ()。"""
+    bars = (_kz_bar("2026-08"), _kz_bar("2026-09"))
+    assert detect_session_high_low(bars) == ()
+
+
+def test_session_high_low_empty():
+    """空 bars → ()。"""
+    assert detect_session_high_low(()) == ()
 
 
 # ---------------------------------------------------------------- Valid Order Blocks (VOB)

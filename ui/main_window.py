@@ -35,10 +35,11 @@ logger = logging.getLogger(__name__)
 
 # 指標開關註冊表（模組化擴展點）：加新指標 = 喺呢度加一行 → control bar 自動生成對應 checkable 按鍵。
 # 偵測邏輯喺 engine/indicators.py、繪製層喺 candle_chart._recompute_zones() / paintEvent；
-# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"）。
+# key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"）。
 INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
     ("ob", "OB"), ("fvg", "FVG"), ("vob", "VOB"), ("brk", "BRK"), ("kz", "KZ"),
-    ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS"), ("pd", "PD"), ("ote", "OTE")
+    ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS"), ("pd", "PD"), ("ote", "OTE"),
+    ("shl", "SHL")
 )
 
 

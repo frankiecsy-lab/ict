@@ -24,6 +24,9 @@
   （DST-aware）做分類；呢個轉換只供顯示，永遠唔涉及 bar key 產生。
 - **Daily reference lines**：DO = 每日開市價線段（只跨當日）；PH/PL/PC = 前一交易日
   high/low/close 全寬水平線。
+- **Session High/Low**：每個交易日（session）嘅最高 high / 最低 low 水平線段（跨當日、
+  per-day span，同 DO 一樣）。每日交易範圍標記為明確參考位——stop orders 聚集喺前高上方/
+  前低下方 = 流動性掃蕩目標。sh=當日 high max、sl=當日 low min；非 intraday key → ()。
 - **Liquidity Levels（流動性池 BSL/SSL）**：pivot swing high/low（前後各 pivot bar 嘅
   局部極值）按價格聚類——同一價位被 ≥min_touches 個 pivot 觸及 = 流動性池（equal highs /
   equal lows）。BSL=上方 buy-side 阻力（swing high 群、price > last_close）、SSL=下方
@@ -71,7 +74,8 @@ class Zone:
 class RefLine:
     """水平參考線。
 
-    kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）。
+    kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）或
+    {"sh", "sl"}（Session High/Low，per-day span）。
     start_idx/end_idx = 線段覆蓋嘅 bar index 範圍；end_idx=None 表示全寬（畫到右緣）。
     """
 
@@ -388,15 +392,11 @@ def kill_zone_bands(bars) -> tuple[tuple[int, int, str], ...]:
 
 # ---------------------------------------------------------------- Daily reference lines
 
-def daily_reference_lines(bars) -> tuple[RefLine, ...]:
-    """Daily Open / Prev Day HLC 參考線。
+def _date_groups(bars) -> list[tuple[int, int]]:
+    """按日期（time_key[:10]）分組 → [(first_idx, last_idx), ...]，O(n)。
 
-    DO：每日第一根 bar 嘅 open → 只跨當日嘅線段（start/end = 當日首尾 index）。
-    PH/PL/PC：前一交易日（倒数第二個日組）high max / low min / close → 全寬水平線
-    （start=0、end=None）。非 intraday key（長度 < 10，如 K_MON 'yyyy-MM'）→ ()。
+    假定 bars 非空且係 intraday key（長度 ≥ 10）；呼叫方自行 guard。
     """
-    if not bars or len(bars[0][0]) < 10:
-        return ()
     groups: list[tuple[int, int]] = []   # (first_idx, last_idx) per date
     prev_date = None
     for i, b in enumerate(bars):
@@ -406,6 +406,19 @@ def daily_reference_lines(bars) -> tuple[RefLine, ...]:
             prev_date = d
         else:
             groups[-1] = (groups[-1][0], i)
+    return groups
+
+
+def daily_reference_lines(bars) -> tuple[RefLine, ...]:
+    """Daily Open / Prev Day HLC 參考線。
+
+    DO：每日第一根 bar 嘅 open → 只跨當日嘅線段（start/end = 當日首尾 index）。
+    PH/PL/PC：前一交易日（倒数第二個日組）high max / low min / close → 全寬水平線
+    （start=0、end=None）。非 intraday key（長度 < 10，如 K_MON 'yyyy-MM'）→ ()。
+    """
+    if not bars or len(bars[0][0]) < 10:
+        return ()
+    groups = _date_groups(bars)
     out: list[RefLine] = []
     for s, e in groups:                  # DO：每日開市價線段
         out.append(RefLine("do", float(bars[s][1]), s, e))
@@ -417,6 +430,24 @@ def daily_reference_lines(bars) -> tuple[RefLine, ...]:
         out.append(RefLine("ph", ph, 0, None))
         out.append(RefLine("pl", pl, 0, None))
         out.append(RefLine("pc", pc, 0, None))
+    return tuple(out)
+
+
+def detect_session_high_low(bars) -> tuple[RefLine, ...]:
+    """Session High/Low：每個交易日嘅最高 high / 最低 low 水平線段（跨當日）。
+
+    sh = 當日 max(high)、sl = 當日 min(low)；線段 start/end = 當日首尾 bar index
+    （per-day span，同 DO——唔係全寬，避免多日圖表上滿布水平線）。非 intraday key
+    （長度 < 10）→ ()。O(n)。
+    """
+    if not bars or len(bars[0][0]) < 10:
+        return ()
+    out: list[RefLine] = []
+    for s, e in _date_groups(bars):
+        sh = max(float(b[2]) for b in bars[s:e + 1])
+        sl = min(float(b[3]) for b in bars[s:e + 1])
+        out.append(RefLine("sh", sh, s, e))
+        out.append(RefLine("sl", sl, s, e))
     return tuple(out)
 
 

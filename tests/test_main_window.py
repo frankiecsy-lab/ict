@@ -265,7 +265,7 @@ def test_text_changed_guard_strips_name_before_catalog(monkeypatch):
 def test_indicator_toggle_buttons_exist_and_default_off(monkeypatch):
     """control bar「指標」區：INDICATOR_TOGGLES 每個 entry 一個 checkable 按鍵、預設 off。"""
     win, _engine = _make_window(monkeypatch)
-    assert set(win._indicator_btns) == {"ob", "fvg", "vob", "brk", "kz", "ref", "liq", "bos", "pd", "ote"}
+    assert set(win._indicator_btns) == {"ob", "fvg", "vob", "brk", "kz", "ref", "liq", "bos", "pd", "ote", "shl"}
     for btn in win._indicator_btns.values():
         assert btn.isCheckable()
         assert not btn.isChecked()
@@ -357,6 +357,18 @@ def test_pd_ote_toggles_apply_to_all_panes(monkeypatch):
         win._indicator_btns[key].click()
         for pane in win._panes:
             assert pane._indicator_enabled.get(key) is False
+
+
+def test_shl_toggle_applies_to_all_panes(monkeypatch):
+    """SHL（Session High/Low）開關 click → 全部 4 pane _indicator_enabled["shl"] 同步翻轉；再 click 還原。"""
+    win, _engine = _make_window(monkeypatch)
+    win._indicator_btns["shl"].click()
+    assert win._indicator_btns["shl"].isChecked()
+    for pane in win._panes:
+        assert pane._indicator_enabled.get("shl") is True
+    win._indicator_btns["shl"].click()
+    for pane in win._panes:
+        assert pane._indicator_enabled.get("shl") is False
 
 
 # ---------------------------------------------------------------- UI state persistence（SQLite 記憶）

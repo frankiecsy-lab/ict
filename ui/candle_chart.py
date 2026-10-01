@@ -28,7 +28,8 @@ from engine.indicators import (_KZ_LABELS, Level, Marker, RefLine, Zone, conflue
                                daily_reference_lines, detect_breaker_blocks,
                                detect_fvg, detect_liquidity_levels,
                                detect_order_blocks, detect_ote_zones,
-                               detect_premium_discount, detect_structure_breaks,
+                               detect_premium_discount, detect_session_high_low,
+                               detect_structure_breaks,
                                detect_valid_order_blocks,
                                kill_zone_bands)
 from engine.timeutil import bar_key_to_dt
@@ -288,6 +289,7 @@ class CandleChart(QWidget):
         self._levels: tuple[Level, ...] = ()                     # Liquidity Levels BSL/SSL 流動性池
         self._markers: tuple[Marker, ...] = ()                   # Structure Breaks BOS/CHoCH 標記
         self._pd_zones: tuple[Zone, ...] = ()                    # Premium/Discount dealing range 帶（背景層）
+        self._session_lines: tuple[RefLine, ...] = ()            # Session High/Low per-day 範圍線
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -317,7 +319,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"/"bos"/"pd"/"ote"/"shl"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -334,15 +336,16 @@ class CandleChart(QWidget):
         VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
         唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels / structure
         markers / premium-discount 存獨立狀態（_kz_bands / _ref_lines / _levels /
-        _markers / _pd_zones），唔入 zones dict；任何 recompute 都先重置五者（toggle off →
-        清空，唔會殘留舊 band/line/level/marker/pd）。OTE 入 zones["ote"]（同 FVG/OB 一樣
-        價格錨定矩形、畫喺蠟燭上面）。
+        _markers / _pd_zones / _session_lines），唔入 zones dict；任何 recompute 都先重置
+        六者（toggle off → 清空，唔會殘留舊 band/line/level/marker/pd/session）。OTE 入
+        zones["ote"]（同 FVG/OB 一樣價格錨定矩形、畫喺蠟燭上面）。
         """
         self._kz_bands = ()
         self._ref_lines = ()
         self._levels = ()
         self._markers = ()
         self._pd_zones = ()
+        self._session_lines = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -365,6 +368,8 @@ class CandleChart(QWidget):
             self._kz_bands = kill_zone_bands(self._bars)
         if self._indicator_enabled.get("ref"):
             self._ref_lines = daily_reference_lines(self._bars)
+        if self._indicator_enabled.get("shl"):
+            self._session_lines = detect_session_high_low(self._bars)   # Session High/Low per-day 範圍線（獨立圖層）
         if self._indicator_enabled.get("liq"):
             self._levels = detect_liquidity_levels(self._bars)   # BSL/SSL 流動性池（獨立圖層）
         if self._indicator_enabled.get("bos"):
@@ -728,6 +733,25 @@ class CandleChart(QWidget):
                 p.drawLine(int(x_left), int(y), int(x_right), int(y))
                 p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
                            Qt.AlignLeft | Qt.AlignBottom, rl.kind.upper())
+
+        # --- Session High/Low（per-day 範圍線段；畫喺 ref lines 之後、levels 之前）
+        if self._session_lines:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            session_colors = {"sh": "#FF6E40", "sl": "#9CCC65"}   # SH 深橙 / SL 青檸綠（palette 唯一）
+            for rl in self._session_lines:
+                if rl.end_idx is not None and rl.end_idx < s0:
+                    continue                       # 線段完全喺視窗前 → skip
+                y = y_price(rl.price)
+                if y < price_r.top() or y > price_r.bottom():
+                    continue                       # 超出當前 Y 範圍 → 唔畫
+                li = max(0, rl.start_idx - s0)
+                re_ = n - 1 if rl.end_idx is None else min(n - 1, rl.end_idx - s0)
+                x_left = plot.left() + li * slot
+                x_right = (plot.right() if rl.end_idx is None
+                           else plot.left() + (re_ + 1) * slot)
+                color = QColor(session_colors[rl.kind])
+                p.setPen(QPen(color, 1, Qt.SolidLine))   # 實線：當日實際範圍（已成交）
+                p.drawLine(int(x_left), int(y), int(x_right), int(y))
 
         # --- Liquidity Levels（BSL/SSL 流動性池水平線；畫喺 ref lines 之後、overlay 之前）
         if self._levels:

@@ -766,3 +766,63 @@ class TestOTEIndicator:
         img_on = self._render(ch)
         assert self._count_in(img_on, QColor("#FFC400")) > 0
 
+
+class TestSessionHighLow:
+    """Session High/Low 圖層（Step 2 · Commit 22）：set_indicator("shl") → detect_session_high_low()
+    per-day sh/sl 線段；#FF6E40 (SH) / #9CCC65 (SL) 係 palette 唯一色 → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _session_bars():
+        """兩日 bars：Day1 (idx0-1) sh=10.5/sl=9.8、Day2 (idx2-3) sh=11.0/sl=9.5。
+        Day1 線段喺整體 Y 範圍 [9.5,11.0] 內 → pixel count 可靠（Day2 係邊界極值）。"""
+        return (
+            ("2026-09-30 09:00", 10.0, 10.5, 9.8, 10.2, 1000.0),
+            ("2026-09-30 09:01", 10.2, 10.4, 10.0, 10.3, 1000.0),
+            ("2026-10-01 09:00", 10.5, 11.0, 9.5, 10.8, 1000.0),
+            ("2026-10-01 09:01", 10.8, 10.9, 9.9, 10.7, 1000.0),
+        )
+
+    def test_session_high_low_recomputes_immediately(self):
+        """set_indicator("shl", True) → _session_lines = per-day sh/sl；toggle off → 清空。"""
+        from engine.indicators import RefLine
+        ch = CandleChart(Config())
+        ch.update_bars(self._session_bars())
+        assert ch._session_lines == ()               # 預設全 off
+        ch.set_indicator("shl", True)
+        assert ch._session_lines == (
+            RefLine("sh", 10.5, 0, 1),
+            RefLine("sl", 9.8, 0, 1),
+            RefLine("sh", 11.0, 2, 3),
+            RefLine("sl", 9.5, 2, 3),
+        )
+        ch.set_indicator("shl", False)
+        assert ch._session_lines == ()
+
+    def test_session_high_low_pixels_only_when_enabled(self):
+        """SH #FF6E40 / SL #9CCC65 palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._session_bars())
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#FF6E40")) == 0
+        assert self._count_in(img_off, QColor("#9CCC65")) == 0
+        ch.set_indicator("shl", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#FF6E40")) > 0
+        assert self._count_in(img_on, QColor("#9CCC65")) > 0
+
