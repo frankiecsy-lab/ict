@@ -541,3 +541,61 @@ class TestVOBIndicator:
         ch.set_indicator("vob", True)
         assert self._count_in(self._render(ch), QColor("#69F0AE")) > 0
 
+
+class TestLiquidityIndicator:
+    """Liquidity Levels BSL/SSL 圖層（Step 2 · Commit 18）：set_indicator("liq") →
+    detect_liquidity_levels()；#FF80AB（BSL 粉紅）/ #7C4DFF（SSL 深紫）係 palette 唯一色
+    → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _liq_bars():
+        """16-bar 序列（同 test_indicators._liq_bars）：equal highs @3/@9=12 → BSL；
+        equal lows @5/@10=9 → SSL。last_close=10.5。"""
+        ohlc = ((9.6, 10, 9.5, 9.8), (9.9, 11, 9.8, 10.4), (10.1, 11.5, 10, 11.2),
+                (10.3, 12, 10.2, 11.8), (11.4, 11.5, 10, 10.6), (10.2, 11, 9, 9.3),
+                (9.9, 10.5, 9.8, 10.4), (10.1, 11, 10, 10.8), (10.3, 11.5, 10.2, 11.3),
+                (10.4, 12, 10, 11.7), (11.4, 11.5, 9, 9.4), (9.9, 11, 9.8, 10.7),
+                (10.1, 10.5, 10, 10.4), (10.3, 11, 10.2, 10.9), (10.1, 11.5, 10, 11.3),
+                (10.6, 11, 9.6, 10.5))
+        return tuple((f"2026-09-30 09:{i:02d}", o, h, l, c, 1000.0)
+                     for i, (o, h, l, c) in enumerate(ohlc))
+
+    def test_liquidity_recomputes_immediately(self):
+        """set_indicator("liq", True) → _levels = BSL@12 + SSL@9；toggle off → 清空。"""
+        from engine.indicators import Level
+        ch = CandleChart(Config())
+        ch.update_bars(self._liq_bars())
+        assert ch._levels == ()                     # 預設全 off
+        ch.set_indicator("liq", True)
+        assert ch._levels == (Level("bsl", 12.0, 3, None), Level("ssl", 9.0, 5, None))
+        ch.set_indicator("liq", False)
+        assert ch._levels == ()
+
+    def test_liquidity_pixels_only_when_enabled(self):
+        """#FF80AB（BSL）/ #7C4DFF（SSL）palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._liq_bars())
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#FF80AB")) == 0
+        assert self._count_in(img_off, QColor("#7C4DFF")) == 0
+        ch.set_indicator("liq", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#FF80AB")) > 0
+        assert self._count_in(img_on, QColor("#7C4DFF")) > 0
+

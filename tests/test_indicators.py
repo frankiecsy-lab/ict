@@ -13,9 +13,9 @@ time_key（全部 case 共用同一 fake key）；Kill Zones / Daily ref lines �
 """
 from __future__ import annotations
 
-from engine.indicators import (RefLine, Zone, confluence_zones, daily_reference_lines,
-                               detect_breaker_blocks, detect_fvg, detect_order_blocks,
-                               detect_valid_order_blocks, kill_zone_bands)
+from engine.indicators import (Level, RefLine, Zone, confluence_zones, daily_reference_lines,
+                               detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
+                               detect_order_blocks, detect_valid_order_blocks, kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -355,3 +355,53 @@ def test_vob_empty_and_short():
     """空 / 單根 → 無 OB 可形成 → ()。"""
     assert detect_valid_order_blocks(()) == ()
     assert detect_valid_order_blocks((bar(1, 2, 0.5, 1.5),)) == ()
+
+
+# ---------------------------------------------------------------- Liquidity Levels (BSL/SSL)
+
+def _liq_bars():
+    """16-bar 序列（pivot=3）：兩個 swing high @3/@9 同價 12 → BSL；兩個 swing low @5/@10
+    同價 9 → SSL。last_close=10.5（BSL 12 > 10.5、SSL 9 < 10.5）。"""
+    return (bar(9.6, 10, 9.5, 9.8),      # b0
+            bar(9.9, 11, 9.8, 10.4),     # b1
+            bar(10.1, 11.5, 10, 11.2),   # b2
+            bar(10.3, 12, 10.2, 11.8),   # b3 swing high @3（high=12）
+            bar(11.4, 11.5, 10, 10.6),   # b4
+            bar(10.2, 11, 9, 9.3),       # b5 swing low @5（low=9）
+            bar(9.9, 10.5, 9.8, 10.4),   # b6
+            bar(10.1, 11, 10, 10.8),     # b7
+            bar(10.3, 11.5, 10.2, 11.3), # b8
+            bar(10.4, 12, 10, 11.7),     # b9 swing high @9（high=12）
+            bar(11.4, 11.5, 9, 9.4),     # b10 swing low @10（low=9）
+            bar(9.9, 11, 9.8, 10.7),     # b11
+            bar(10.1, 10.5, 10, 10.4),   # b12
+            bar(10.3, 11, 10.2, 10.9),   # b13
+            bar(10.1, 11.5, 10, 11.3),   # b14
+            bar(10.6, 11, 9.6, 10.5))    # b15 last_close=10.5
+
+
+def test_liquidity_bsl_and_ssl_pools():
+    """兩個 equal highs（@3/@9 同價 12）→ BSL；兩個 equal lows（@5/@10 同價 9）→ SSL。"""
+    assert detect_liquidity_levels(_liq_bars()) == (
+        Level("bsl", 12.0, 3, None),
+        Level("ssl", 9.0, 5, None),
+    )
+
+
+def test_liquidity_no_pool_when_highs_not_equal():
+    """b9 high 改 11.8（唔再同 b3 嘅 12 聚類）→ BSL 消失，只餘 SSL。"""
+    bars = _liq_bars()[:9] + (bar(10.4, 11.8, 10, 11.7),) + _liq_bars()[10:]
+    assert detect_liquidity_levels(bars) == (Level("ssl", 9.0, 5, None),)
+
+
+def test_liquidity_single_touch_not_a_pool():
+    """min_touches=3 → 只有兩個觸及嘅池唔夠 → ()。"""
+    assert detect_liquidity_levels(_liq_bars(), min_touches=3) == ()
+
+
+def test_liquidity_empty_and_short():
+    """空 / 單根 / 少於 2*pivot+1（7）bar → 無 pivot 可判斷 → ()。"""
+    assert detect_liquidity_levels(()) == ()
+    assert detect_liquidity_levels((bar(1, 2, 0.5, 1.5),)) == ()
+    six = tuple(bar(10 + i * 0.1, 11 + i * 0.1, 9 + i * 0.1, 10.5 + i * 0.1) for i in range(6))
+    assert detect_liquidity_levels(six) == ()

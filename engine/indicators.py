@@ -24,6 +24,11 @@
   （DST-aware）做分類；呢個轉換只供顯示，永遠唔涉及 bar key 產生。
 - **Daily reference lines**：DO = 每日開市價線段（只跨當日）；PH/PL/PC = 前一交易日
   high/low/close 全寬水平線。
+- **Liquidity Levels（流動性池 BSL/SSL）**：pivot swing high/low（前後各 pivot bar 嘅
+  局部極值）按價格聚類——同一價位被 ≥min_touches 個 pivot 觸及 = 流動性池（equal highs /
+  equal lows）。BSL=上方 buy-side 阻力（swing high 群、price > last_close）、SSL=下方
+  sell-side 支撐（swing low 群、price < last_close）；只畫相對於最新 close 未失效嘅池。
+  線段由首次觸及 bar 畫到右緣（end=None）。
 
 全部 O(n) 純函數；bars = tuple[Bar, ...]，Bar = (time_key, open, high, low, close, volume)
 （同 ui/candle_chart.py / engine/candle_aggregator.py 定義）。
@@ -57,6 +62,20 @@ class RefLine:
 
     kind ∈ {"do", "ph", "pl", "pc"}（Daily Open / Prev Day High/Low/Close）。
     start_idx/end_idx = 線段覆蓋嘅 bar index 範圍；end_idx=None 表示全寬（畫到右緣）。
+    """
+
+    kind: str
+    price: float
+    start_idx: int
+    end_idx: int | None
+
+
+@dataclass(frozen=True)
+class Level:
+    """水平流動性池線（獨立於 Zone 矩形、RefLine daily 參考）。
+
+    kind ∈ {"bsl", "ssl"}（Buy-Side / Sell-Side Liquidity）；price = 價位；
+    start_idx/end_idx = 線段覆蓋嘅 bar index 範圍，end_idx=None 表示畫到右緣。
     """
 
     kind: str
@@ -375,3 +394,66 @@ def daily_reference_lines(bars) -> tuple[RefLine, ...]:
         out.append(RefLine("pl", pl, 0, None))
         out.append(RefLine("pc", pc, 0, None))
     return tuple(out)
+
+
+# ---------------------------------------------------------------- Liquidity Levels (BSL/SSL)
+
+def _swing_points(bars, k: int, which: str) -> list[tuple[int, float]]:
+    """pivot 極值點：which="high" → high[i] ≥ [i-k..i+k] 全部 high；"low" 對稱（≤）。
+
+    邊界 bar（i<k 或 i≥n-k）唔計。返回 [(idx, price), ...]，O(n·k)。
+    """
+    n = len(bars)
+    out: list[tuple[int, float]] = []
+    for i in range(k, n - k):
+        if which == "high":
+            v = float(bars[i][2])
+            if all(v >= float(bars[j][2]) for j in range(i - k, i + k + 1)):
+                out.append((i, v))
+        else:
+            v = float(bars[i][3])
+            if all(v <= float(bars[j][3]) for j in range(i - k, i + k + 1)):
+                out.append((i, v))
+    return out
+
+
+def _cluster_by_price(points: list[tuple[int, float]], tol_frac: float) -> list[tuple[float, list[int]]]:
+    """按價格排序後貪心聚類：相鄰差 ≤ tol_frac×price 合併做一簇。
+
+    返回 [(cluster_max_price, [idxs...]), ...]（保留全部簇，size 過濾由 caller 做）。
+    """
+    if not points:
+        return []
+    clusters: list[list] = []   # each: [max_price, [idxs]]
+    for idx, price in sorted(points, key=lambda p: p[1]):
+        if clusters and (price - clusters[-1][0]) <= tol_frac * max(1e-9, price):
+            clusters[-1][0] = max(clusters[-1][0], price)
+            clusters[-1][1].append(idx)
+        else:
+            clusters.append([price, [idx]])
+    return [(c[0], c[1]) for c in clusters]
+
+
+def detect_liquidity_levels(bars, pivot: int = 3, min_touches: int = 2,
+                            tol_frac: float = 0.002) -> tuple[Level, ...]:
+    """流動性池（BSL/SSL）：pivot swing high/low 按價格聚類，≥min_touches 觸及嘅價位先算。
+
+    BSL=上方 buy-side 阻力（swing high 群、price > last_close）、SSL=下方 sell-side
+    支撐（swing low 群、price < last_close）。線段由首次觸及 bar 畫到右緣（end=None）。
+    O(n·k)。
+    """
+    if len(bars) < 2 * pivot + 1 or min_touches < 2:
+        return ()
+    last_close = float(bars[-1][4])
+    out: list[Level] = []
+    for which, kind in (("high", "bsl"), ("low", "ssl")):
+        clusters = _cluster_by_price(_swing_points(bars, pivot, which), tol_frac)
+        for price, idxs in clusters:
+            if len(idxs) < min_touches:
+                continue
+            if (kind == "bsl" and price > last_close) or \
+               (kind == "ssl" and price < last_close):
+                out.append(Level(kind, price, min(idxs), None))
+    bsl = sorted((l for l in out if l.kind == "bsl"), key=lambda l: -l.price)
+    ssl = sorted((l for l in out if l.kind == "ssl"), key=lambda l: l.price)
+    return tuple(bsl + ssl)

@@ -24,10 +24,11 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from engine.indicators import (_KZ_LABELS, RefLine, Zone, confluence_zones,
+from engine.indicators import (_KZ_LABELS, Level, RefLine, Zone, confluence_zones,
                                daily_reference_lines, detect_breaker_blocks,
-                               detect_fvg, detect_order_blocks,
-                               detect_valid_order_blocks, kill_zone_bands)
+                               detect_fvg, detect_liquidity_levels,
+                               detect_order_blocks, detect_valid_order_blocks,
+                               kill_zone_bands)
 from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
@@ -282,6 +283,7 @@ class CandleChart(QWidget):
         self._zones: dict[str, tuple[Zone, ...]] = {}
         self._kz_bands: tuple[tuple[int, int, str], ...] = ()   # Kill Zone session bands（global index 範圍）
         self._ref_lines: tuple[RefLine, ...] = ()                # Daily Open / Prev Day HLC 參考線
+        self._levels: tuple[Level, ...] = ()                     # Liquidity Levels BSL/SSL 流動性池
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -311,7 +313,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob" / "fvg" / "vob" / "brk" / "kz" / "ref"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob" / "fvg" / "vob" / "brk" / "kz" / "ref" / "liq"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -326,11 +328,13 @@ class CandleChart(QWidget):
 
         Confluence 唔係獨立開關——OB + FVG 同時啟用時自動派生（同向價格區間重疊帶）。
         VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
-        唔依賴 ob/fvg 開關狀態。KZ bands / ref lines 存獨立狀態（_kz_bands / _ref_lines），
-        唔入 zones dict；任何 recompute 都先重置兩者（toggle off → 清空，唔會殘留舊 band/line）。
+        唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels 存獨立狀態
+        （_kz_bands / _ref_lines / _levels），唔入 zones dict；任何 recompute 都先重置三者
+        （toggle off → 清空，唔會殘留舊 band/line/level）。
         """
         self._kz_bands = ()
         self._ref_lines = ()
+        self._levels = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -353,6 +357,8 @@ class CandleChart(QWidget):
             self._kz_bands = kill_zone_bands(self._bars)
         if self._indicator_enabled.get("ref"):
             self._ref_lines = daily_reference_lines(self._bars)
+        if self._indicator_enabled.get("liq"):
+            self._levels = detect_liquidity_levels(self._bars)   # BSL/SSL 流動性池（獨立圖層）
         self._zones = zones
 
     def reset_view(self) -> None:
@@ -683,6 +689,27 @@ class CandleChart(QWidget):
                 p.drawLine(int(x_left), int(y), int(x_right), int(y))
                 p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
                            Qt.AlignLeft | Qt.AlignBottom, rl.kind.upper())
+
+        # --- Liquidity Levels（BSL/SSL 流動性池水平線；畫喺 ref lines 之後、overlay 之前）
+        if self._levels:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            level_colors = {"bsl": "#FF80AB", "ssl": "#7C4DFF"}   # BSL 粉紅 / SSL 深紫（palette 唯一）
+            for lv in self._levels:
+                if lv.end_idx is not None and lv.end_idx < s0:
+                    continue                       # 線段完全喺視窗前 → skip
+                y = y_price(lv.price)
+                if y < price_r.top() or y > price_r.bottom():
+                    continue                       # 超出當前 Y 範圍 → 唔畫
+                li = max(0, lv.start_idx - s0)
+                re_ = n - 1 if lv.end_idx is None else min(n - 1, lv.end_idx - s0)
+                x_left = plot.left() + li * slot
+                x_right = (plot.right() if lv.end_idx is None
+                           else plot.left() + (re_ + 1) * slot)
+                color = QColor(level_colors[lv.kind])
+                p.setPen(QPen(color, 1, Qt.DashLine))   # 虛線：流動性池（未觸及前係「潛在」位）
+                p.drawLine(int(x_left), int(y), int(x_right), int(y))
+                p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
+                           Qt.AlignLeft | Qt.AlignBottom, lv.kind.upper())
 
         # --- overlays（通用擴展點；ICT FVG / Order Block 已係一級指標層，見上）
         for fn in self._overlays:
