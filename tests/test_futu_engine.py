@@ -24,7 +24,7 @@ import engine.futu_engine as fe
 from config import Config, kline_period_minutes
 from engine.candle_aggregator import CandleAggregator
 from engine.futu_engine import (FutuEngine, _KLTYPE_MAP, _PAGE_SIZE, _QuoteHandler,
-                                _State, _fallback_date, _normalize_code)
+                                _State, _fallback_date, _logged_in_flag, _normalize_code)
 from engine.stock_catalog import StockEntry
 
 # cross-thread signal（ping thread → test thread）係 queued 到 test thread event loop——
@@ -84,8 +84,9 @@ class FakeCtx:
         # market → (ret, df) | Exception；未 script 嘅市場 default 空 DataFrame（catalog fetch 零 entries）
         self._basicinfo = basicinfo or {}
         self.basicinfo_calls = []
-        # get_global_state() scripted 回應（ping loop 用）；default = 行情伺服器已登入（qot_logined='1'）
-        self._global_state = global_state if global_state is not None else (RET_OK, {"qot_logined": "1"})
+        # get_global_state() scripted 回應（ping loop 用）；default = 行情伺服器已登入
+        # （proto `required bool qotLogined` → Python True——真實形態，見 futu GetGlobalState.proto）
+        self._global_state = global_state if global_state is not None else (RET_OK, {"qot_logined": True})
         self.global_state_calls = []
 
     def get_global_state(self):
@@ -1210,21 +1211,54 @@ class TestStartCodeParam:
 
 # ---------------------------------------------------------------- OpenD 定時 ping（連線狀態 + RTT）
 
+class TestLoggedInFlag:
+    """_logged_in_flag：qot_logined / trd_logined 雙形態判定（proto bool + docstring str）。"""
+
+    @pytest.mark.parametrize("value", [True, "1", "true", "TRUE", " True ", 1])
+    def test_logged_in_forms(self, value):
+        assert _logged_in_flag(value) is True
+
+    @pytest.mark.parametrize("value", [False, "0", "false", None, "", 0])
+    def test_not_logged_in_forms(self, value):
+        assert _logged_in_flag(value) is False
+
+
 class TestPingOnce:
     """_ping_once：get_global_state() RTT → (connected, latency_ms)——純邏輯、零線程。"""
 
     def test_connected_when_qot_logined(self):
         eng = make_engine()
-        ctx = FakeCtx([])   # default global_state = (RET_OK, {"qot_logined": "1"})
+        ctx = FakeCtx([])   # default global_state = (RET_OK, {"qot_logined": True})（proto bool 真實形態）
         connected, latency_ms = eng._ping_once(ctx)
         assert connected is True
         assert latency_ms >= 0.0   # perf_counter RTT（本地 mock ≈ 0ms）
         assert len(ctx.global_state_calls) == 1
 
+    def test_disconnected_when_qot_not_logged_in_bool(self):
+        """qot_logined=False（proto bool 形態、行情伺服器未登入）→ 斷線。"""
+        eng = make_engine()
+        ctx = FakeCtx([], global_state=(RET_OK, {"qot_logined": False}))
+        connected, _latency = eng._ping_once(ctx)
+        assert connected is False
+
+    def test_connected_when_qot_logined_string_one(self):
+        """兼容形態：字串 '1'（官方 docstring 聲稱嘅 str 返回）→ 已連線。"""
+        eng = make_engine()
+        ctx = FakeCtx([], global_state=(RET_OK, {"qot_logined": "1"}))
+        connected, _latency = eng._ping_once(ctx)
+        assert connected is True
+
     def test_disconnected_when_qot_not_logged_in(self):
-        """qot_logined='0'（行情伺服器未登入）→ 斷線。"""
+        """兼容形態：字串 '0'（行情伺服器未登入）→ 斷線。"""
         eng = make_engine()
         ctx = FakeCtx([], global_state=(RET_OK, {"qot_logined": "0"}))
+        connected, _latency = eng._ping_once(ctx)
+        assert connected is False
+
+    def test_disconnected_when_qot_key_missing(self):
+        """data 缺 qot_logined key（None）→ 斷線（唔 crash）。"""
+        eng = make_engine()
+        ctx = FakeCtx([], global_state=(RET_OK, {}))
         connected, _latency = eng._ping_once(ctx)
         assert connected is False
 

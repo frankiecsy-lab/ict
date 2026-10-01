@@ -153,6 +153,16 @@ def _fallback_date(anchor: date | None, code: str) -> date:
     return anchor if (anchor is not None and anchor > today) else today
 
 
+def _logged_in_flag(value) -> bool:
+    """get_global_state() 嘅 qot_logined / trd_logined 判定。
+
+    **proto 實測係 bool**（`GetGlobalState.proto`: `required bool qotLogined`）→ Python True/False；
+    官方 docstring 話 str '1'/'0'——兩種形態都兜底：`str(value).strip().lower() in ("1","true")`。
+    唔好靠 truthiness（字串 '0' 係 truthy → 會誤判已登入）。
+    """
+    return str(value).strip().lower() in ("1", "true")
+
+
 class _QuoteHandler(StockQuoteHandlerBase):
     """QUOTE push 回調：parse tick → 聚合入蠟燭 → emit bars_changed 新 snapshot。"""
 
@@ -458,7 +468,7 @@ class FutuEngine(QObject):
     def _ping_once(self, ctx) -> tuple[bool, float]:
         """單次 ping：get_global_state() RTT → (connected, latency_ms)；exception → (False, -1.0)。
 
-        connected = ret OK + data 係 dict + qot_logined=='1'（行情伺服器已登入——連線狀態權威來源）。
+        connected = ret OK + data 係 dict + qot_logined 已登入（行情伺服器——連線狀態權威來源）。
         latency_ms 用 perf_counter（高精度 monotonic clock）量 RTT——本地 OpenD 通常 sub-millisecond，
         UI 端 <1ms 顯示 µs、否則 ms。
         """
@@ -469,7 +479,7 @@ class FutuEngine(QObject):
         except Exception:  # noqa: BLE001 — ping exception → 當斷線，唔 propagate 去 GUI shutdown path
             logger.exception("OpenD ping failed")
             return False, -1.0
-        connected = ret == RET_OK and isinstance(data, dict) and str(data.get("qot_logined")) == "1"
+        connected = ret == RET_OK and isinstance(data, dict) and _logged_in_flag(data.get("qot_logined"))
         return connected, latency_ms
 
     def _ping_loop(self, gen: int) -> None:
