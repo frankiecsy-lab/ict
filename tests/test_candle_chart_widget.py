@@ -599,3 +599,58 @@ class TestLiquidityIndicator:
         assert self._count_in(img_on, QColor("#FF80AB")) > 0
         assert self._count_in(img_on, QColor("#7C4DFF")) > 0
 
+
+class TestStructureBreaks:
+    """Structure Breaks BOS/CHoCH 圖層（Step 2 · Commit 19）：set_indicator("bos") →
+    detect_structure_breaks()；#FF9100（BOS 橙）/ #E040FB（CHoCH 品紅）係 palette 唯一色
+    → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _bos_bars():
+        """12-bar 序列（同 test_indicators._bos_choch_bars，k=2）：BOS up @5 + CHoCH down @11。"""
+        ohlc = ((10.0, 10.5, 9.8, 10.3), (10.3, 11.2, 10.2, 11.0), (11.0, 12.0, 10.9, 11.6),
+                (11.6, 11.8, 11.5, 11.7), (11.7, 11.9, 11.6, 11.8), (11.8, 13.0, 11.7, 12.6),
+                (12.6, 13.4, 12.5, 13.2), (13.2, 13.8, 12.9, 13.6), (13.6, 13.7, 12.4, 13.0),
+                (13.0, 13.9, 12.8, 13.7), (13.7, 14.0, 13.0, 13.9), (13.9, 14.0, 12.2, 12.3))
+        return tuple((f"2026-09-30 09:{i:02d}", o, h, l, c, 1000.0)
+                     for i, (o, h, l, c) in enumerate(ohlc))
+
+    def test_structure_recomputes_immediately(self):
+        """set_indicator("bos", True) → _markers = BOS up @5 + CHoCH down @11；toggle off → 清空。"""
+        from engine.indicators import Marker
+        ch = CandleChart(Config())
+        ch.update_bars(self._bos_bars())
+        assert ch._markers == ()                     # 預設全 off
+        ch.set_indicator("bos", True)
+        assert ch._markers == (Marker("bos", "up", 5), Marker("choch", "down", 11))
+        ch.set_indicator("bos", False)
+        assert ch._markers == ()
+
+    def test_structure_pixels_only_when_enabled(self):
+        """#FF9100（BOS）/ #E040FB（CHoCH）palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._bos_bars())
+        img_off = self._render(ch)
+        assert self._count_in(img_off, QColor("#FF9100")) == 0
+        assert self._count_in(img_off, QColor("#E040FB")) == 0
+        ch.set_indicator("bos", True)
+        img_on = self._render(ch)
+        assert self._count_in(img_on, QColor("#FF9100")) > 0
+        assert self._count_in(img_on, QColor("#E040FB")) > 0
+

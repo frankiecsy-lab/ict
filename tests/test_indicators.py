@@ -13,9 +13,10 @@ time_key（全部 case 共用同一 fake key）；Kill Zones / Daily ref lines �
 """
 from __future__ import annotations
 
-from engine.indicators import (Level, RefLine, Zone, confluence_zones, daily_reference_lines,
+from engine.indicators import (Level, Marker, RefLine, Zone, confluence_zones, daily_reference_lines,
                                detect_breaker_blocks, detect_fvg, detect_liquidity_levels,
-                               detect_order_blocks, detect_valid_order_blocks, kill_zone_bands)
+                               detect_order_blocks, detect_structure_breaks,
+                               detect_valid_order_blocks, kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -405,3 +406,63 @@ def test_liquidity_empty_and_short():
     assert detect_liquidity_levels((bar(1, 2, 0.5, 1.5),)) == ()
     six = tuple(bar(10 + i * 0.1, 11 + i * 0.1, 9 + i * 0.1, 10.5 + i * 0.1) for i in range(6))
     assert detect_liquidity_levels(six) == ()
+
+
+# ---------------------------------------------------------------- Structure Breaks (BOS / CHoCH)
+
+def _bos_choch_bars():
+    """12-bar 序列（k=2）：swing high @2（high=12，i=4 確認）→ b5 close 12.6 > 12 → BOS up @5
+    （建立 uptrend、consumed）。之後 pullback 形成 swing low @8（low=12.4，i=10 確認）→
+    b11 close 12.3 < 12.4 → CHoCH down @11（首次逆勢 = 反轉）。"""
+    return (bar(10.0, 10.5, 9.8, 10.3),   # b0
+            bar(10.3, 11.2, 10.2, 11.0),  # b1
+            bar(11.0, 12.0, 10.9, 11.6),  # b2 swing high @2（high=12）
+            bar(11.6, 11.8, 11.5, 11.7),  # b3
+            bar(11.7, 11.9, 11.6, 11.8),  # b4（i=4 確認 s=2 → last_sh=(12,2)）
+            bar(11.8, 13.0, 11.7, 12.6),  # b5 close 12.6 > 12 → BOS up @5
+            bar(12.6, 13.4, 12.5, 13.2),  # b6
+            bar(13.2, 13.8, 12.9, 13.6),  # b7
+            bar(13.6, 13.7, 12.4, 13.0),  # b8 swing low @8（low=12.4）
+            bar(13.0, 13.9, 12.8, 13.7),  # b9
+            bar(13.7, 14.0, 13.0, 13.9),  # b10（i=10 確認 s=8 → last_sl=(12.4,8)）
+            bar(13.9, 14.0, 12.2, 12.3))  # b11 close 12.3 < 12.4 → CHoCH down @11
+
+
+def _bos_continuation_bars():
+    """11-bar 序列（k=2）：swing high @2（high=12，i=4 確認）→ b5 close 12.6 > 12 → BOS up @5。
+    pullback 形成更高 swing high @7（high=13.8，i=9 確認）→ b10 close 14.0 > 13.8 →
+    BOS up @10（順勢延續、第二個結構 break）。"""
+    return (bar(10.0, 10.5, 9.8, 10.3),   # b0
+            bar(10.3, 11.2, 10.2, 11.0),  # b1
+            bar(11.0, 12.0, 10.9, 11.6),  # b2 swing high @2（high=12）
+            bar(11.6, 11.8, 11.5, 11.7),  # b3
+            bar(11.7, 11.9, 11.6, 11.8),  # b4（i=4 確認 s=2 → last_sh=(12,2)）
+            bar(11.8, 13.0, 11.7, 12.6),  # b5 close 12.6 > 12 → BOS up @5
+            bar(12.6, 13.4, 12.5, 13.2),  # b6
+            bar(13.2, 13.8, 12.9, 13.6),  # b7 swing high @7（high=13.8）
+            bar(13.6, 13.7, 12.4, 13.5),  # b8
+            bar(13.5, 13.6, 12.8, 13.4),  # b9（i=9 確認 s=7 → last_sh=(13.8,7)）
+            bar(13.4, 14.2, 13.3, 14.0))  # b10 close 14.0 > 13.8 → BOS up @10
+
+
+def test_structure_bos_up_then_choch_down():
+    """順勢突破建立 uptrend（BOS up）→ 首次逆勢跌破 swing low = CHoCH down（反轉）。"""
+    assert detect_structure_breaks(_bos_choch_bars()) == (
+        Marker("bos", "up", 5),
+        Marker("choch", "down", 11),
+    )
+
+
+def test_structure_bos_continuation():
+    """uptrend 內兩個更高 swing high 各被突破 → 兩個 BOS up（順勢延續、唔係 CHoCH）。"""
+    assert detect_structure_breaks(_bos_continuation_bars()) == (
+        Marker("bos", "up", 5),
+        Marker("bos", "up", 10),
+    )
+
+
+def test_structure_empty_and_short():
+    """空 / 少於 2*k+1（k=2 → 5）bar → 無 pivot 可確認 → ()。"""
+    assert detect_structure_breaks(()) == ()
+    four = tuple(bar(10 + i * 0.1, 11 + i * 0.1, 9 + i * 0.1, 10.5 + i * 0.1) for i in range(4))
+    assert detect_structure_breaks(four) == ()

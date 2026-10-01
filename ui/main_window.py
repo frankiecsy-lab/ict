@@ -34,7 +34,7 @@ from .stock_completer import StockCompleter, code_from_completion
 # key 必須同 CandleChart.set_indicator() 認得嘅 key 一致（"ob"/"fvg"/"vob"/"brk"/"kz"/"ref"/"liq"）。
 INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
     ("ob", "OB"), ("fvg", "FVG"), ("vob", "VOB"), ("brk", "BRK"), ("kz", "KZ"),
-    ("ref", "REF"), ("liq", "LIQ")
+    ("ref", "REF"), ("liq", "LIQ"), ("bos", "BOS")
 )
 
 

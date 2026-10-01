@@ -21,13 +21,14 @@ from datetime import timedelta
 from typing import Callable
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
-from engine.indicators import (_KZ_LABELS, Level, RefLine, Zone, confluence_zones,
+from engine.indicators import (_KZ_LABELS, Level, Marker, RefLine, Zone, confluence_zones,
                                daily_reference_lines, detect_breaker_blocks,
                                detect_fvg, detect_liquidity_levels,
-                               detect_order_blocks, detect_valid_order_blocks,
+                               detect_order_blocks, detect_structure_breaks,
+                               detect_valid_order_blocks,
                                kill_zone_bands)
 from engine.timeutil import bar_key_to_dt
 
@@ -284,6 +285,7 @@ class CandleChart(QWidget):
         self._kz_bands: tuple[tuple[int, int, str], ...] = ()   # Kill Zone session bands（global index 範圍）
         self._ref_lines: tuple[RefLine, ...] = ()                # Daily Open / Prev Day HLC 參考線
         self._levels: tuple[Level, ...] = ()                     # Liquidity Levels BSL/SSL 流動性池
+        self._markers: tuple[Marker, ...] = ()                   # Structure Breaks BOS/CHoCH 標記
         # 互動視圖狀態（X/Y pan/zoom；reset_view() 還原預設）
         self._view_count = max(1, int(cfg.visible_bars))  # X zoom：可見根數
         self._right_offset = 0.0                          # X pan：距數據尾部 bar 數（0=右 pin 跟 live）
@@ -313,7 +315,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob" / "fvg" / "vob" / "brk" / "kz" / "ref" / "liq"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob" / "fvg" / "vob" / "brk" / "kz" / "ref" / "liq" / "bos"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -328,13 +330,14 @@ class CandleChart(QWidget):
 
         Confluence 唔係獨立開關——OB + FVG 同時啟用時自動派生（同向價格區間重疊帶）。
         VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
-        唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels 存獨立狀態
-        （_kz_bands / _ref_lines / _levels），唔入 zones dict；任何 recompute 都先重置三者
-        （toggle off → 清空，唔會殘留舊 band/line/level）。
+        唔依賴 ob/fvg 開關狀態。KZ bands / ref lines / liquidity levels / structure
+        markers 存獨立狀態（_kz_bands / _ref_lines / _levels / _markers），唔入 zones dict；
+        任何 recompute 都先重置四者（toggle off → 清空，唔會殘留舊 band/line/level/marker）。
         """
         self._kz_bands = ()
         self._ref_lines = ()
         self._levels = ()
+        self._markers = ()
         if not any(self._indicator_enabled.values()):
             self._zones = {}
             return
@@ -359,6 +362,8 @@ class CandleChart(QWidget):
             self._ref_lines = daily_reference_lines(self._bars)
         if self._indicator_enabled.get("liq"):
             self._levels = detect_liquidity_levels(self._bars)   # BSL/SSL 流動性池（獨立圖層）
+        if self._indicator_enabled.get("bos"):
+            self._markers = detect_structure_breaks(self._bars)  # BOS/CHoCH 結構突破標記（獨立圖層）
         self._zones = zones
 
     def reset_view(self) -> None:
@@ -710,6 +715,34 @@ class CandleChart(QWidget):
                 p.drawLine(int(x_left), int(y), int(x_right), int(y))
                 p.drawText(QRectF(x_left + 2, y - 14, 30, 12),
                            Qt.AlignLeft | Qt.AlignBottom, lv.kind.upper())
+
+        # --- Structure Breaks（BOS/CHoCH 結構突破標記；畫喺 levels 之後、overlay 之前）
+        #     每個 marker = 特定 bar 上嘅小三角：direction "up" → high 上方指上、「down」→ low 下方指下。
+        if self._markers:
+            s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
+            marker_colors = {"bos": "#FF9100", "choch": "#E040FB"}   # BOS 橙 / CHoCH 品紅（palette 唯一）
+            for mk in self._markers:
+                li = mk.idx - s0
+                if li < 0 or li >= n:
+                    continue                       # 標記喺可見視窗外 → skip
+                b = bars[li]                        # (key, o, h, l, c, v)
+                x = self._bar_x(li, n, plot)        # bar 中心 x（同蠟燭 body 對齊）
+                if mk.direction == "up":            # 向上突破 → 三角喺 high 上方指上
+                    y_base = y_price(b[2]) - 3      # 底邊（貼住 high 之上少少）
+                    y_apex = y_base - 10            # 頂點（更上，Qt y 向下增大）
+                else:                               # 向下突破 → 三角喺 low 下方指下
+                    y_base = y_price(b[3]) + 3      # 底邊（貼住 low 之下少少）
+                    y_apex = y_base + 10            # 頂點（更下）
+                color = QColor(marker_colors[mk.kind])
+                half = max(4.0, min(slot * 0.4, 8.0))   # 三角半寬跟 bar 寬度、clamp [4,8]px
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(color))
+                p.drawPolygon(QPolygonF([QPointF(x - half, y_base), QPointF(x + half, y_base),
+                                         QPointF(x, y_apex)]))
+                label = "BOS" if mk.kind == "bos" else "CHoCH"
+                p.setPen(color)
+                ly = (y_apex - 14) if mk.direction == "up" else (y_apex + 2)
+                p.drawText(QRectF(x - 20, ly, 40, 12), Qt.AlignHCenter | Qt.AlignVCenter, label)
 
         # --- overlays（通用擴展點；ICT FVG / Order Block 已係一級指標層，見上）
         for fn in self._overlays:

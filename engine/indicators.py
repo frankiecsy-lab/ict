@@ -29,6 +29,10 @@
   equal lows）。BSL=上方 buy-side 阻力（swing high 群、price > last_close）、SSL=下方
   sell-side 支撐（swing low 群、price < last_close）；只畫相對於最新 close 未失效嘅池。
   線段由首次觸及 bar 畫到右緣（end=None）。
+- **Structure Breaks（BOS / CHoCH）**：追蹤趨勢方向 + 已確認 pivot swing high/low——
+  順勢突破最近結構極值 = **BOS**（延續）；首次逆勢突破 = **CHoCH**（反轉訊號，翻轉
+  direction）。pivot 需前後各 k bar 確認（喺 i=s+k 先算 confirmed），每個 pivot 只觸發
+  一次（break 後 consumed、等下一個新 pivot）。標記畫喺 break 發生嘅 bar。
 
 全部 O(n) 純函數；bars = tuple[Bar, ...]，Bar = (time_key, open, high, low, close, volume)
 （同 ui/candle_chart.py / engine/candle_aggregator.py 定義）。
@@ -82,6 +86,19 @@ class Level:
     price: float
     start_idx: int
     end_idx: int | None
+
+
+@dataclass(frozen=True)
+class Marker:
+    """結構突破標記（BOS / CHoCH）——畫喺特定 bar 上嘅箭頭/三角，唔係價格矩形。
+
+    kind ∈ {"bos", "choch"}：BOS=Break of Structure（順勢延續）、CHoCH=Change of
+    Character（首次逆勢 = 反轉訊號）。direction ∈ {"up", "down"}；idx = bar global index。
+    """
+
+    kind: str
+    direction: str
+    idx: int
 
 
 def detect_fvg(bars) -> tuple[Zone, ...]:
@@ -457,3 +474,86 @@ def detect_liquidity_levels(bars, pivot: int = 3, min_touches: int = 2,
     bsl = sorted((l for l in out if l.kind == "bsl"), key=lambda l: -l.price)
     ssl = sorted((l for l in out if l.kind == "ssl"), key=lambda l: l.price)
     return tuple(bsl + ssl)
+
+
+# ---------------------------------------------------------------- Structure Breaks (BOS / CHoCH)
+
+def _is_swing_high(bars, s: int, k: int) -> bool:
+    """bar s 係 pivot swing high：high[s] 嚴格大於前後各 k 根嘅 high。
+
+    邊界（s-k<0 或 s+k≥n）→ False。喺 i=s+k 確認（呢時 [s+1..s+k] 已齊）。O(k)。
+    """
+    n = len(bars)
+    if s - k < 0 or s + k >= n:
+        return False
+    h = float(bars[s][2])
+    for j in range(s - k, s + k + 1):
+        if j != s and float(bars[j][2]) >= h:
+            return False
+    return True
+
+
+def _is_swing_low(bars, s: int, k: int) -> bool:
+    """bar s 係 pivot swing low：low[s] 嚴格小於前後各 k 根嘅 low。對稱 _is_swing_high。"""
+    n = len(bars)
+    if s - k < 0 or s + k >= n:
+        return False
+    l = float(bars[s][3])
+    for j in range(s - k, s + k + 1):
+        if j != s and float(bars[j][3]) <= l:
+            return False
+    return True
+
+
+def detect_structure_breaks(bars, k: int = 2) -> tuple[Marker, ...]:
+    """BOS / CHoCH 結構突破標記（單週期、確定性狀態機）。
+
+    趨勢 direction ∈ {None,"up","down"}；追蹤最近**已確認且未 break**嘅 pivot swing
+    high/low（last_sh / last_sl，(price, idx)）。逐 bar：
+      - direction="up"：close > last_sh → **BOS up**（順勢延續）並 consumed；
+        否則 close < last_sl → **CHoCH down**（首次逆勢 = 反轉），direction→"down"。
+      - direction="down" 對稱（close < last_sl → BOS down；close > last_sh → CHoCH up）。
+      - direction=None：首個結構 break 建立趨勢（記做 BOS）。
+    每 bar 最多一個標記（if/elif）；break 後該 pivot consumed（設 None），等下一個新
+    confirmed pivot。pivot 喺 i=s+k 確認（marker check 用**之前**嘅 state，故新 pivot
+    只俾未來 bar break）。O(n·k)。
+    """
+    n = len(bars)
+    if n < 2 * k + 1:
+        return ()
+    markers: list[Marker] = []
+    direction: str | None = None
+    last_sh: tuple[float, int] | None = None   # (price, idx) 最近已確認未 break swing high
+    last_sl: tuple[float, int] | None = None   # (price, idx) 最近已確認未 break swing low
+    for i in range(n):
+        c = float(bars[i][4])
+        if direction == "up":
+            if last_sh is not None and c > last_sh[0]:
+                markers.append(Marker("bos", "up", i))
+                last_sh = None                       # consumed——等下一個新 pivot high
+            elif last_sl is not None and c < last_sl[0]:
+                markers.append(Marker("choch", "down", i))
+                direction = "down"                   # 首次逆勢 → 反轉
+        elif direction == "down":
+            if last_sl is not None and c < last_sl[0]:
+                markers.append(Marker("bos", "down", i))
+                last_sl = None                       # consumed——等下一個新 pivot low
+            elif last_sh is not None and c > last_sh[0]:
+                markers.append(Marker("choch", "up", i))
+                direction = "up"                     # 首次逆勢 → 反轉
+        else:  # None——首個結構 break 建立趨勢（記做 BOS）
+            if last_sh is not None and c > last_sh[0]:
+                markers.append(Marker("bos", "up", i))
+                direction = "up"
+                last_sh = None
+            elif last_sl is not None and c < last_sl[0]:
+                markers.append(Marker("bos", "down", i))
+                direction = "down"
+                last_sl = None
+        s = i - k
+        if s >= 0:
+            if _is_swing_high(bars, s, k):
+                last_sh = (float(bars[s][2]), s)     # arm 一個新可 break high
+            if _is_swing_low(bars, s, k):
+                last_sl = (float(bars[s][3]), s)     # arm 一個新可 break low
+    return tuple(markers)
