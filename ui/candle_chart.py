@@ -26,7 +26,8 @@ from PySide6.QtWidgets import QWidget
 
 from engine.indicators import (_KZ_LABELS, RefLine, Zone, confluence_zones,
                                daily_reference_lines, detect_breaker_blocks,
-                               detect_fvg, detect_order_blocks, kill_zone_bands)
+                               detect_fvg, detect_order_blocks,
+                               detect_valid_order_blocks, kill_zone_bands)
 from engine.timeutil import bar_key_to_dt
 
 # (time_key, open, high, low, close, volume)
@@ -310,7 +311,7 @@ class CandleChart(QWidget):
     # ------------------------------------------------------------- ICT 指標層
 
     def set_indicator(self, key: str, on: bool) -> None:
-        """開關一個指標圖層（"ob" / "fvg" / "brk" / "kz" / "ref"）；立即重算 + repaint。"""
+        """開關一個指標圖層（"ob" / "fvg" / "vob" / "brk" / "kz" / "ref"）；立即重算 + repaint。"""
         self._indicator_enabled[key] = bool(on)
         self._recompute_zones()
         self.update()
@@ -324,8 +325,9 @@ class CandleChart(QWidget):
         """對全部啟用指標用完整 snapshot 重算偵測結果；冇啟用 → 清空。
 
         Confluence 唔係獨立開關——OB + FVG 同時啟用時自動派生（同向價格區間重疊帶）。
-        KZ bands / ref lines 存獨立狀態（_kz_bands / _ref_lines），唔入 zones dict；
-        任何 recompute 都先重置兩者（toggle off → 清空，唔會殘留舊 band/line）。
+        VOB（有效訂單塊）係獨立圖層——detect_valid_order_blocks() 內部自算 OB+FVG，
+        唔依賴 ob/fvg 開關狀態。KZ bands / ref lines 存獨立狀態（_kz_bands / _ref_lines），
+        唔入 zones dict；任何 recompute 都先重置兩者（toggle off → 清空，唔會殘留舊 band/line）。
         """
         self._kz_bands = ()
         self._ref_lines = ()
@@ -343,6 +345,8 @@ class CandleChart(QWidget):
             zones["ob"] = ob_zones
         if self._indicator_enabled.get("brk"):
             zones["breaker"] = detect_breaker_blocks(self._bars)
+        if self._indicator_enabled.get("vob"):
+            zones["vob"] = detect_valid_order_blocks(self._bars)   # 自含 OB+FVG，獨立於 ob/fvg 開關
         if ob_zones and fvg_zones:
             zones["confluence"] = confluence_zones(ob_zones, fvg_zones)
         if self._indicator_enabled.get("kz"):
@@ -616,10 +620,10 @@ class CandleChart(QWidget):
 
         # --- ICT 指標層（OB / FVG / Breaker / Confluence）：價格錨定矩形畫喺蠟燭上面；zone index 係 global →
         #     visible_slice_range() 映射返 local；完全喺視窗外 / Y 範圍外嘅 zone skip。
-        #     繪製順序 fvg → ob → breaker → confluence（confluence 最上層）
+        #     繪製順序 fvg → ob → breaker → confluence → vob（vob 有效訂單塊最上層）
         if self._zones:
             s0, _e0 = visible_slice_range(self._bars, self._view_count, self._right_offset)
-            for kind in ("fvg", "ob", "breaker", "confluence"):
+            for kind in ("fvg", "ob", "breaker", "confluence", "vob"):
                 for z in self._zones.get(kind, ()):
                     if z.end_idx is not None and z.end_idx < s0:
                         continue                       # 已喺視窗前填補/失效 → skip
@@ -644,6 +648,9 @@ class CandleChart(QWidget):
                     elif kind == "breaker":
                         base = QColor("#4DD0E1")       # cyan accent：失效 OB 翻轉（獨立於 up/down 色）
                         alpha, dash = 70, Qt.SolidLine
+                    elif kind == "vob":
+                        base = QColor("#69F0AE")       # 亮綠：有效訂單塊（三重驗證通過）高優先級
+                        alpha, dash = 45, Qt.SolidLine
                     else:                              # ob
                         base = up_c if z.side == "bullish" else down_c
                         alpha, dash = 80, Qt.SolidLine
@@ -652,7 +659,7 @@ class CandleChart(QWidget):
                     p.setPen(Qt.NoPen)
                     p.setBrush(QBrush(fill))
                     p.drawRect(rect)
-                    p.setPen(QPen(base, 1, dash))
+                    p.setPen(QPen(base, 2 if kind == "vob" else 1, dash))   # vob 加粗邊框強調優先級
                     p.setBrush(Qt.NoBrush)
                     p.drawRect(rect)
 

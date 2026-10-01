@@ -10,6 +10,11 @@
   [min(o,c), max(o,c)] 做矩形。後續 bar close 跌穿 body 遠端邊界 → 失效。
 - **Confluence（共鳴）**：同方向 OB ∩ FVG 價格區間重疊 → 重疊帶高亮
   （兩個開關同時開啟時由 CandleChart 自動派生）。
+- **Valid Order Block（VOB，有效訂單塊）**：通過三重過濾嘅 OB——①前置流動性掃蕩
+  （origin 前 lookback 窗口內有 bar 創下窗口新低/新高且之後到 origin 再冇跌穿/升穿）+
+  ②未失效（body close 穿邊界先算失效，wick 唔算）+ ③同方向 FVG 與 OB body 價格嚴格重疊。
+  矩形畫完整 OB body；end = min(OB 失效、最早匹配 FVG 填補)。HTF 對齊 / LTF CISD
+  計時超出單週期 zone 層範圍（見 README）。
 - **Breaker Block**：「失效咗嘅 OB」——bullish OB 被後續 bar close 跌穿 body 下界後
   翻轉做 bearish 阻力；bearish 對稱（high 升穿上界 → 翻轉 bullish 支持）。矩形 = 原 OB
   body，自失效 bar 向右延伸直到價格收返去 zone 另一邊（mitigation 完成）。
@@ -33,7 +38,7 @@ from datetime import datetime
 class Zone:
     """價格錨定指標矩形。
 
-    kind ∈ {"ob", "fvg", "confluence", "breaker"}；side ∈ {"bullish", "bearish"}。
+    kind ∈ {"ob", "fvg", "confluence", "breaker", "vob"}；side ∈ {"bullish", "bearish"}。
     start_idx = origin bar 嘅 global index（矩形左緣）；end_idx=None 表示仍活躍
     （畫到 plot 右緣），否則喺該 bar 被填補/失效。top/bottom 係價格（top > bottom）。
     """
@@ -208,6 +213,71 @@ def _min_end(a: int | None, b: int | None) -> int | None:
     if a is None or b is None:
         return b if a is None else a
     return min(a, b)
+
+
+def _has_liquidity_sweep(bars, j: int, side: str, lookback: int = 20) -> bool:
+    """前置流動性掃蕩 proxy（valid OB 研究條件①「No sweep, no order block」）。
+
+    窗口 [max(0, j-lookback)..j] 內存在 s < j，其 low（bullish）/ high（bearish）：
+      (a) 創下窗口新低/新高——跌破之前結構（low[s] < min(low[win..s-1])）；且
+      (b) 係終端極值——之後到 origin j 再冇跌穿/升穿（low[s] <= min(low[s+1..j])）。
+    s == win 起點無 prior 結構可比 → 唔計；j==0 / lookback<=0 → False。O(lookback²)。
+    """
+    if j <= 0 or lookback <= 0:
+        return False
+    win = max(0, j - lookback)
+    for s in range(win + 1, j):         # s > win：要有 prior 結構先談得上「掃蕩」
+        if side == "bullish":
+            ext = float(bars[s][3])     # low
+            prior_min = min(float(b[3]) for b in bars[win:s])
+            after_min = min((float(b[3]) for b in bars[s + 1:j + 1]), default=float("inf"))
+            if ext < prior_min and ext <= after_min:
+                return True
+        else:                           # bearish 對稱（high）
+            ext = float(bars[s][2])     # high
+            prior_max = max(float(b[2]) for b in bars[win:s])
+            after_max = max((float(b[2]) for b in bars[s + 1:j + 1]), default=float("-inf"))
+            if ext > prior_max and ext >= after_max:
+                return True
+    return False
+
+
+def detect_valid_order_blocks(bars, sweep_lookback: int = 20) -> tuple[Zone, ...]:
+    """Valid Order Block（VOB）：通過三重過濾嘅 OB。
+
+    ICT valid OB 研究四條件中可單週期實作嘅三個（見 README / AGENTS.md 知識庫）：
+      ① 前置流動性掃蕩——_has_liquidity_sweep() proxy；
+      ② 未失效——ob.end_idx is None（body close 穿邊界 = 失效，wick 唔算）；
+      ③ OB+FVG 共鳴——存在同方向 FVG 與 OB body 價格嚴格重疊。
+    矩形畫**完整 OB body**（唔係重疊帶）——用戶要睇「邊個訂單塊有效」；end_idx =
+    min(OB 失效、最早匹配 FVG 填補)（_min_end）。每個 OB 最多一個 vob zone。
+    """
+    if len(bars) < 2:
+        return ()
+    ob_zones = detect_order_blocks(bars)
+    fvg_zones = detect_fvg(bars)
+    out: list[Zone] = []
+    for ob in ob_zones:
+        if ob.end_idx is not None:      # ② 已失效 → 唔有效（變 Breaker，由 brk 層負責）
+            continue
+        if not _has_liquidity_sweep(bars, ob.start_idx, ob.side, sweep_lookback):
+            continue                    # ① 無前置掃蕩
+        best_end = None                 # 匹配 FVG 中最早嘅 end（None = 到右緣）
+        matched = False
+        for fvg in fvg_zones:           # ③ 同方向 FVG 價格重疊（confluence_zones 公式）
+            if fvg.side != ob.side:
+                continue
+            lo = max(ob.bottom, fvg.bottom)
+            hi = min(ob.top, fvg.top)
+            if hi <= lo:
+                continue                # 無嚴格價格重疊
+            matched = True
+            end_idx = _min_end(ob.end_idx, fvg.end_idx)   # ob 未失效 → 實為 fvg.end
+            if best_end is None or (end_idx is not None and end_idx < best_end):
+                best_end = end_idx
+        if matched:
+            out.append(Zone("vob", ob.side, ob.start_idx, best_end, ob.top, ob.bottom))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------- Kill Zones

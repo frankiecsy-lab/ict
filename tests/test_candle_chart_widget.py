@@ -486,3 +486,58 @@ class TestSecondBatchIndicators:
         )
         assert self._count_in(self._render(ch), QColor("#FFD54F")) > 0
 
+
+class TestVOBIndicator:
+    """VOB 有效訂單塊圖層（Step 2 · Commit 17）：set_indicator("vob") → detect_valid_order_blocks()
+    自含 recompute（獨立於 ob/fvg 開關狀態）；#69F0AE 亮綠係 palette 唯一色 → off=0 / on>0。"""
+
+    @staticmethod
+    def _render(ch, w=800, h=600):
+        ch.resize(w, h)
+        pix = QPixmap(ch.size())
+        ch.render(pix)
+        return pix.toImage()
+
+    @staticmethod
+    def _count_in(img, color) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.pixelColor(x, y) == color:
+                    n += 1
+        return n
+
+    @staticmethod
+    def _vob_bars():
+        """8-bar bullish VOB 序列（同 test_indicators._vob_bullish_bars）：整固 → sweep low 8.9
+        （s=3）→ origin 陰線 j=4 body [9.3,9.6] → trigger i=6 BOS up → FVG@7 [9.5,9.8] 重疊。"""
+        return (
+            ("2026-09-30 09:00", 10.0, 10.2, 9.9, 10.1, 1000.0),   # b0 整固
+            ("2026-09-30 09:01", 10.1, 10.3, 10.0, 10.2, 1000.0),  # b1 整固
+            ("2026-09-30 09:02", 10.2, 10.4, 9.8, 9.9, 1000.0),    # b2 陰線（prior_high=10.4）
+            ("2026-09-30 09:03", 9.9, 10.0, 8.9, 9.5, 1000.0),     # b3 sweep：low 8.9 = 窗口新低
+            ("2026-09-30 09:04", 9.6, 9.7, 9.2, 9.3, 1000.0),      # b4 origin 陰線 → OB body [9.3,9.6]
+            ("2026-09-30 09:05", 9.3, 9.5, 9.2, 9.4, 1000.0),      # b5 小陽 c1（high 9.5 喺 OB 內）
+            ("2026-09-30 09:06", 9.4, 11.2, 9.3, 11.1, 1000.0),    # b6 trigger i=6：BOS up
+            ("2026-09-30 09:07", 11.1, 11.5, 9.8, 11.2, 1000.0),   # b7 → FVG@7 [9.5,9.8] 重疊 OB
+        )
+
+    def test_vob_recomputes_immediately(self):
+        """set_indicator("vob", True) → _zones["vob"] = 完整 OB body（end=None）；toggle off → 清空。"""
+        from engine.indicators import Zone
+        ch = CandleChart(Config())
+        ch.update_bars(self._vob_bars())
+        assert ch._zones == {}                       # 預設全 off
+        ch.set_indicator("vob", True)
+        assert ch._zones["vob"] == (Zone("vob", "bullish", 4, None, 9.6, 9.3),)
+        ch.set_indicator("vob", False)
+        assert ch._zones == {}
+
+    def test_vob_border_pixels_only_when_enabled(self):
+        """#69F0AE（亮綠 VOB 邊框/fill base）palette 唯一色 → off=0 / on>0。"""
+        ch = CandleChart(Config())
+        ch.update_bars(self._vob_bars())
+        assert self._count_in(self._render(ch), QColor("#69F0AE")) == 0
+        ch.set_indicator("vob", True)
+        assert self._count_in(self._render(ch), QColor("#69F0AE")) > 0
+

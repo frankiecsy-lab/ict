@@ -3,6 +3,7 @@
 覆蓋：FVG bullish/bearish/無 gap（touching）/fill/unfilled/multiple；
 OB 觸發 + 最近反向線選擇 + body 邊界 + 失效 + doji skip + weak bar no-trigger + dedup；
 confluence 同向重疊 / 無價格重疊 / 異向排除 / 時間區間無交集 / end 邊界取 min；
+VOB 有效訂單塊 bullish/bearish + 無掃蕩拒收 + FVG 無重疊拒收 + OB 已失效拒收；
 Breaker bullish/bearish OB 翻轉 + mitigation + 冇失效唔算 breaker + dedup；
 Kill Zones EST/EDT（DST）session 分類 + band 分組 + 非 intraday skip；
 Daily ref lines DO 線段 + PH/PL/PC 全寬線 + 單日無 prev day + monthly key skip。
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 from engine.indicators import (RefLine, Zone, confluence_zones, daily_reference_lines,
                                detect_breaker_blocks, detect_fvg, detect_order_blocks,
-                               kill_zone_bands)
+                               detect_valid_order_blocks, kill_zone_bands)
 
 
 def bar(o: float, h: float, l: float, c: float, v: float = 1000.0,
@@ -299,3 +300,58 @@ def test_daily_ref_lines_monthly_keys_skipped():
 def test_daily_ref_lines_empty():
     """空 bars → ()。"""
     assert daily_reference_lines(()) == ()
+
+
+# ---------------------------------------------------------------- Valid Order Blocks (VOB)
+
+def _vob_bullish_bars():
+    """8-bar bullish VOB 序列：整固 → sweep low 8.9（s=3）→ origin 陰線 j=4 body [9.3,9.6]
+    → 小陽 c1（high 9.5 喺 OB 範圍內）→ trigger i=6 BOS up → FVG@7 = [high(b5)=9.5, low(b7)=9.8]。"""
+    return (bar(10.0, 10.2, 9.9, 10.1),   # b0 整固
+            bar(10.1, 10.3, 10.0, 10.2),  # b1 整固
+            bar(10.2, 10.4, 9.8, 9.9),    # b2 陰線（prior_high=10.4）
+            bar(9.9, 10.0, 8.9, 9.5),     # b3 sweep：low 8.9 = 窗口新低且之後再冇跌穿
+            bar(9.6, 9.7, 9.2, 9.3),      # b4 origin 陰線 → OB body [9.3, 9.6]
+            bar(9.3, 9.5, 9.2, 9.4),      # b5 小陽 c1（high 9.5 喺 OB 範圍內）
+            bar(9.4, 11.2, 9.3, 11.1),    # b6 trigger i=6：BOS up（c>10.4）+ body ≥ range/2
+            bar(11.1, 11.5, 9.8, 11.2))   # b7 → bullish FVG@7 [9.5, 9.8] 同 OB 嚴格重疊
+
+
+def test_vob_bullish_valid():
+    """三重過濾全過（sweep + 未失效 + FVG 重疊）→ 完整 OB body vob zone。"""
+    assert detect_valid_order_blocks(_vob_bullish_bars()) == \
+        (Zone("vob", "bullish", 4, None, 9.6, 9.3),)
+
+
+def test_vob_bearish_mirror():
+    """價格軸鏡像序列 → bearish VOB（sweep high 11.1 + origin 陽線 body [10.4,10.7] + FVG@7 重疊）。"""
+    bars = (bar(10.0, 10.1, 9.8, 9.9), bar(9.9, 10.0, 9.7, 9.8),
+            bar(9.8, 10.2, 9.6, 10.1), bar(10.1, 11.1, 10.0, 10.5),
+            bar(10.4, 10.8, 10.3, 10.7), bar(10.7, 10.8, 10.5, 10.6),
+            bar(10.6, 10.7, 8.8, 8.9), bar(8.9, 10.2, 8.5, 8.8))
+    assert detect_valid_order_blocks(bars) == \
+        (Zone("vob", "bearish", 4, None, 10.7, 10.4),)
+
+
+def test_vob_rejected_without_sweep():
+    """b3 low 改 9.7（無窗口新低 → 無流動性掃蕩）→ OB 存在但唔有效。"""
+    bars = _vob_bullish_bars()[:3] + (bar(9.9, 10.0, 9.7, 9.5),) + _vob_bullish_bars()[4:]
+    assert detect_valid_order_blocks(bars) == ()
+
+
+def test_vob_rejected_without_fvg_overlap():
+    """b5 high 改 9.7 → FVG@7 = [9.7, 9.8] 存在但同 OB body [9.3,9.6] 無價格重疊 → 唔有效。"""
+    bars = _vob_bullish_bars()[:5] + (bar(9.3, 9.7, 9.2, 9.4),) + _vob_bullish_bars()[6:]
+    assert detect_valid_order_blocks(bars) == ()
+
+
+def test_vob_rejected_when_ob_invalidated():
+    """加 b8 close=9.1 < bottom 9.3 → OB 已失效（end_idx=8，屬 Breaker 層）→ 唔有效。"""
+    bars = _vob_bullish_bars() + (bar(11.0, 11.1, 9.0, 9.1),)
+    assert detect_valid_order_blocks(bars) == ()
+
+
+def test_vob_empty_and_short():
+    """空 / 單根 → 無 OB 可形成 → ()。"""
+    assert detect_valid_order_blocks(()) == ()
+    assert detect_valid_order_blocks((bar(1, 2, 0.5, 1.5),)) == ()
