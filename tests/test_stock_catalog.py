@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import time
 
-from engine.stock_catalog import (StockCatalog, StockEntry, display_text, name_text,
-                                  register_code_aliases, to_simplified)
+from engine.stock_catalog import (StockCatalog, StockEntry, basic_info_text, display_text,
+                                  name_text, register_code_aliases, to_simplified)
 
 
 def _catalog() -> StockCatalog:
@@ -56,6 +56,28 @@ def test_name_text_en_only():
 
 def test_name_text_no_names_empty():
     assert name_text(StockEntry("HK.HSImain")) == ""
+
+
+# ---------------------------------------------------------------- basic_info
+
+def test_basic_info_both_fields():
+    e = StockEntry("US.AAPL", "苹果", "Apple Inc.", lot_size=1, listing_date="2016-06-09")
+    assert basic_info_text(e) == "每手 1 · 上市 2016-06-09"
+
+
+def test_basic_info_lot_only():
+    e = StockEntry("HK.00700", "腾讯控股", "", lot_size=500, listing_date="")
+    assert basic_info_text(e) == "每手 500"
+
+
+def test_basic_info_listing_only():
+    e = StockEntry("US.MSFT", "", "Microsoft Corp.", lot_size=None, listing_date="1986-03-13")
+    assert basic_info_text(e) == "上市 1986-03-13"
+
+
+def test_basic_info_no_fields_empty():
+    # seed 主力連續合約等無此數據 → 空字串（LABEL 唔顯示）
+    assert basic_info_text(StockEntry("HK.HSImain", "恒指期货主连", "")) == ""
 
 
 # ---------------------------------------------------------------- to_simplified

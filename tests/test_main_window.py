@@ -15,7 +15,7 @@ from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from config import Config  # noqa: E402
-from engine.stock_catalog import StockEntry, display_text, name_text  # noqa: E402
+from engine.stock_catalog import (StockEntry, basic_info_text, display_text, name_text)  # noqa: E402
 import ui.main_window as mw_module  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 
@@ -85,10 +85,11 @@ class FakeStateStore:
 
 
 def _entries():
+    # HK.HSImain 無基本資料（seed 主力連續合約唔喺 API 列表——真實行為）；其餘兩隻有 lot_size/listing_date
     return [
         StockEntry("HK.HSImain", "恒指期货主连", ""),
-        StockEntry("HK.00700", "腾讯控股", "TENCENT"),
-        StockEntry("US.AAPL", "苹果", "Apple Inc."),
+        StockEntry("HK.00700", "腾讯控股", "TENCENT", lot_size=500, listing_date="2004-06-16"),
+        StockEntry("US.AAPL", "苹果", "Apple Inc.", lot_size=1, listing_date="2016-06-09"),
     ]
 
 
@@ -160,6 +161,35 @@ def test_catalog_ready_initializes_name_label(monkeypatch):
     assert win.name_label.text() == ""  # 目錄未載入前空白
     win._on_catalog_ready(_entries())
     assert win.name_label.text() == "恒指期货主连"
+
+
+def test_catalog_ready_initializes_info_label_empty_for_seed(monkeypatch):
+    """catalog_ready → 基本資料行：seed 主力連續合約無 lot_size/listing_date → 空白。"""
+    win, _engine = _make_window(monkeypatch)
+    assert win.info_label.text() == ""  # 目錄未載入前空白
+    win._on_catalog_ready(_entries())
+    assert win.info_label.text() == ""  # HK.HSImain seed 無基本資料
+
+
+def test_do_switch_updates_info_label(monkeypatch):
+    """切換標的 → 基本資料行同步更新（每手股數 · 上市日期）。"""
+    win, _engine = _make_window(monkeypatch)
+    win._on_catalog_ready(_entries())
+    win.code_edit.setText("HK.00700")
+    win._do_switch()
+    assert win.info_label.text() == basic_info_text(_entries()[1])  # "每手 500 · 上市 2004-06-16"
+
+
+def test_unknown_code_clears_name_and_info_labels(monkeypatch):
+    """未知 code → 名稱 + 基本資料兩個 LABEL 都清空。"""
+    win, _engine = _make_window(monkeypatch)
+    win._on_catalog_ready(_entries())
+    win.code_edit.setText("HK.00700")
+    win._do_switch()
+    assert win.info_label.text() == "每手 500 · 上市 2004-06-16"
+    win._update_name_label("HK.NOSUCH")
+    assert win.name_label.text() == ""
+    assert win.info_label.text() == ""
 
 
 def test_zoom_buttons_wired_to_chart(monkeypatch):
@@ -245,6 +275,7 @@ def test_on_code_activated_sets_code_and_name(monkeypatch):
     assert win.code_edit.text() == "US.AAPL"  # 名稱唔入輸入欄
     assert engine.switch_calls == [("US.AAPL", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
     assert win.name_label.text() == name_text(aapl)
+    assert win.info_label.text() == basic_info_text(aapl)  # "每手 1 · 上市 2016-06-09"
 
 
 def test_text_changed_guard_strips_name_on_change(monkeypatch):

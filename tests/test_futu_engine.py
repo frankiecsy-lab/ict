@@ -372,6 +372,53 @@ class TestFetchCatalog:
         assert [e.code for e in entries2] == ["HK.HSImain", "HK.HHImain", "HK.MHImain"]  # dedup：seeds 先入，API row skip
 
 
+class TestFetchCatalogBasicInfo:
+    """lot_size（每手股數/合約乘數）+ listing_date（上市日期）提取——基本資料行數據源。"""
+
+    def test_extracts_lot_size_and_listing_date(self):
+        eng = make_engine()
+        df = pd.DataFrame([dict(code="HK.00700", name="腾讯控股", english_name="",
+                                lot_size=500, listing_date="2004-06-16"),
+                           dict(code="US.AAPL", name="苹果", english_name="Apple Inc.",
+                                lot_size=1, listing_date="2016-06-09")])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        by_code = {e.code: e for e in entries}
+        assert by_code["HK.00700"].lot_size == 500
+        assert by_code["HK.00700"].listing_date == "2004-06-16"
+        assert by_code["US.AAPL"].lot_size == 1
+
+    def test_nan_and_none_basicinfo_cells_cleaned(self):
+        """pandas NaN（float）/ None → lot_size=None、listing_date=""（唔會 "nan" 字串混入）。"""
+        eng = make_engine()
+        df = pd.DataFrame([dict(code="US.X", name="x", english_name="",
+                                lot_size=float("nan"), listing_date=None)])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        by_code = {e.code: e for e in entries}
+        assert by_code["US.X"].lot_size is None
+        assert by_code["US.X"].listing_date == ""
+
+    def test_non_numeric_lot_size_becomes_none(self):
+        eng = make_engine()
+        df = pd.DataFrame([dict(code="US.Y", name="y", english_name="",
+                                lot_size="abc", listing_date="1990-01-01")])
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, df)})
+        entries = eng._fetch_catalog(ctx)
+        by_code = {e.code: e for e in entries}
+        assert by_code["US.Y"].lot_size is None  # 非數字 → None（唔 crash）
+        assert by_code["US.Y"].listing_date == "1990-01-01"
+
+    def test_missing_basicinfo_columns_yield_defaults(self):
+        """df 冇 lot_size/listing_date 欄（舊 schema）→ getattr None → 預設值，唔炸。"""
+        eng = make_engine()
+        ctx = FakeCtx([], basicinfo={Market.US: (RET_OK, basic_df([("US.Z", "z", "")]))})
+        entries = eng._fetch_catalog(ctx)
+        by_code = {e.code: e for e in entries}
+        assert by_code["US.Z"].lot_size is None
+        assert by_code["US.Z"].listing_date == ""
+
+
 # ---------------------------------------------------------------- on_recv_rsp
 
 class TestQuoteHandler:

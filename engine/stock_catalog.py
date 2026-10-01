@@ -41,11 +41,16 @@ def to_simplified(text: str) -> str:
 
 @dataclass(frozen=True)
 class StockEntry:
-    """單隻股票：code 保留 API 返回嘅嚴格大小寫正規形式。"""
+    """單隻股票：code 保留 API 返回嘅嚴格大小寫正規形式。
+
+    lot_size = 每手股數（期貨 = 合約乘數）；listing_date = 'yyyy-MM-dd'（API 已停止維護但仍有返回）。
+    """
 
     code: str
     name_cn: str = ""
     name_en: str = ""
+    lot_size: int | None = None
+    listing_date: str = ""
 
     @property
     def suffix(self) -> str:
@@ -65,6 +70,19 @@ def display_text(e: StockEntry) -> str:
 def name_text(e: StockEntry) -> str:
     """名稱部分（獨立 LABEL 顯示用，輸入欄只留 code）：`中文名 英文名`（空欄位略過、全缺 → 空字串）。"""
     return " ".join(p for p in (e.name_cn, e.name_en) if p)
+
+
+def basic_info_text(e: StockEntry) -> str:
+    """基本資料行（標的輸入欄下方 LABEL）：`每手 N · 上市 yyyy-MM-dd`。
+
+    空欄位略過、全缺 → 空字串（seed 主力連續合約等無此數據時唔顯示）。
+    """
+    parts = []
+    if e.lot_size is not None:
+        parts.append(f"每手 {e.lot_size}")
+    if e.listing_date:
+        parts.append(f"上市 {e.listing_date}")
+    return " · ".join(parts)
 
 
 def register_code_aliases(entries, alias_map: dict[str, str]) -> int:

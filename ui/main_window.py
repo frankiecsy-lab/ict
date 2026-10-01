@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QGridLayout, QHB
 
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
-from engine.stock_catalog import name_text
+from engine.stock_catalog import basic_info_text, name_text
 from engine.ui_state_store import UIStateStore, default_ui_state_path
 from .candle_chart import CandleChart
 from .stock_completer import StockCompleter, code_from_completion
@@ -188,10 +188,10 @@ class MainWindow(QMainWindow):
             self._pane_grid.addWidget(w, r, c)
 
     def _build_control_bar(self):
-        """頂部 control bar：標的編號輸入欄 + K 線週期按鍵組（深色主題跟 cfg 配色）。"""
+        """頂部 control bar（兩行）：第一行 = 標的編號輸入欄 + K 線週期按鍵組；
+        第二行 = 當前標的基本資料 LABEL（每手股數 / 上市日期，深色主題跟 cfg 配色）。"""
         cfg = self._cfg
         bar = QFrame()
-        bar.setFixedHeight(40)
         bar.setStyleSheet(
             f"QFrame {{ background: {cfg.grid_color}; border-bottom: 1px solid {cfg.axis_text_color}; }}"
             f"QLabel {{ color: {cfg.text_color}; font-family: Consolas; padding-left: 8px; }}"
@@ -208,7 +208,10 @@ class MainWindow(QMainWindow):
             f" background: {cfg.last_price_color}; color: {cfg.bg_color};"
             f" border-color: {cfg.last_price_color}; font-weight: bold; }}"
         )
-        h = QHBoxLayout(bar)
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(0, 2, 0, 2)
+        v.setSpacing(2)
+        h = QHBoxLayout()
         h.setContentsMargins(8, 0, 8, 0)
         h.addWidget(QLabel("標的"))
 
@@ -278,6 +281,19 @@ class MainWindow(QMainWindow):
         # bool 版 → zoom_all(False) no-op（踩坑記錄見 AGENTS.md 附錄）；時間空間統一縮放全部可見 pane
         self.zoom_in_btn.clicked.connect(lambda: self._zoom_all(1 / 1.25))
         self.zoom_out_btn.clicked.connect(lambda: self._zoom_all(1.25))
+        v.addLayout(h)
+
+        # 第二行：當前標的基本資料（每手股數 / 上市日期）——目錄載入後由 _update_name_label() 填充；
+        # widget-level stylesheet 覆蓋 bar 級 QLabel 顏色 → 較暗色區分主控制行
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet(
+            f"color: {cfg.axis_text_color}; font-family: Consolas; padding-left: 8px;"
+        )
+        h2 = QHBoxLayout()
+        h2.setContentsMargins(0, 0, 8, 0)
+        h2.addWidget(self.info_label)
+        h2.addStretch(1)
+        v.addLayout(h2)
         return bar
 
     def _desired_periods(self) -> frozenset[str]:
@@ -456,11 +472,13 @@ class MainWindow(QMainWindow):
         self._apply_code_switch(code)
 
     def _update_name_label(self, raw_code: str | None) -> None:
-        """獨立 LABEL 顯示當前標的嘅中英文名（`name_text()`）；目錄未載入/未知 code → 清空。"""
+        """獨立 LABEL 顯示當前標的嘅中英文名（`name_text()`）+ 基本資料行（`basic_info_text()`：
+        每手股數 / 上市日期）；目錄未載入/未知 code → 兩個 LABEL 都清空。"""
         catalog = self._completer.catalog()
         code = catalog.canonical_code(raw_code) if len(catalog) and raw_code else None
         entry = next((e for e in catalog.entries if e.code == code), None)
         self.name_label.setText(name_text(entry) if entry else "")
+        self.info_label.setText(basic_info_text(entry) if entry else "")
 
     def _on_error(self, msg: str) -> None:
         label = QLabel(f"⚠ {msg}")

@@ -113,6 +113,21 @@ def _cell_str(value) -> str:
     s = str(value).strip()
     return "" if s.lower() == "nan" else s
 
+
+def _cell_int(value) -> int | None:
+    """DataFrame cell → int（lot_size 等整數欄位；None/NaN/非數字 → None）。"""
+    if value is None:
+        return None
+    try:
+        if value != value:  # NaN guard（pandas 空欄位）
+            return None
+    except TypeError:
+        pass
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
 # time-only tick 補 fallback date 用嘅市場時區（只影響日曆日期推斷，永遠唔轉換數據 timestamp——時區鐵律不變）
 _MARKET_TZ: dict[str, str] = {
     "HK": "Asia/Hong_Kong",
@@ -705,7 +720,7 @@ class FutuEngine(QObject):
         return rows[-cfg.history_count:]
 
     def _fetch_catalog(self, ctx) -> list[StockEntry]:
-        """Fetch HK+US 股票基本資料（code/name/english_name）→ StockEntry list。
+        """Fetch HK+US 股票基本資料（code/name/english_name/lot_size/listing_date）→ StockEntry list。
 
         Per-market try/except：單一市場失敗唔阻另一邊；重覆 code dedup。
         `code` 保留 API 返回嘅嚴格大小寫正規形式（autocomplete + alias 註冊用）。
@@ -734,6 +749,8 @@ class FutuEngine(QObject):
                     code=code,
                     name_cn=_cell_str(getattr(row, "name", None)),
                     name_en=_cell_str(getattr(row, "english_name", None)),
+                    lot_size=_cell_int(getattr(row, "lot_size", None)),
+                    listing_date=_cell_str(getattr(row, "listing_date", None)),
                 ))
         return entries
 
