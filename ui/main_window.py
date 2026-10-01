@@ -276,6 +276,16 @@ class MainWindow(QMainWindow):
             for i in range(4):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
                 self._pane_grid.removeWidget(self._pane_widgets[i])
             self._layout_panes()
+            # 同步 layout 按鍵 checked 狀態：構造時 default「1」checked，還原 pane count 後要將
+            # 對應按鍵 setChecked(True)（exclusive group 自動 uncheck 其餘）。programmatic
+            # setChecked 唔會 emit clicked → 唔觸發 _on_layout_clicked / save。
+            for btn in self._layout_group.buttons():
+                if btn.text() == str(n):
+                    btn.blockSignals(True)
+                    try:
+                        btn.setChecked(True)
+                    finally:
+                        btn.blockSignals(False)
 
         # per-pane periods：blockSignals——engine 未 start，setCurrentText 唔會觸發 switch
         periods = state.get("periods")

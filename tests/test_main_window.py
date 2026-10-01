@@ -385,8 +385,14 @@ def test_startup_loads_saved_state(monkeypatch):
     # code → 輸入欄 + start(code=...)（engine 用還原嘅標的，唔係 cfg.trading_code）
     assert win.code_edit.text() == "US.AAPL"
     assert engine.start_code == "US.AAPL"
-    # pane count / layout
+    # pane count / layout：_pane_count 還原 + layout 按鍵 checked 狀態同步（「4」checked、「1」uncheck）
     assert win._pane_count == 4
+    btn4 = next(b for b in win._layout_group.buttons() if b.text() == "4")
+    btn1 = next(b for b in win._layout_group.buttons() if b.text() == "1")
+    assert btn4.isChecked()
+    assert not btn1.isChecked()
+    # load 期間唔觸發 save（setChecked 唔 emit clicked → 唔經 _on_layout_clicked）
+    assert win._state_store.saved == []
     # per-pane periods（combo 還原）+ start(periods=...) = 全 pane union
     assert [c.currentText() for c in win._pane_combos] == ["K_5M", "K_15M", "K_30M", "K_60M"]
     assert sorted(engine.start_periods) == ["K_15M", "K_30M", "K_5M", "K_60M"]
@@ -406,6 +412,9 @@ def test_startup_no_saved_state_uses_defaults(monkeypatch):
     assert win.code_edit.text() == "HK.HSImain"   # cfg.trading_code 預設
     assert engine.start_code is None              # → engine fallback cfg.trading_code
     assert win._pane_count == 1
+    # layout 按鍵 default「1」checked（無記憶 → 構造時預設）
+    btn1 = next(b for b in win._layout_group.buttons() if b.text() == "1")
+    assert btn1.isChecked()
     for btn in win._indicator_btns.values():
         assert not btn.isChecked()
 
