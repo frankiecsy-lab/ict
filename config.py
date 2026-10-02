@@ -79,6 +79,15 @@ def _bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _str_list(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Comma-separated 環境變數 → upper-cased tuple；空/未設 → default。"""
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    items = [p.strip().upper() for p in raw.split(",")]
+    return tuple(p for p in items if p) or default
+
+
 @dataclass(frozen=True)
 class Config:
     """不可變運行配置；一律經 from_env() 構造。"""
@@ -105,6 +114,9 @@ class Config:
     text_color: str = "#D6DEE8"
     axis_text_color: str = "#7A8699"
     last_price_color: str = "#FFB020"
+
+    # --- 交易（下單版面）---
+    trd_markets: tuple[str, ...] = ("HK", "US")   # OpenSecTradeContext per-market contexts
 
     debug: bool = False
 
@@ -144,6 +156,7 @@ class Config:
             text_color=_str("TEXT_COLOR", "#D6DEE8"),
             axis_text_color=_str("AXIS_TEXT_COLOR", "#7A8699"),
             last_price_color=_str("LAST_PRICE_COLOR", "#FFB020"),
+            trd_markets=_str_list("TRD_MARKETS", ("HK", "US")),
             debug=_bool("DEBUG", False),
         )
 

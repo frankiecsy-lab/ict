@@ -1,9 +1,10 @@
-"""ICT Trader 入口：Config → QApplication + MainWindow → event loop。
+"""ICT Trader 入口：Config → QApplication + 雙視窗（K 線 + 下單）→ event loop。
 
 - Config.from_env() 失敗（例如未知 KLINE_TYPE）→ 報錯並 exit(1)，唔開窗口；
   windowed build（無 console，sys.stdout is None）改用 QMessageBox 彈出。
 - SIGINT（Ctrl+C）→ 排程 app.quit()，行完 event loop 先 clean shutdown。
-- exec() 返回後 finally window.shutdown()：close OpenD context + join setup thread。
+- 雙視窗默認 windowed（非全屏、可各自拖去不同螢幕）；K 線視窗 F11 切換全屏幕。
+- exec() 返回後 finally 兩個視窗都 shutdown()：close OpenD contexts + join threads。
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from config import Config
 from ui.main_window import MainWindow
+from ui.order_window import OrderWindow
 
 
 def _report_config_error(message: str) -> None:
@@ -42,8 +44,11 @@ def main() -> int:
     )
 
     app = QApplication(sys.argv)
+    # 雙視窗默認 windowed（非全屏）——各自可拖去不同螢幕；K 線視窗 F11 仍可切全屏幕。
     window = MainWindow(cfg)
-    window.showFullScreen()
+    order_window = OrderWindow(cfg)
+    window.show()
+    order_window.show()
 
     def _sigint_handler(signum, frame):  # noqa: ARG001 — signal handler signature
         # Ctrl+C：排程去 GUI event loop quit（唔好喺 signal context 直接做重活）
@@ -55,6 +60,7 @@ def main() -> int:
         return app.exec()
     finally:
         window.shutdown()
+        order_window.shutdown()
 
 
 if __name__ == "__main__":

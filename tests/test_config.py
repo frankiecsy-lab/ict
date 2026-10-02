@@ -13,7 +13,7 @@ _ALL_KEYS = [
     "FUTU_OPEND_HOST", "FUTU_OPEND_PORT", "TRADING_CODE", "KLINE_TYPE",
     "HISTORY_COUNT", "VISIBLE_BARS", "CONVENTION", "COLOR_UP", "COLOR_DOWN",
     "BG_COLOR", "GRID_COLOR", "TEXT_COLOR", "AXIS_TEXT_COLOR",
-    "LAST_PRICE_COLOR", "DEBUG",
+    "LAST_PRICE_COLOR", "TRD_MARKETS", "DEBUG",
 ]
 
 
@@ -40,6 +40,7 @@ def test_defaults(tmp_path):
     assert cfg.convention == "HK"
     assert cfg.color_up is None
     assert cfg.color_down is None
+    assert cfg.trd_markets == ("HK", "US")
     assert cfg.debug is False
 
 
@@ -129,3 +130,23 @@ def test_config_is_frozen():
     cfg = Config()
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.trading_code = "US.AAPL"
+
+
+def test_trd_markets_default(tmp_path):
+    """未設 TRD_MARKETS → 預設 ("HK", "US")。"""
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert cfg.trd_markets == ("HK", "US")
+
+
+def test_trd_markets_env_parsing(monkeypatch, tmp_path):
+    """Comma-separated + 空白/小寫 → strip、upper；空 token 剔除。"""
+    monkeypatch.setenv("TRD_MARKETS", "us, hk ,JP")
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert cfg.trd_markets == ("US", "HK", "JP")
+
+
+def test_trd_markets_empty_falls_back_to_default(monkeypatch, tmp_path):
+    """全空白/逗號 → 無有效 token → 回落預設。"""
+    monkeypatch.setenv("TRD_MARKETS", ", ,")
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert cfg.trd_markets == ("HK", "US")
