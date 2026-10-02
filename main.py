@@ -50,6 +50,7 @@ def main() -> int:
     # 跨視窗同步：K 綫標的切換 → 下單代碼；最新收市價 → 跟隨市價（auto-queue 跨 thread）
     window.code_changed.connect(order_window.set_symbol)
     window.last_price.connect(order_window.follow_price)
+    window.catalog_ready.connect(order_window.set_stock_catalog)   # Commit 31：股票目錄 → 下單代碼補全/驗證
     order_window.set_symbol(window.code_edit.text())   # 初始同步一次（UI-state restored code）
     window.show()
     order_window.show()

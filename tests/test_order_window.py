@@ -70,7 +70,7 @@ def test_default_state_is_locked(monkeypatch):
     w, _ = _make_window(monkeypatch)
     assert w._pin_holder is None
     assert w._place_btn.isEnabled() is False
-    for widget in (w._order_code, w._side_combo, w._order_price, w._order_qty):
+    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_price, w._order_qty):   # Commit 31：買賣按鍵跟隨鎖狀態
         assert widget.isEnabled() is False
     assert w._unlock_btn.isEnabled() is True
     assert w._pin_edit.isEnabled() is True
@@ -83,7 +83,7 @@ def test_unlock_with_valid_pin_enables_trading(monkeypatch):
 
     assert w._pin_holder is not None
     assert w._place_btn.isEnabled() is True
-    for widget in (w._order_code, w._side_combo, w._order_qty):
+    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_qty):   # Commit 31：買賣按鍵跟隨鎖狀態
         assert widget.isEnabled() is True
     # 價格欄：follow mode（默認）→ 解鎖後仍 disabled（由市價驅動）；manual mode 需解鎖先可輸入
     assert w._following is True and w._order_price.isEnabled() is False
@@ -167,14 +167,16 @@ def test_positions_table_populated(monkeypatch):
 
     table = w._pos_table
     assert table.rowCount() == 2
+    assert table.columnCount() == 12, "Commit 31：持倉表加「帳戶」欄 → 12 欄"
     assert table.item(0, 0).text() == "HK.00700"
-    assert table.item(0, 3).text() == "100"      # %g 格式
-    assert table.item(0, 9).text() == "150.00"   # 今日盈虧（APP 對齊 today_pl_val）
-    assert table.item(0, 10).text() == "+6.67%"  # pl_ratio 已是百分數
-    assert table.item(1, 8).text() == "-100.00"
+    assert table.item(0, 3).text() == "0·實"     # Commit 31：帳戶欄（acc_id=0 / REAL → 「0·實」）
+    assert table.item(0, 4).text() == "100"      # %g 格式
+    assert table.item(0, 10).text() == "150.00"  # 今日盈虧（APP 對齊 today_pl_val）
+    assert table.item(0, 11).text() == "+6.67%"  # pl_ratio 已是百分數
+    assert table.item(1, 9).text() == "-100.00"
 
-    up = table.item(0, 8).foreground().color().name()
-    down = table.item(1, 8).foreground().color().name()
+    up = table.item(0, 9).foreground().color().name()
+    down = table.item(1, 9).foreground().color().name()
     assert up != down, "盈虧正負應有不同顏色"
 
 
@@ -308,7 +310,7 @@ def test_place_order_dispatches_to_engine(monkeypatch):
     _unlock(w, pin="246810")
 
     w._order_code.setText("HK.00700")
-    w._side_combo.setCurrentIndex(0)   # 買入
+    assert w._buy_btn.isChecked() is True        # Commit 31：默認買入（彩色按鍵取代 combo）
     w._order_price.setValue(55.5)      # QDoubleSpinBox（programmatic setValue 唔受 disabled 影響）
     w._order_qty.setText("200")
     w._on_place_order()
@@ -324,7 +326,7 @@ def test_place_order_sell_side(monkeypatch):
     _unlock(w)
 
     w._order_code.setText("US.AAPL")
-    w._side_combo.setCurrentIndex(1)   # 賣出
+    w._sell_btn.setChecked(True)      # Commit 31：賣出按鍵（exclusive group → buy 自動 uncheck）
     w._order_price.setValue(140.25)
     w._order_qty.setText("10")
     w._on_place_order()
@@ -460,3 +462,137 @@ def test_non_active_accounts_hidden_from_cards(monkeypatch):
     assert len(w._env_card_lists["REAL"]) == 1
     texts = "\n".join(l.text() for l in w.findChildren(QLabel))
     assert "2 · MARGIN" not in texts
+
+
+# ------------------------------------------------------------- Commit 31：帳戶卡撳選過濾 / 代碼補全驗證 / 買賣按鍵
+
+def test_positions_table_account_column_dual_env(monkeypatch):
+    """Commit 31：「帳戶」欄 = acc_id·實/模（雙 env 標記，SIMULATE → 「模」）。"""
+    rows = (
+        PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0, 6.67, 150.0,
+                    acc_id=7, trd_env="REAL"),
+        PositionRow("US.AAPL", "Apple", "US", 10, 10, 150.0, 140.0, 1400.0, -100.0, -6.67, -20.0,
+                    acc_id=9, trd_env="SIMULATE"),
+    )
+    w, fake = _make_window(monkeypatch)
+    fake.positions_updated.emit(rows)
+
+    table = w._pos_table
+    assert table.item(0, 3).text() == "7·實"
+    assert table.item(1, 3).text() == "9·模"
+
+
+def test_account_card_click_filters_positions(monkeypatch):
+    """Commit 31：撳帳戶卡 → 持倉過濾該帳戶；再撳同一張卡 = 取消選取顯示全部。"""
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1), _acc(2)))
+
+    rows = (
+        PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0, 6.67, 150.0,
+                    acc_id=1, trd_env="REAL"),
+        PositionRow("US.AAPL", "Apple", "US", 10, 10, 150.0, 140.0, 1400.0, -100.0, -6.67, -20.0,
+                    acc_id=2, trd_env="REAL"),
+    )
+    fake.positions_updated.emit(rows)
+    assert w._pos_table.rowCount() == 2
+
+    # 撳卡 1 → 只剩帳戶 1 持倉（_select_account 即刻用 cached snapshot 重繪）
+    w._select_account(("REAL", 1))
+    assert w._selected_acc == ("REAL", 1)
+    assert w._pos_table.rowCount() == 1
+    assert w._pos_table.item(0, 0).text() == "HK.00700"
+
+    # 新 snapshot 到達 → 仍經已選帳戶過濾（filter 係持久狀態）
+    fake.positions_updated.emit(rows + rows[:1])   # 3 行：acc1×2 + acc2
+    assert w._pos_table.rowCount() == 2, "新 snapshot 都要過 filter"
+
+    # 再撳同一張卡 → 取消選取 = 顯示全部
+    w._select_account(("REAL", 1))
+    assert w._selected_acc is None
+    fake.positions_updated.emit(rows)
+    assert w._pos_table.rowCount() == 2
+
+
+def test_selected_account_reset_when_accounts_change(monkeypatch):
+    """Commit 31：帳戶列表更新（例如 OpenD 重連）→ 已選卡唔存在 → 自動取消選取。"""
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1),))
+    w._select_account(("REAL", 1))
+    assert w._selected_acc == ("REAL", 1)
+
+    fake.accounts_updated.emit((_acc(2),))   # 帳戶 1 消失
+    assert w._selected_acc is None, "stale selection 必須清空"
+
+
+def test_set_stock_catalog_populates_completer(monkeypatch):
+    """Commit 31：catalog_ready → set_stock_catalog（同 K 綫圖同源）；mapping = display_text → canonical code。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    entries = (StockEntry("HK.00700", "騰訊控股", "Tencent"), StockEntry("US.AAPL", "", "Apple"))
+    w.set_stock_catalog(entries)
+
+    assert len(w._code_completer.catalog()) == 2
+    # display_text（雙空格 join）→ canonical code mapping
+    assert w._code_by_text["HK.00700  騰訊控股  Tencent"] == "HK.00700"
+
+
+def test_code_activated_and_guard_strip_to_bare_code(monkeypatch):
+    """Commit 31：dropdown activated / onChange guard → 輸入欄只留純 code（同 K 綫圖一致）。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "Tencent"),))
+
+    # dropdown activated：完整 display_text → mapping hit → 純 code
+    w._on_code_activated("HK.00700  騰訊控股  Tencent")
+    assert w._order_code.text() == "HK.00700"
+
+    # onChange guard：含空白文本（code + 名稱混入）→ 剝離返第一 token
+    w._order_code.setText("US.AAPL Apple Inc")   # 模擬 completer 寫入完整字串
+    assert w._order_code.text() == "US.AAPL"
+
+
+def test_place_order_catalog_validation(monkeypatch):
+    """Commit 31：目錄已載入 → 未知代碼拒絕 + 已知代碼正規化大小寫；未載入 → 放行俾 engine/OpenD。"""
+    from engine.stock_catalog import StockEntry
+
+    w, fake = _make_window(monkeypatch)
+    _unlock(w)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "Tencent"),))
+
+    # 未知代碼 → 拒絕（唔 dispatch）
+    w._order_code.setText("XX.99999")
+    w._order_price.setValue(10.0)
+    w._order_qty.setText("5")
+    w._on_place_order()
+    assert fake.order_calls == []
+    assert "股票編號唔存在" in w._status_label.text()
+
+    # 已知代碼（小寫輸入）→ 正規化 canonical HK.00700 + dispatch
+    w._order_code.setText("hk.00700")
+    w._on_place_order()
+    assert fake.order_calls[0][0] == "HK.00700"
+
+    # 目錄未載入（新視窗）→ 放行俾 engine/OpenD 最終校驗
+    w2, fake2 = _make_window(monkeypatch)
+    _unlock(w2)
+    w2._order_code.setText("SG.D05")
+    w2._order_price.setValue(1.0)
+    w2._order_qty.setText("1")
+    w2._on_place_order()
+    assert fake2.order_calls[0][0] == "SG.D05"
+
+
+def test_buy_sell_buttons_exclusive_and_follow_pin(monkeypatch):
+    """Commit 31：買賣按鍵 exclusive（QButtonGroup）+ 跟隨 PIN 鎖狀態。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._buy_btn.isChecked() is True and w._sell_btn.isChecked() is False   # 默認買入
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False  # LOCKED
+
+    _unlock(w)
+    assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True
+
+    # exclusive：check sell → buy 自動 uncheck
+    w._sell_btn.setChecked(True)
+    assert w._sell_btn.isChecked() is True and w._buy_btn.isChecked() is False

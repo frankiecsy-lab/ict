@@ -37,6 +37,7 @@ class FakeEngine(QObject):
     connection_state = Signal(bool, float)   # (connected, latency_ms) — 右下角連線狀態 + 延遲
     smt_history_ready = Signal(str, tuple)   # (period, bars) — SMT Divergence 配對副標的 seed snapshot
     smt_bars_changed = Signal(str, tuple)    # (period, bars) — SMT tick 聚合更新
+    tick_data = Signal(tuple)                # Commit 31：逐筆成交 batch（time/price/vol/direction/type）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -109,6 +110,11 @@ def _make_window(monkeypatch, saved_state: dict | None = None) -> tuple[MainWind
     return win, engine
 
 
+# Commit 31：6 pane 常駐（show/hide）→ _desired_periods() = 全 6 combo union（與可見性無關）。
+# 預設 combos：pane0=K_1M（cfg）、pane i=KLINE_TYPES[i] → union = 以下 sorted tuple。
+_SIX_PANE_PERIODS = ("K_15M", "K_1M", "K_30M", "K_3M", "K_5M", "K_60M")
+
+
 def test_do_switch_rejects_name_in_field(monkeypatch):
     """輸入欄含名稱（空白分隔）→ onChange guard 即刻剝離返純 code，_do_switch 對純 code 正常切換。"""
     win, engine = _make_window(monkeypatch)
@@ -117,7 +123,7 @@ def test_do_switch_rejects_name_in_field(monkeypatch):
     # guard 已將欄位剝離返純 code（名稱唔會殘留）
     assert win.code_edit.text() == "HK.00700"
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
+    assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
 
 
 def test_do_switch_rejects_empty_field(monkeypatch):
@@ -142,7 +148,7 @@ def test_do_switch_valid_code_normalizes_case_and_updates_name(monkeypatch):
     win._on_catalog_ready(_entries())
     win.code_edit.setText("hk.00700")
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
+    assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
     assert win.code_edit.text() == "HK.00700"
     assert win.name_label.text() == name_text(_entries()[1])  # "腾讯控股 TENCENT"
 
@@ -152,7 +158,7 @@ def test_do_switch_before_catalog_passthrough(monkeypatch):
     win, engine = _make_window(monkeypatch)
     win.code_edit.setText("HK.00700")
     win._do_switch()
-    assert engine.switch_calls == [("HK.00700", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
+    assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
 
 
 def test_catalog_ready_initializes_name_label(monkeypatch):
@@ -247,7 +253,8 @@ def test_pane_period_change_pushes_active_snapshot(monkeypatch):
         def bars(self): return five_bars
 
     class _State:
-        periods = frozenset({"K_1M", "K_5M", "K_15M"})
+        # Commit 31：desired = 全 6 pane union；pane1 K_3M→K_5M 後 K_3M 消失 → {K_1M,K_5M,K_15M,K_30M,K_60M}
+        periods = frozenset({"K_1M", "K_5M", "K_15M", "K_30M", "K_60M"})
         aggregators = {"K_5M": _Agg()}
 
     engine.state = _State()
@@ -278,7 +285,7 @@ def test_on_code_activated_sets_code_and_name(monkeypatch):
     aapl = entries[2]
     win._on_code_activated(display_text(aapl))
     assert win.code_edit.text() == "US.AAPL"  # 名稱唔入輸入欄
-    assert engine.switch_calls == [("US.AAPL", ("K_15M", "K_1M", "K_3M", "K_5M"))]  # sorted() 字典序
+    assert engine.switch_calls == [("US.AAPL", _SIX_PANE_PERIODS)]  # sorted() 字典序
     assert win.name_label.text() == name_text(aapl)
     assert win.info_label.text() == basic_info_text(aapl)  # "每手 1 · 上市 2016-06-09"
 
@@ -435,7 +442,8 @@ def test_startup_loads_saved_state(monkeypatch):
     saved = {
         "code": "US.AAPL",
         "pane_count": 4,
-        "periods": ["K_5M", "K_15M", "K_30M", "K_60M"],
+        # Commit 31：6 pane 常駐 → periods 必須 6 元素（len != len(_pane_combos) → 整組忽略）
+        "periods": ["K_5M", "K_15M", "K_30M", "K_60M", "K_1M", "K_3M"],
         "indicators": ["ob", "fvg"],
     }
     win, engine = _make_window(monkeypatch, saved_state=saved)
@@ -450,9 +458,9 @@ def test_startup_loads_saved_state(monkeypatch):
     assert not btn1.isChecked()
     # load 期間唔觸發 save（setChecked 唔 emit clicked → 唔經 _on_layout_clicked）
     assert win._state_store.saved == []
-    # per-pane periods（combo 還原）+ start(periods=...) = 全 pane union
-    assert [c.currentText() for c in win._pane_combos] == ["K_5M", "K_15M", "K_30M", "K_60M"]
-    assert sorted(engine.start_periods) == ["K_15M", "K_30M", "K_5M", "K_60M"]
+    # per-pane periods（combo 還原，全 6 pane）+ start(periods=...) = 全 pane union
+    assert [c.currentText() for c in win._pane_combos] == saved["periods"]
+    assert sorted(engine.start_periods) == ["K_15M", "K_1M", "K_30M", "K_3M", "K_5M", "K_60M"]
     # indicator toggles（button checked + 全部 pane enabled）
     assert win._indicator_btns["ob"].isChecked()
     assert win._indicator_btns["fvg"].isChecked()
@@ -614,3 +622,102 @@ def test_last_price_not_emitted_on_empty_or_smt(monkeypatch):
 
     win._on_smt_bars("K_1M", _bars_with_close(99.0))   # SMT handler → 無 last_price emit
     assert prices == []
+
+
+# ------------------------------------------------------------- Commit 31：六圖版面 + 逐筆成交面板
+
+def test_six_pane_layout_3_columns_x_2_rows(monkeypatch):
+    """Commit 31：6-pane = 水平 3 × 垂直 2（divmod(i, 3)）；layout 按鍵組含「6」；全 6 pane 可見。"""
+    win, _engine = _make_window(monkeypatch)
+    btn6 = next(b for b in win._layout_group.buttons() if b.text() == "6")
+    assert btn6 is not None, "layout 按鍵組必須包含「6」"
+    btn6.click()
+
+    assert win._pane_count == 6
+    for i in range(6):
+        # isHidden()（explicit hide flag）——isVisible() 會因 top-level window 未 show 而 False
+        assert not win._pane_widgets[i].isHidden(), f"pane {i} 應可見"
+    # grid 位置 = divmod(i, 3)：pane0=(0,0) … pane5=(1,2)
+    for i in range(6):
+        r, c = divmod(i, 3)
+        assert win._pane_grid.itemAtPosition(r, c).widget() is win._pane_widgets[i]
+
+
+def test_tick_feed_buffers_and_flushes_newest_first(monkeypatch):
+    """Commit 31：tick_data → buffer 累積；flush 最新喺頂（row 0）、最舊喺底；buffer flush 後清空。"""
+    win, engine = _make_window(monkeypatch)
+
+    ticks = (
+        ("2026-10-02 09:30:01", 55.5, 100, "BUY", "AUTO_MATCH"),
+        ("2026-10-02 09:30:02", 55.6, 200, "SELL", "AUTO_MATCH"),
+        ("2026-10-02 09:30:03", 55.7, 50, "NEUTRAL", "LATE"),
+    )
+    engine.tick_data.emit(ticks)   # 同線程 → direct connection（offscreen 無 event loop spin）
+    assert len(win._tick_buffer) == 3
+
+    win._flush_ticks()             # 手動 flush（唔等 100ms timer）
+    t = win._tick_table
+    assert t.rowCount() == 3
+    assert t.item(0, 0).text() == "09:30:03"   # 最新喺頂（完整 timestamp → HH:MM:SS）
+    assert t.item(2, 0).text() == "09:30:01"   # 最舊喺底
+    assert t.item(0, 1).text() == "55.7"       # 價格格式（:.4f rstrip 0）
+    assert t.item(0, 2).text() == "50"         # 數量 %g
+    assert win._tick_buffer == []              # flush 後 buffer 清空
+
+
+def test_tick_row_buy_sell_background_colors(monkeypatch):
+    """Commit 31：BUY = 深綠底 / SELL = 深紅底（整行）+ 方向欄亮字；NEUTRAL 無特殊背景。"""
+    win, _engine = _make_window(monkeypatch)
+
+    t = win._tick_table
+    t.setRowCount(3)
+    MainWindow._fill_tick_row(t, 0, ("2026-10-02 09:30:01", 55.5, 100, "BUY", "AUTO_MATCH"))
+    MainWindow._fill_tick_row(t, 1, ("2026-10-02 09:30:02", 55.4, 200, "SELL", "AUTO_MATCH"))
+    MainWindow._fill_tick_row(t, 2, ("2026-10-02 09:30:03", 55.5, 50, "NEUTRAL", "LATE"))
+
+    assert t.item(0, 0).background().color().name() == "#0f3d23"   # BUY 深綠
+    assert t.item(1, 0).background().color().name() == "#4a1420"   # SELL 深紅
+    assert t.item(0, 3).text() == "主買" and t.item(1, 3).text() == "主賣"
+    assert t.item(0, 3).foreground().color().name() == "#69f0ae"   # BUY 方向欄亮字
+    neutral_bg = t.item(2, 0).background().color().name()
+    assert neutral_bg not in ("#0f3d23", "#4a1420"), "NEUTRAL 唔應該有主買/主賣背景"
+
+
+def test_tick_feed_caps_at_max_rows(monkeypatch):
+    """Commit 31：buffer + table 都 cap _TICK_MAX_ROWS（超出由最舊端丟棄/刪除）。"""
+    win, engine = _make_window(monkeypatch)
+
+    ticks = tuple((f"2026-10-02 09:{i // 60:02d}:{i % 60:02d}", 55.0 + i * 0.01, 1, "BUY", "AUTO_MATCH")
+                  for i in range(mw_module._TICK_MAX_ROWS + 100))   # 600 筆 burst（MAX=500）
+    engine.tick_data.emit(ticks)
+    assert len(win._tick_buffer) == mw_module._TICK_MAX_ROWS       # buffer cap：丟最舊 100
+
+    win._flush_ticks()
+    t = win._tick_table
+    assert t.rowCount() == mw_module._TICK_MAX_ROWS
+    assert t.item(0, 0).text() == "09:09:59"   # row 0 = 最新（i=599）
+    assert t.item(mw_module._TICK_MAX_ROWS - 1, 0).text() == "09:01:40"   # 底 = 保留嘅最舊（i=100）
+
+
+def test_clear_tick_feed_on_code_switch(monkeypatch):
+    """Commit 31：標的切換 → _clear_tick_feed（buffer + table 清空）。"""
+    win, engine = _make_window(monkeypatch)
+    engine.tick_data.emit((("2026-10-02 09:30:01", 55.5, 100, "BUY", "AUTO_MATCH"),))
+    win._flush_ticks()
+    assert win._tick_table.rowCount() == 1
+
+    win.code_edit.setText("US.AAPL")
+    win._do_switch()   # catalog 空 → 放行 → _apply_code_switch → 清空逐筆面板
+    assert win._tick_table.rowCount() == 0
+    assert win._tick_buffer == []
+
+
+def test_catalog_ready_reemits_for_order_window(monkeypatch):
+    """Commit 31：engine catalog_ready → MainWindow re-emit catalog_ready（→ OrderWindow StockCompleter）。"""
+    win, _engine = _make_window(monkeypatch)
+    got: list[tuple] = []
+    win.catalog_ready.connect(got.append)
+
+    entries = tuple(_entries())
+    win._on_catalog_ready(entries)
+    assert got == [entries], "catalog_ready 必須原樣 re-emit（OrderWindow 同源目錄）"

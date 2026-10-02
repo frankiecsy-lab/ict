@@ -43,6 +43,8 @@ from futu import (
     OpenQuoteContext,
     StockQuoteHandlerBase,
     SubType,
+    TickerDirect,
+    TickerHandlerBase,
 )
 
 from config import kline_period_minutes
@@ -181,6 +183,16 @@ def _logged_in_flag(value) -> bool:
     return str(value).strip().lower() in ("1", "true")
 
 
+def _subtype_enum(name: str):
+    """訂閱帳本 / query_subscription 嘅 subtype 名（"QUOTE"/"TICKER"…）→ SubType 常數。
+
+    SDK 實測 SubType 常數係純字串（SubType.QUOTE == "QUOTE"），但經 getattr 映射兜底
+    未來 SDK 改 enum；未知名 → QUOTE fallback（reconcile 清理用，唔會誤清其他 subtype）。
+    """
+    st = getattr(SubType, str(name).upper(), None)
+    return st if isinstance(st, str) else SubType.QUOTE
+
+
 class _QuoteHandler(StockQuoteHandlerBase):
     """QUOTE push 回調：parse tick → 聚合入蠟燭 → emit bars_changed 新 snapshot。"""
 
@@ -234,6 +246,55 @@ class _QuoteHandler(StockQuoteHandlerBase):
         return ret_code, data
 
 
+class _TickerHandler(TickerHandlerBase):
+    """TICKER push 回調（Commit 31）：parse 逐筆成交 → emit tick_data snapshot。
+
+    SDK `TickerHandlerBase.on_recv_rsp` 返回 `(ret, DataFrame)`，欄位 = code/name/time/price/volume/
+    turnover/ticker_direction/sequence/type/push_data_type——**ticker_direction 同 type 已係字串**
+    （SDK 內部經 TickerDirect.to_string2 / TickerType.to_string2 映射：'BUY'/'SELL'/'NEUTRAL'、
+    'AUTO_MATCH'/'LATE'/…；無值 → 'N/A'）。`time` = 完整成交時間字串（唔似 QUOTE 嘅 time-only）。
+
+    只保留當前主標的（state.code）——SMT 副標的 / 切換後舊標的 in-flight push 一律 skip
+    （同 _QuoteHandler code routing 一致；unsubscribe 唔係硬停）。
+    """
+
+    def __init__(self, engine: "FutuEngine") -> None:
+        super().__init__()
+        self._engine = engine
+
+    def on_recv_rsp(self, rsp_pb):  # noqa: N802 (SDK naming)
+        ret_code, data = super().on_recv_rsp(rsp_pb)
+        eng = self._engine
+        if ret_code != RET_OK or data is None:
+            if not eng._closed:
+                eng.error.emit(f"TICKER push 異常: ret={ret_code}")
+            return ret_code, data
+        state = eng._state  # 每 batch load 一次（GIL-atomic reference）
+        if state is None:
+            return ret_code, data
+        rows: list[tuple[str, float, float, str, str]] = []
+        for row in data.itertuples(index=False):
+            if getattr(row, "code", None) != state.code:   # 只主標的（副標的 / 舊 push → skip）
+                continue
+            try:
+                price = float(getattr(row, "price", 0.0))
+                volume = float(getattr(row, "volume", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not price > 0:   # NaN guard：nan > 0 係 False → skip
+                continue
+            rows.append((
+                str(getattr(row, "time", "") or ""),                    # 成交時間（完整字串）
+                price,                                                 # 成交價
+                volume,                                                # 成交量
+                str(getattr(row, "ticker_direction", "") or ""),       # BUY/SELL/NEUTRAL/N/A
+                str(getattr(row, "type", "") or ""),                   # AUTO_MATCH/LATE/…/N/A
+            ))
+        if rows and state is eng._state:   # batch 中途 state 被 swap → 呢批 discard
+            eng.tick_data.emit(tuple(rows))
+        return ret_code, data
+
+
 class FutuEngine(QObject):
     """futu 行情 pipeline 嘅 QObject 包裝。
 
@@ -243,6 +304,8 @@ class FutuEngine(QObject):
     - smt_history_ready / smt_bars_changed: SMT Divergence 配對副標的嘅 seed / tick snapshot（同 (period, bars)）
     - status(str) / error(str)
     - connection_state(bool, float): (connected, latency_ms) 定時 ping get_global_state RTT（右下角狀態）
+    - tick_data(tuple[(str,float,float,str,str)]): 主標的逐筆成交 batch——(time, price, volume, direction, type)
+      （Commit 31：報價頁左側全高逐筆面板；direction = BUY/SELL/NEUTRAL → 主買/主賣背景色）
 
     運行時切換：switch(code=None, periods=None, smt=None) spawn worker thread——code 變先 unsubscribe/subscribe、
     periods 變先 fetch+seed 差集；smt=True/False 啟用/停用 SMT 配對副標的（雙訂閱）。全部驗證通過先 swap
@@ -257,6 +320,7 @@ class FutuEngine(QObject):
     error = Signal(str)
     catalog_ready = Signal(tuple)   # tuple[StockEntry]：HK+US 股票目錄（fuzzy autocomplete 用）
     connection_state = Signal(bool, float)   # (connected, latency_ms)：定時 ping RTT（右下角連線狀態 + 延遲）
+    tick_data = Signal(tuple)   # tuple[(time_str, price, volume, direction, type)]：主標的逐筆成交 batch（Commit 31）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -420,6 +484,15 @@ class FutuEngine(QObject):
                         self._ensure_store().add(c)  # re-subscribe 成功 → 帳本重新計時
             except Exception:  # noqa: BLE001 — rollback 唔好 propagate
                 logger.exception("rollback resubscribe exception")
+            # TICKER（Commit 31）：主標的一併 resubscribe（非致命——失敗只係逐筆面板暫停，reconcile 兜底）
+            try:
+                ret_tk, info_tk = ctx.subscribe([code], [SubType.TICKER])
+                if ret_tk == RET_OK:
+                    self._ensure_store().add(code, "TICKER")
+                else:
+                    logger.warning("rollback TICKER resubscribe %s 失敗（非致命）: %s", code, info_tk)
+            except Exception:  # noqa: BLE001 — 同上
+                logger.exception("rollback TICKER resubscribe exception")
         if not self._closed:
             self.error.emit(f"切換失敗：{msg}")
 
@@ -460,6 +533,15 @@ class FutuEngine(QObject):
                         self._ensure_store().remove(old_state.code)
                 except Exception:  # noqa: BLE001 — unsubscribe 失敗唔阻切換（code filter 兜底）
                     logger.exception("unsubscribe exception")
+                # TICKER（Commit 31）：舊主標的一併 unsub（非致命——失敗保留 pending，reconcile 稍後重試）
+                try:
+                    ret_tk, info_tk = ctx.unsubscribe([old_state.code], [SubType.TICKER])
+                    if ret_tk == RET_OK:
+                        self._ensure_store().remove(old_state.code, "TICKER")
+                    else:
+                        logger.warning("unsubscribe TICKER %s 失敗（pending）: %s", old_state.code, info_tk)
+                except Exception:  # noqa: BLE001 — 同上
+                    logger.exception("unsubscribe TICKER exception")
             if old_state.smt_code is not None and smt_target is None:
                 try:
                     ret, info = ctx.unsubscribe([old_state.smt_code], [SubType.QUOTE])
@@ -520,6 +602,15 @@ class FutuEngine(QObject):
                     self._rollback(old_state.code, f"subscribe {new_code} 失敗: {sub_info}", old_state.smt_code)
                     return
                 self._ensure_store().add(new_code)   # 新訂閱入帳本（re-subscribe 同 code → 重新計時）
+                # TICKER（Commit 31）：新主標的逐筆訂閱（非致命——失敗只係逐筆面板空，K 線照常）
+                try:
+                    ret_tk, info_tk = ctx.subscribe([new_code], [SubType.TICKER])
+                    if ret_tk == RET_OK:
+                        self._ensure_store().add(new_code, "TICKER")
+                    else:
+                        logger.warning("subscribe TICKER %s 失敗（非致命）: %s", new_code, info_tk)
+                except Exception:  # noqa: BLE001 — TICKER 失敗唔阻切換
+                    logger.exception("subscribe TICKER exception")
             if smt_target is not None and old_state.smt_code != smt_target:
                 ret, sub_info = ctx.subscribe([smt_target], [SubType.QUOTE])
                 if ret != RET_OK:
@@ -611,8 +702,12 @@ class FutuEngine(QObject):
             self._reconcile_timer = timer
         timer.start()
 
-    def _query_open_subscriptions(self, ctx) -> set[str] | None:
-        """query_subscription() → OpenD 端實際訂閱緊嘅 code 集合；失敗/異常 → None（對帳跳過）。"""
+    def _query_open_subscriptions(self, ctx) -> dict[str, list[str]] | None:
+        """query_subscription() → OpenD 端實際訂閱緊嘅 code→[subtypes] 映射；失敗/異常 → None（對帳跳過）。
+
+        Commit 31：由 set[codes] 升級做 per-code subtype 列表——reconcile unsubscribe 要帶正確
+        SubType（TICKER 洩漏唔可以淨係 unsub QUOTE）。sub_list key = subtype 名（"QUOTE"/"TICKER"…）。
+        """
         try:
             ret, data = ctx.query_subscription(is_all_conn=False)
         except Exception:  # noqa: BLE001 — query 唔好 propagate 去 reconcile worker
@@ -621,10 +716,11 @@ class FutuEngine(QObject):
         if ret != RET_OK or not isinstance(data, dict):
             logger.warning("query_subscription 失敗: %s", data)
             return None
-        codes: set[str] = set()
-        for sub_list in (data.get("sub_list") or {}).values():
-            codes.update(sub_list or [])
-        return codes
+        code_subs: dict[str, list[str]] = {}
+        for subtype, sub_list in (data.get("sub_list") or {}).items():
+            for c in sub_list or []:
+                code_subs.setdefault(c, []).append(str(subtype))
+        return code_subs
 
     def _reconcile_subscriptions(self) -> None:
         """定時清理：對「已不活躍且訂閱滿 MIN_SUBSCRIBE_SECONDS」的洩漏訂閱重試 unsubscribe。
@@ -646,29 +742,31 @@ class FutuEngine(QObject):
         if state is not None and state.smt_code:
             active_codes.add(state.smt_code)
 
-        open_codes = self._query_open_subscriptions(ctx)
-        if open_codes is None:
+        open_map = self._query_open_subscriptions(ctx)   # code → [subtypes]（Commit 31）
+        if open_map is None:
             return  # query 失敗 → 唔改帳本，下輪再試（避免誤刪）
+        open_codes = set(open_map)
 
         store = self._ensure_store()
         ledger_codes = {c for c, _s, _ts in store.list_active()}  # loop 前 snapshot（residual 判斷用）
         for code, subtype, _ts in store.due_for_cleanup(active_codes):
             try:
-                ret, info = ctx.unsubscribe([code], [SubType.QUOTE])
+                ret, info = ctx.unsubscribe([code], [_subtype_enum(subtype)])   # 帶正確 SubType（TICKER/QUOTE）
             except Exception:  # noqa: BLE001 — 單筆 unsubscribe exception 唔阻其餘清理
                 logger.exception("reconcile unsubscribe %s exception", code)
                 continue
             if ret == RET_OK:
                 store.remove(code, subtype)
-                logger.info("reconcile：已清理洩漏訂閱 %s", code)
+                logger.info("reconcile：已清理洩漏訂閱 %s [%s]", code, subtype)
             else:
-                logger.warning("reconcile：unsubscribe %s 仍失敗（稍後重試）: %s", code, info)
+                logger.warning("reconcile：unsubscribe %s [%s] 仍失敗（稍後重試）: %s", code, subtype, info)
 
         # 殘留自癒：OpenD 端有、但帳本完全冇記錄（上次 crash 前嘅訂閱）、且唔係當前 state →
         # unsubscribe。用 loop 前 ledger snapshot 排除「已喺帳本」嘅 code——避免同 due-loop 重複 unsub。
         for code in open_codes - active_codes - ledger_codes:
+            subtypes = list(dict.fromkeys(_subtype_enum(s) for s in open_map.get(code, []))) or [SubType.QUOTE]
             try:
-                ret, info = ctx.unsubscribe([code], [SubType.QUOTE])
+                ret, info = ctx.unsubscribe([code], subtypes)   # 清晒該 code 全部殘留 subtype
             except Exception:  # noqa: BLE001 — 同上
                 logger.exception("reconcile unsubscribe residual %s exception", code)
                 continue
@@ -806,6 +904,7 @@ class FutuEngine(QObject):
                         self.smt_history_ready.emit(p, self._state.smt_aggregators[p].bars())
 
             ctx.set_handler(_QuoteHandler(self))
+            ctx.set_handler(_TickerHandler(self))   # Commit 31：TICKER push handler（獨立 proto_id slot，同 QUOTE 共存）
             codes = [code] + ([cur_state.smt_code] if cur_state.smt_code else [])   # SMT 配對一併訂閱
             self.status.emit(f"訂閱 {code} QUOTE 中…")
             ret, sub_info = ctx.subscribe(codes, [SubType.QUOTE])
@@ -813,6 +912,15 @@ class FutuEngine(QObject):
                 raise RuntimeError(f"subscribe 失敗: {sub_info}")  # 成功時第二返回值係 None（實測）
             for c in codes:
                 self._ensure_store().add(c)   # 初始訂閱入帳本
+            # TICKER 訂閱（Commit 31）：只主標的；失敗非致命——逐筆面板空 + warning，唔影響 K 線主流程
+            try:
+                ret_tk, info_tk = ctx.subscribe([code], [SubType.TICKER])
+                if ret_tk == RET_OK:
+                    self._ensure_store().add(code, "TICKER")   # 入帳本（PK=(code, subtype)，同 QUOTE 獨立行）
+                else:
+                    logger.warning("TICKER subscribe %s 失敗（非致命）: %s", code, info_tk)
+            except Exception:  # noqa: BLE001 — TICKER 失敗唔阻開機
+                logger.exception("TICKER subscribe exception")
             self._schedule_reconcile()       # 開機對帳：query_subscription 清理上次殘留訂閱
             self.status.emit(f"訂閱成功 · {len(cur_state.periods)} 週期 · 歷史 {total} 根 · 等待實時報價")
 

@@ -75,8 +75,11 @@ class FakeCtx:
         self._pages = list(pages)
         self.kline_calls = []
         self.handler = None
-        self.subscribed = None
-        self.unsubscribed = None
+        self.subscribed = None          # 最後一次 subscribe（backward compat）
+        self.unsubscribed = None        # 最後一次 unsubscribe（backward compat）
+        # Commit 31：TICKER 訂閱加入後，subscribe/unsubscribe 會多次呼叫——累積全部呼叫供斷言
+        self.subscribe_calls: list[tuple[list, list]] = []
+        self.unsubscribe_calls: list[tuple[list, list]] = []
         self.closed = False
         self.subscribe_event = threading.Event()
         self._sub_ret = sub_ret
@@ -111,11 +114,13 @@ class FakeCtx:
 
     def subscribe(self, codes, sub_types):
         self.subscribed = (list(codes), list(sub_types))
+        self.subscribe_calls.append(self.subscribed)
         self.subscribe_event.set()
         return self._sub_ret, self._sub_info
 
     def unsubscribe(self, codes, sub_types):
         self.unsubscribed = (list(codes), list(sub_types))
+        self.unsubscribe_calls.append(self.unsubscribed)
         return RET_OK, None
 
     def close(self):
@@ -657,7 +662,11 @@ class TestSetup:
         _p, bars = history[0]
         assert _p == "K_1M" and len(bars) == 2
         assert ctx.handler is not None  # set_handler 已呼叫
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
+        # Commit 31：先 QUOTE、後 TICKER（逐筆訂閱，非致命）——兩筆都要喺帳
+        assert ctx.subscribe_calls == [
+            (["HK.HSImain"], [SubType.QUOTE]),
+            (["HK.HSImain"], [SubType.TICKER]),
+        ]
         assert eng._ctx is ctx
         # seed 完成先 swap state：anchor = seed 最後一根 bar 嘅日期
         assert eng.state.anchor_date == date(2026, 9, 30)
@@ -676,7 +685,7 @@ class TestSetup:
 
         assert not errors
         assert ctx.kline_calls[0]["code"] == "HK.HSImain"
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
+        assert (["HK.HSImain"], [SubType.QUOTE]) in ctx.subscribe_calls   # 正規形式訂閱（Commit 31 另有 TICKER）
         assert eng.state.code == "HK.HSImain"
 
     def test_connect_failure_emits_error(self, monkeypatch):
@@ -829,10 +838,16 @@ class TestReconfigure:
         eng._reconfigure("US.AAPL", frozenset({"K_5M"}))
 
         # 1) unsubscribe 舊 → 2) fetch 新 code/ktype → 3) subscribe 新
-        assert ctx.unsubscribed == (["HK.HSImain"], [SubType.QUOTE])
+        assert ctx.unsubscribe_calls == [
+            (["HK.HSImain"], [SubType.QUOTE]),
+            (["HK.HSImain"], [SubType.TICKER]),   # Commit 31：逐筆訂閱一併 unsub
+        ]
         call = ctx.kline_calls[0]
         assert call["code"] == "US.AAPL" and call["ktype"] is _KLTYPE_MAP["K_5M"]
-        assert ctx.subscribed == (["US.AAPL"], [SubType.QUOTE])
+        assert ctx.subscribe_calls == [
+            (["US.AAPL"], [SubType.QUOTE]),
+            (["US.AAPL"], [SubType.TICKER]),      # Commit 31：新標的逐筆訂閱跟隨
+        ]
         # state swap：新 aggregator + anchor（seed 最後一根 bar 日期）
         st = eng.state
         assert st is not old_state
@@ -857,7 +872,10 @@ class TestReconfigure:
         assert any("冇歷史數據" in e for e in errors)
         assert not history
         assert eng.state is old_state  # state 未 swap，圖表保持 live
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # rollback resubscribe 舊
+        assert ctx.subscribe_calls == [   # rollback resubscribe 舊（含 Commit 31 逐筆）
+            (["HK.HSImain"], [SubType.QUOTE]),
+            (["HK.HSImain"], [SubType.TICKER]),
+        ]
 
     def test_fetch_failure_rolls_back(self):
         eng, ctx = self._setup_eng([(-1, "kline err", None)])
@@ -869,7 +887,10 @@ class TestReconfigure:
 
         assert any("切換失敗" in e and "request_history_kline" in e for e in errors)
         assert eng.state is old_state
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # resubscribe 舊
+        assert ctx.subscribe_calls == [   # resubscribe 舊（含 Commit 31 逐筆）
+            (["HK.HSImain"], [SubType.QUOTE]),
+            (["HK.HSImain"], [SubType.TICKER]),
+        ]
 
     def test_subscribe_failure_rolls_back(self):
         eng, ctx = self._setup_eng(
@@ -882,7 +903,12 @@ class TestReconfigure:
 
         assert any("subscribe US.AAPL 失敗" in e for e in errors)
         assert eng.state is old_state  # subscribe 失敗 → 唔 swap
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])  # 最後一次係 rollback
+        # sub_ret=-1 對所有 subscribe 生效：新 QUOTE 失敗 → rollback 舊 QUOTE/TICKER（都失敗、非致命）
+        assert ctx.subscribe_calls == [
+            (["US.AAPL"], [SubType.QUOTE]),       # 新標的訂閱（失敗 → trigger rollback）
+            (["HK.HSImain"], [SubType.QUOTE]),    # rollback resubscribe 舊
+            (["HK.HSImain"], [SubType.TICKER]),   # rollback 逐筆 resubscribe（非致命）
+        ]
 
     def test_unsubscribe_failure_does_not_block(self):
         """unsubscribe 失敗唔阻切換（in-flight push 由 handler code filter 兜底）。"""
@@ -1067,7 +1093,10 @@ class TestSwitchThreaded:
         ctx.gate.set()
         assert wait_until(lambda: not eng._switching)
         assert eng.state.code == "HK.00700" and eng.state.periods == frozenset({"K_5M"})
-        assert ctx.subscribed == (["HK.00700"], [SubType.QUOTE])
+        assert ctx.subscribe_calls[-2:] == [   # 新標的 QUOTE + Commit 31 逐筆訂閱跟隨
+            (["HK.00700"], [SubType.QUOTE]),
+            (["HK.00700"], [SubType.TICKER]),
+        ]
         eng.stop()
 
     def test_hsimain_alias_flows_through_switch(self):
@@ -1086,7 +1115,10 @@ class TestSwitchThreaded:
         assert wait_until(lambda: not eng._switching)
         assert eng.state.code == "HK.HSImain"
         assert ctx.kline_calls[0]["code"] == "HK.HSImain"
-        assert ctx.subscribed == (["HK.HSImain"], [SubType.QUOTE])
+        assert ctx.subscribe_calls[-2:] == [   # 正規形式 QUOTE + Commit 31 逐筆訂閱跟隨
+            (["HK.HSImain"], [SubType.QUOTE]),
+            (["HK.HSImain"], [SubType.TICKER]),
+        ]
         eng.stop()
 
     def test_switch_rejected_while_setup_running(self, monkeypatch):

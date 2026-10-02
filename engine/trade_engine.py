@@ -105,6 +105,8 @@ class PositionRow:
     unrealized_pl: float     # unrealized_pl——按均價計嘅浮動盈虧
     pl_ratio_pct: float      # pl_ratio_avg_cost——已是百分數數字（20 = +20%）
     today_pl: float          # today_pl_val——今日盈虧
+    acc_id: int = 0          # 來源帳戶（Commit 31：per-account 持倉過濾用；default 保舊構造相容）
+    trd_env: str = "REAL"    # 來源環境 "REAL"/"SIMULATE"（同上）
 
 
 @dataclass(frozen=True)
@@ -356,18 +358,19 @@ class TradeEngine(QObject):
             self._poll_stop.wait(_POLL_INTERVAL)
 
     def _poll_once(self) -> None:
-        """單輪 poll：逐 (market, account) 查持倉；資金 per-account（雙 env、ACTIVE）獨立 emit；訂單按獨立 30s 間隔查。
+        """單輪 poll：持倉 per-account（雙 env、ACTIVE，Commit 31）；資金 per-account 獨立 emit；訂單按獨立 30s 間隔查。
 
         每次查詢獨立 try/except（單筆失敗唔殺整輪）。
         """
+        # 持倉輪詢：per-account、雙 env（Commit 31——重用 _funds_targets，同 funds loop 同一來源；
+        # position_list_query 無文檔限頻 → 5s polling 安全）。每行 tag (acc_id, trd_env) 供 GUI 過濾。
         positions: list[PositionRow] = []
-        for market in sorted(self._ctxs):
+        for market, acc_id, trd_env in self._funds_targets:
             ctx = self._ctxs.get(market)
             if ctx is None:
                 continue
-            for acc_id, _card in self._accounts.get(market, ()):
-                rows = self._query_positions(ctx, acc_id)
-                positions.extend(rows)
+            rows = self._query_positions(ctx, acc_id, trd_env)
+            positions.extend(rows)
         # 資金輪詢：per-account、雙 env（accinfo_query 無文檔限頻）；逐個 emit，失敗帳戶跳過（GUI 保留上次值）
         for market, acc_id, trd_env in self._funds_targets:
             ctx = self._ctxs.get(market)
@@ -394,10 +397,15 @@ class TradeEngine(QObject):
 
     # ------------------------------------------------------------- queries（poll thread 內）
 
-    def _query_positions(self, ctx, acc_id: int) -> list[PositionRow]:
-        """position_list_query → [PositionRow]；失敗/無數據 → []。字段用 APP 對齊組（FIELD_MAPPING）。"""
+    def _query_positions(self, ctx, acc_id: int, trd_env: str = "REAL") -> list[PositionRow]:
+        """position_list_query → [PositionRow]；失敗/無數據 → []。字段用 APP 對齊組（FIELD_MAPPING）。
+
+        Commit 31：trd_env 參數化（雙 env per-account polling）+ 每行 tag (acc_id, trd_env)——
+        GUI 端按選中帳戶卡片過濾持倉表。
+        """
+        env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
         try:
-            ret, data = ctx.position_list_query(trd_env=TrdEnv.REAL, acc_id=acc_id, refresh_cache=False)
+            ret, data = ctx.position_list_query(trd_env=env_enum, acc_id=acc_id, refresh_cache=False)
         except Exception as exc:  # noqa: BLE001 — 單筆查詢失敗唔殺整輪 poll
             logger.exception("position_list_query failed (acc=%s)", acc_id)
             return []
@@ -418,6 +426,8 @@ class TradeEngine(QObject):
                     unrealized_pl=_f(row.get("unrealized_pl")),    # 按均價計浮動盈虧（禁用 pl_val）
                     pl_ratio_pct=_f(row.get("pl_ratio_avg_cost")),   # 已是百分數數字，唔好再 ×100
                     today_pl=_f(row.get("today_pl_val")),
+                    acc_id=acc_id,
+                    trd_env=trd_env,
                 ))
             except Exception:  # noqa: BLE001 — 單行損壞跳過
                 logger.exception("bad position row skipped")

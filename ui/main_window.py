@@ -10,6 +10,8 @@
   分步 X 軸縮放，多段式唔再直跳 min/max 極限），returnPressed / 按鍵點擊 →
   engine.switch(code, kline_type) 運行時切換。
 - F11 切換全屏幕；Esc 關閉（README Features）。
+- 左側**全高逐筆成交面板**（Commit 31）：TICKER push → engine.tick_data → buffer + 100ms coalescing flush，
+  時間/價格/數量/方向/類型五欄、最新喺頂，主買(BUY)/主賣(SELL) 不同行背景色；佈局按鍵支持 1/2/4/**6**（3 列 × 2 行）。
 - Engine signals（callback/setup thread emit）經 Qt auto-queue 過 GUI thread：
   history_ready / bars_changed → chart.update_bars；status / error → status bar；
   smt_history_ready / smt_bars_changed → chart.set_smt_bars（SMT Divergence 配對副標的 snapshot，
@@ -20,10 +22,11 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QKeyEvent
 from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QPushButton, QVBoxLayout, QWidget)
+                               QLineEdit, QMainWindow, QPushButton, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from config import KLINE_TYPES
 from engine.futu_engine import FutuEngine
@@ -48,6 +51,14 @@ INDICATOR_TOGGLES: tuple[tuple[str, str], ...] = (
 _CONN_OK_COLOR = "#089981"    # teal green（= HK down_color）
 _CONN_BAD_COLOR = "#F23645"   # red（= HK up_color）
 
+# 逐筆成交面板行背景色（Commit 31，深色主題——深綠/深紅底 + 方向欄亮字）：主買 BUY / 主賣 SELL；
+# NEUTRAL / N/A → 無特殊背景（默認底色）。
+_TICK_BUY_BG = "#0F3D23"      # 主買行背景（dark green）
+_TICK_SELL_BG = "#4A1420"     # 主賣行背景（dark red）
+_TICK_BUY_FG = "#69F0AE"      # 主買方向欄亮字
+_TICK_SELL_FG = "#FF8A80"     # 主賣方向欄亮字
+_TICK_MAX_ROWS = 500          # 表格最大行數（超出由最舊端刪除，防無界增長）
+
 
 def format_latency(ms: float | None) -> str:
     """延遲顯示：<1ms → µs 精度、≥1ms → ms；負數/None → "—"（斷線 / 未知）。
@@ -63,9 +74,10 @@ def format_latency(ms: float | None) -> str:
 
 
 class MainWindow(QMainWindow):
-    # 跨視窗同步 signal（main.py 接線去 OrderWindow）：K 綫標的切換 / 最新收市價
+    # 跨視窗同步 signal（main.py 接線去 OrderWindow）：K 綫標的切換 / 最新收市價 / 股票目錄
     code_changed = Signal(str)
     last_price = Signal(float)
+    catalog_ready = Signal(tuple)   # engine catalog re-emit → OrderWindow StockCompleter（Commit 31）
 
     def __init__(self, cfg):
         super().__init__()
@@ -85,14 +97,14 @@ class MainWindow(QMainWindow):
         self._syncing = False   # Defensive 保留：移除跨 pane 同步後已無 reader；仍包住會 emit view_changed 嘅 reset_view()，防日後重接 listener 誤廣播
 
         self.chart = CandleChart(cfg)
-        # 多 pane 圖表區：pane 0 = self.chart（兼容既有測試）；panes 1..3 預建、由 1/2/4 layout 按鍵顯示。
+        # 多 pane 圖表區：pane 0 = self.chart（兼容既有測試）；panes 1..5 預建、由 1/2/4/6 layout 按鍵顯示。
         # 每個 pane = 頂部週期 combo + 獨立放大/縮小按鍵 + CandleChart（各 pane 獨立選週期、異步縮放）。
         self._panes: list[CandleChart] = []
         self._pane_combos: list[QComboBox] = []
         self._pane_widgets: list[QWidget] = []
         self._pane_zoom_in: list[QPushButton] = []
         self._pane_zoom_out: list[QPushButton] = []
-        for i in range(4):
+        for i in range(6):   # 預建 6 pane（Commit 31：新增 3x2 六圖版面）
             widget, combo, pane = self._build_pane_widget(i)
             self._pane_widgets.append(widget)
             self._pane_combos.append(combo)
@@ -114,10 +126,16 @@ class MainWindow(QMainWindow):
         self._conn_label.setStyleSheet(f"color: {_CONN_BAD_COLOR}; font-family: Consolas;")
         sb.addPermanentWidget(self._conn_label)
         self._engine.connection_state.connect(self._on_connection_state)
+        self._engine.tick_data.connect(self._on_tick_data)   # 逐筆成交（Commit 31）→ 左側全高面板
 
-        # Central：container + 頂部 control bar + pane grid（0 margin/spacing，全屏幕感不變）
+        # Central：outer HBox = [左側全高逐筆面板（fixed width）| 右 VBox(control bar + pane grid)]（Commit 31）；
+        # 0 margin/spacing，全屏幕感不變
         central = QWidget()
-        layout = QVBoxLayout(central)
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        outer.addWidget(self._build_tick_feed())   # 左側全高逐筆成交面板（fixed width、HBox 內自動拉滿高度）
+        layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._build_control_bar())
@@ -126,6 +144,7 @@ class MainWindow(QMainWindow):
         self._pane_grid.setHorizontalSpacing(4)
         self._pane_grid.setVerticalSpacing(4)
         layout.addLayout(self._pane_grid, 1)
+        outer.addLayout(layout, 1)
         self.setCentralWidget(central)
 
         self._pane_count = 1
@@ -187,15 +206,15 @@ class MainWindow(QMainWindow):
         return container, combo, chart
 
     def _set_pane_count(self, count: int) -> None:
-        """切換 1/2/4 pane layout：顯示對應 pane、隱藏其餘（pane 數據保留，唔重建）。"""
+        """切換 1/2/4/6 pane layout：顯示對應 pane、隱藏其餘（pane 數據保留，唔重建）。"""
         self._pane_count = count
-        for i in range(4):
+        for i in range(6):
             self._pane_widgets[i].setVisible(i < count)
 
     def _layout_panes(self) -> None:
-        """按當前 pane 數重排 grid：1=單格 / 2=左右 / 4=2x2。"""
+        """按當前 pane 數重排 grid：1=單格 / 2=左右 / 4=2x2 / 6=3列×2行（Commit 31）。"""
         n = self._pane_count
-        for i in range(4):
+        for i in range(6):
             w = self._pane_widgets[i]
             if i >= n:
                 continue
@@ -203,6 +222,8 @@ class MainWindow(QMainWindow):
                 r, c = 0, 0
             elif n == 2:
                 r, c = 0, i
+            elif n == 6:
+                r, c = divmod(i, 3)   # 水平 3 個 × 垂直 2 個（Commit 31）
             else:
                 r, c = divmod(i, 2)
             self._pane_grid.addWidget(w, r, c)
@@ -257,10 +278,10 @@ class MainWindow(QMainWindow):
         h.addSpacing(16)
         h.addWidget(QLabel("佈局"))
 
-        # 1/2/4 pane layout 按鍵組（checkable + autoExclusive）：週期選擇已下放各 pane combo
+        # 1/2/4/6 pane layout 按鍵組（checkable + autoExclusive）：週期選擇已下放各 pane combo
         self._layout_group = QButtonGroup(self)
         self._layout_group.setExclusive(True)
-        for n in (1, 2, 4):
+        for n in (1, 2, 4, 6):
             btn = QPushButton(str(n))
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -307,7 +328,7 @@ class MainWindow(QMainWindow):
         return bar
 
     def _desired_periods(self) -> frozenset[str]:
-        """全部 4 pane combo 週期 union = engine 目標活躍週期集合。
+        """全部 6 pane combo 週期 union = engine 目標活躍週期集合。
 
         與可見性無關（隱藏 pane 嘅週期都保持活躍）：layout 切換即時有數據、唔會 stale；
         OpenD 訂閱額度零額外成本（單一 QUOTE 訂閱 → N aggregator fan-out）。
@@ -328,11 +349,11 @@ class MainWindow(QMainWindow):
         if not isinstance(state, dict):
             return None
 
-        # pane count / layout（1/2/4）：set + relayout（同 _on_layout_clicked 一樣搬位）
+        # pane count / layout（1/2/4/6）：set + relayout（同 _on_layout_clicked 一樣搬位）
         n = state.get("pane_count")
-        if n in (1, 2, 4) and n != self._pane_count:
+        if n in (1, 2, 4, 6) and n != self._pane_count:
             self._set_pane_count(n)
-            for i in range(4):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
+            for i in range(6):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
                 self._pane_grid.removeWidget(self._pane_widgets[i])
             self._layout_panes()
             # 同步 layout 按鍵 checked 狀態：構造時 default「1」checked，還原 pane count 後要將
@@ -441,6 +462,7 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing = False
         self._engine.switch(code=code, periods=list(self._desired_periods()))
+        self._clear_tick_feed()   # 標的切換 → 清空逐筆面板（Commit 31）
         self._save_ui_state()   # 標的改變 → 記憶（code + 當前 layout/periods/indicators）
         self.code_changed.emit(code)   # 跨視窗同步：OrderWindow 下單代碼跟隨 K 綫標的
 
@@ -467,6 +489,7 @@ class MainWindow(QMainWindow):
         self._code_by_text = self._completer.set_catalog(tuple(entries))
         # 目錄到手 → 用當前輸入欄 code 初始化名稱 LABEL
         self._update_name_label(self.code_edit.text())
+        self.catalog_ready.emit(tuple(entries))   # re-emit → OrderWindow StockCompleter（Commit 31）
 
     def _on_code_activated(self, text: str) -> None:
         """Dropdown 選中一行 → 輸入欄只留 code（名稱唔入 TEXT FIELD）→ switch。
@@ -506,6 +529,96 @@ class MainWindow(QMainWindow):
             self._conn_label.setText(f"● OpenD 已連線 · {format_latency(latency_ms)}")
         else:
             self._conn_label.setText("● OpenD 未連線")
+
+    # ------------------------------------------------------------- 逐筆成交面板（Commit 31）
+
+    def _build_tick_feed(self) -> QWidget:
+        """左側全高逐筆成交面板：QTableWidget 時間/價格/數量/方向/類型五欄。
+
+        數據源 = engine.tick_data（TICKER push、只主標的）。push callback thread emit →
+        Qt auto-queue 過 GUI thread；高頻 batch 先累積入 _tick_buffer，100ms single-shot
+        QTimer coalescing flush 入表（最新喺頂），buffer/表都 cap _TICK_MAX_ROWS 行。
+        主買(BUY)/主賣(SELL) 用不同行背景色提示（_fill_tick_row）。
+        """
+        cfg = self._cfg
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(4, 2, 0, 2)
+        v.setSpacing(2)
+        title = QLabel("逐筆成交")
+        title.setStyleSheet(f"color: {cfg.text_color}; font-family: Consolas; font-weight: bold;")
+        v.addWidget(title)
+
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["時間", "價格", "數量", "方向", "類型"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setStyleSheet(
+            f"QTableWidget {{ background: {cfg.bg_color}; color: {cfg.text_color};"
+            f" border: 1px solid {cfg.axis_text_color}; font-family: Consolas; font-size: 12px; }}"
+            f"QHeaderView::section {{ background: {cfg.grid_color}; color: {cfg.text_color};"
+            f" border: none; padding: 2px; font-family: Consolas; }}"
+        )
+        for col, w in ((0, 74), (1, 56), (2, 48), (3, 40), (4, 40)):
+            table.setColumnWidth(col, w)
+        v.addWidget(table, 1)
+
+        box.setFixedWidth(270)   # fixed width + HBox stretch → 左側全高
+        self._tick_table = table
+        self._tick_buffer: list[tuple[str, float, float, str, str]] = []
+        # coalescing flush：single-shot 100ms——burst 期間只有一個 timer active，flush 後 buffer
+        # 仍有數據（flush 中途新到）→ _on_tick_data 會再 arm
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setSingleShot(True)
+        self._tick_timer.setInterval(100)
+        self._tick_timer.timeout.connect(self._flush_ticks)
+        return box
+
+    def _on_tick_data(self, rows: tuple) -> None:
+        """engine.tick_data（callback thread emit → auto-queue 過 GUI）：累積 buffer + arm flush timer。"""
+        for row in rows:
+            self._tick_buffer.append(row)
+        if len(self._tick_buffer) > _TICK_MAX_ROWS:   # cap：由最舊端丟棄
+            del self._tick_buffer[: len(self._tick_buffer) - _TICK_MAX_ROWS]
+        if not self._tick_timer.isActive():
+            self._tick_timer.start()
+
+    def _flush_ticks(self) -> None:
+        """Coalescing flush：buffer 內新 tick 全部 insertRow(0)（最新喺頂），超出 cap 由最舊端刪除。"""
+        if not self._tick_buffer:
+            return
+        t = self._tick_table
+        for tick in self._tick_buffer:             # oldest first，逐個 insertRow(0) → 最新最終喺頂
+            t.insertRow(0)
+            self._fill_tick_row(t, 0, tick)
+        self._tick_buffer.clear()
+        while t.rowCount() > _TICK_MAX_ROWS:       # overflow → 刪最舊（底部）
+            t.removeRow(t.rowCount() - 1)
+
+    @staticmethod
+    def _fill_tick_row(table: QTableWidget, row: int, tick: tuple[str, float, float, str, str]) -> None:
+        """填一行 + 主買/主賣背景色：BUY=深綠底 / SELL=深紅底（整行）、方向欄亮字；NEUTRAL/N/A 無特殊背景。"""
+        time_s, price, volume, direction, type_s = tick
+        hhmmss = time_s[-8:] if len(time_s) >= 8 else time_s   # 完整 timestamp → 只顯示 HH:MM:SS
+        values = (hhmmss, f"{price:.4f}".rstrip("0").rstrip("."), f"{volume:g}",
+                  {"BUY": "主買", "SELL": "主賣"}.get(direction, direction or "—"), type_s or "—")
+        bg = _TICK_BUY_BG if direction == "BUY" else (_TICK_SELL_BG if direction == "SELL" else None)
+        fg = _TICK_BUY_FG if direction == "BUY" else (_TICK_SELL_FG if direction == "SELL" else None)
+        for col, text in enumerate(values):
+            item = QTableWidgetItem(text)
+            if bg:
+                item.setBackground(QColor(bg))
+            if fg and col == 3:   # 方向欄亮字突出（其餘欄保持默認文字色）
+                item.setForeground(QColor(fg))
+            table.setItem(row, col, item)
+
+    def _clear_tick_feed(self) -> None:
+        """標的切換 → 清空逐筆面板（舊標的數據對新標的無意義）。"""
+        self._tick_buffer.clear()
+        if self._tick_timer.isActive():
+            self._tick_timer.stop()
+        self._tick_table.setRowCount(0)
 
     # ------------------------------------------------------------- panes / time sync
 
@@ -557,7 +670,7 @@ class MainWindow(QMainWindow):
         self._save_ui_state()   # per-pane 週期改變 → 記憶
 
     def _on_layout_clicked(self) -> None:
-        """1/2/4 layout 按鍵 → 顯示/隱藏 pane + grid 重排（pane 數據保留、唔重建）。"""
+        """1/2/4/6 layout 按鍵 → 顯示/隱藏 pane + grid 重排（pane 數據保留、唔重建）。"""
         btn = self._layout_group.checkedButton()
         if btn is None:
             return
@@ -565,13 +678,13 @@ class MainWindow(QMainWindow):
         if n == self._pane_count:
             return
         self._set_pane_count(n)
-        for i in range(4):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
+        for i in range(6):   # removeWidget 先至 addWidget 會真正搬位（Qt grid 唔會自動 move）
             self._pane_grid.removeWidget(self._pane_widgets[i])
         self._layout_panes()
         self._save_ui_state()   # layout 改變 → 記憶（early return 已確保只喺真改變時 save）
 
     def _on_indicator_toggled(self, key: str, on: bool) -> None:
-        """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。
+        """指標開關 → 同步全部 6 pane（含隱藏——狀態同 pane 數據一樣保留）。
 
         "smt" 特殊：除圖層外仲要 engine 端訂閱配對副標的（雙訂閱）→ switch(smt=on/off)。
         setup/switch 進行中時 engine 會 status 提示並 reject（pane 圖層狀態照樣翻轉，
