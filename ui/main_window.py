@@ -466,6 +466,27 @@ class MainWindow(QMainWindow):
         self._save_ui_state()   # 標的改變 → 記憶（code + 當前 layout/periods/indicators）
         self.code_changed.emit(code)   # 跨視窗同步：OrderWindow 下單代碼跟隨 K 綫標的
 
+    def switch_symbol(self, code: str) -> None:
+        """Commit 34：反向同步——OrderWindow `code_changed` → K 綫圖標的切換。
+
+        驗證邏輯同 `_do_switch()`（目錄已載入 → canonical 檢查、未知 no-op）；
+        與當前輸入欄相同 → no-op（防雙向同步 loop）。
+        """
+        code = (code or "").strip()
+        if not code:
+            return
+        catalog = self._completer.catalog()
+        if len(catalog):
+            resolved = catalog.canonical_code(code)
+            if resolved is None:
+                return   # 未知標的 → no-op（唔切圖表去無效代碼）
+            code = resolved
+        if code == self.code_edit.text().strip():
+            return   # 同當前標的 → no-op（防 loop）
+        self.code_edit.setText(code)
+        self._update_name_label(code)
+        self._apply_code_switch(code)
+
     def _on_code_text_changed(self, text: str) -> None:
         """onChange guard：欄位出現「code + 名稱」（含空白）→ 即刻剝離返純 code。
 

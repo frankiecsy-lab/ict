@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必須喺 PySide6 impo
 
 import pytest
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
 
 from config import Config
 from engine.trade_engine import AccountInfo, FundsSnapshot, OrderRow, PositionRow
@@ -34,12 +34,14 @@ class FakeTradeEngine(QObject):
     status = Signal(str)
     error = Signal(str)
     order_result = Signal(bool, str)
+    cancel_result = Signal(bool, str)   # Commit 34：撤單結果（同 order_result 共用 action-done handler）
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.started_cfg = None
         self.stopped = False
         self.order_calls: list[tuple] = []
+        self.cancel_calls: list[tuple] = []   # Commit 34：(order_id, code, trd_env, acc_id)
 
     def start(self, cfg):
         self.started_cfg = cfg
@@ -47,9 +49,13 @@ class FakeTradeEngine(QObject):
     def stop(self):
         self.stopped = True
 
-    def place_order(self, code, side, price, qty, pin=None, *, trd_env="REAL", acc_id=None):
-        """Commit 33：dispatch 帶 trd_env（模式）+ acc_id（自動匹配帳戶）。"""
-        self.order_calls.append((code, side, price, qty, pin, trd_env, acc_id))
+    def place_order(self, code, side, price, qty, pin=None, *, trd_env="REAL", acc_id=None, market=False):
+        """Commit 33：dispatch 帶 trd_env（模式）+ acc_id（自動匹配帳戶）；Commit 34：market flag。"""
+        self.order_calls.append((code, side, price, qty, pin, trd_env, acc_id, market))
+
+    def cancel_order(self, order_id, code, *, trd_env="REAL", acc_id=None):
+        """Commit 34：記錄撤單調用（同步 fake——測試需手動 emit result signal drain queue）。"""
+        self.cancel_calls.append((order_id, code, trd_env, acc_id))
 
 
 def _make_window(monkeypatch, **kwargs) -> tuple[OrderWindow, FakeTradeEngine]:
@@ -188,7 +194,7 @@ def test_positions_table_populated(monkeypatch):
 
     table = w._pos_table
     assert table.rowCount() == 2
-    assert table.columnCount() == 12, "Commit 31：持倉表加「帳戶」欄 → 12 欄"
+    assert table.columnCount() == 13, "Commit 34：持倉表加「操作」（平倉）欄 → 13 欄"
     assert table.item(0, 0).text() == "HK.00700"
     assert table.item(0, 3).text() == "0·實"     # Commit 31：帳戶欄（acc_id=0 / REAL → 「0·實」）
     assert table.item(0, 4).text() == "100"      # %g 格式
@@ -287,7 +293,7 @@ def test_orders_table_populated_with_status_zh_and_color(monkeypatch):
 
     table = w._orders_table
     assert table.rowCount() == 2
-    assert table.columnCount() == 11, "Commit 33：訂單表 11 欄全細節"
+    assert table.columnCount() == 12, "Commit 34：訂單表加「操作」（撤單）欄 → 12 欄"
     assert table.item(0, 0).text() == "9001"          # 訂單號
     assert table.item(0, 1).text() == "HK.00700"      # 代碼
     assert table.item(0, 2).text() == "買入"           # 方向中文映射
@@ -344,12 +350,13 @@ def test_place_order_dispatches_to_engine(monkeypatch):
     w._order_code.setText("HK.00700")
     w._order_price.setValue(55.5)      # QDoubleSpinBox（programmatic setValue 唔受 disabled 影響）
     w._order_qty.setText("200")
+    w._confirm_cb.setChecked(False)   # Commit 34：跳過二次確認對話框（offscreen 會 block）
     w._on_place_order("BUY")
 
     assert len(fake.order_calls) == 1
-    code, side, price, qty, pin, trd_env, acc_id = fake.order_calls[0]
-    assert (code, side, price, qty, pin, trd_env, acc_id) == \
-        ("HK.00700", TrdSide.BUY, 55.5, 200, "246810", "REAL", 1)
+    code, side, price, qty, pin, trd_env, acc_id, market = fake.order_calls[0]
+    assert (code, side, price, qty, pin, trd_env, acc_id, market) == \
+        ("HK.00700", TrdSide.BUY, 55.5, 200, "246810", "REAL", 1, False)
     assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False, "in-flight 期間禁用買賣按鍵"
 
 
@@ -361,6 +368,7 @@ def test_place_order_sell_side(monkeypatch):
     w._order_code.setText("US.AAPL")
     w._order_price.setValue(140.25)
     w._order_qty.setText("10")
+    w._confirm_cb.setChecked(False)   # Commit 34：跳過二次確認對話框（offscreen 會 block）
     w._on_place_order("SELL")
 
     assert fake.order_calls[0][1] is TrdSide.SELL
@@ -635,6 +643,7 @@ def test_place_order_catalog_validation(monkeypatch):
 
     # 已知代碼（小寫輸入）→ 正規化 canonical HK.00700 + dispatch
     w._order_code.setText("hk.00700")
+    w._confirm_cb.setChecked(False)   # Commit 34：跳過二次確認對話框（offscreen 會 block）
     w._on_place_order("BUY")
     assert fake.order_calls[0][0] == "HK.00700"
 
@@ -644,6 +653,7 @@ def test_place_order_catalog_validation(monkeypatch):
     w2._order_code.setText("SG.D05")
     w2._order_price.setValue(1.0)
     w2._order_qty.setText("1")
+    w2._confirm_cb.setChecked(False)   # Commit 34：跳過二次確認對話框（offscreen 會 block）
     w2._on_place_order("BUY")
     assert fake2.order_calls[0][0] == "SG.D05"
 
@@ -780,3 +790,346 @@ def test_set_symbol_refreshes_labels(monkeypatch):
     w.set_symbol("US.AAPL")
     assert w._order_code.text() == "US.AAPL"
     assert w._name_label.text() == "Apple Inc. Apple"
+
+
+# ------------------------------------------------------------- Commit 34：PIN bar / lot size / 反向同步 / 二次確認 / 撤單平倉
+
+def _drain_queue(w: OrderWindow, fake: FakeTradeEngine) -> None:
+    """Fake engine 係同步嘅（唔會自動 emit result）→ 手動 emit order_result N 次 drain action queue。"""
+    total = len(w._action_queue) + (1 if w._action_busy else 0)
+    for _ in range(total):
+        fake.order_result.emit(True, "ok")
+
+
+def test_pin_bar_and_confirm_checkbox_inside_order_form(monkeypatch):
+    """Commit 34：PIN bar（交易模式選擇 + PIN）同二次確認 checkbox 都喺下單 form 內。"""
+    w, _ = _make_window(monkeypatch)
+
+    node = w._pin_box
+    while node is not None and node.objectName() != "orderGroup":
+        node = node.parentWidget()
+    assert node is not None, "PIN bar 必須喺下單 form（objectName=orderGroup）內"
+
+    assert w._confirm_cb.isChecked() is True   # 二次確認默認開
+
+
+def test_reverse_sync_emits_valid_code(monkeypatch):
+    """Commit 34：下單代碼變更 → debounce 後 emit `code_changed`（canonical uppercase）。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "TENCENT"),))
+    emitted: list[str] = []
+    w.code_changed.connect(emitted.append)
+
+    w._order_code.setText("hk.00700")   # debounce 600ms——offscreen 無 event loop 唔會自動 fire
+    assert emitted == [], "debounce 未到期唔應該 emit"
+
+    w._emit_symbol_if_valid()           # 手動觸發 timeout callback
+    assert emitted == ["HK.00700"]      # canonical uppercase
+
+    w._emit_symbol_if_valid()           # _last_emitted_code guard → 唔重複 emit
+    assert len(emitted) == 1
+
+
+def test_reverse_sync_skips_unknown_or_invalid(monkeypatch):
+    """Commit 34：目錄已載入但未知 code / 無「.」→ skip（唔切圖表去無效標的）。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "TENCENT"),))
+    emitted: list[str] = []
+    w.code_changed.connect(emitted.append)
+
+    w._order_code.setText("XX.99999")   # 有「.」但唔喺目錄 → skip
+    w._emit_symbol_if_valid()
+    assert emitted == []
+
+    w._order_code.setText("NOPE")       # 無「.」→ skip
+    w._emit_symbol_if_valid()
+    assert emitted == []
+
+
+def test_set_symbol_primes_last_emitted(monkeypatch):
+    """Commit 34：set_symbol（K 綫 → 下單正向同步）prime `_last_emitted_code`——防反向 debounce echo loop。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("US.AAPL", "Apple Inc.", "Apple"),))
+    emitted: list[str] = []
+    w.code_changed.connect(emitted.append)
+
+    w.set_symbol("US.AAPL")             # 正向同步——唔自己 emit、只 prime dedup state
+    assert emitted == []
+
+    w._emit_symbol_if_valid()           # debounce 其後 fire → 同 code → skip（防 loop）
+    assert emitted == []
+
+
+def test_qty_autofill_from_lot_size(monkeypatch):
+    """Commit 34：標的變更 → auto-fill 數量 = 每手單位；手動輸入唔覆蓋；未知 lot 唔填。"""
+    from engine.stock_catalog import StockEntry
+
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "TENCENT", lot_size=500),))
+    w._order_code.setText("HK.00700")   # _on_code_changed → auto-fill
+    assert w._order_qty.text() == "500"
+
+    w._order_qty.setText("1000")        # 用戶手動輸入
+    w._auto_fill_qty()                  # 同 code guard → 唔覆蓋
+    assert w._order_qty.text() == "1000"
+
+    w2, _ = _make_window(monkeypatch)   # 目錄未載入 → lot 未知 → 唔填
+    w2._order_code.setText("US.AAPL")
+    assert w2._order_qty.text() == ""
+
+
+def test_place_order_rejects_non_lot_multiple(monkeypatch):
+    """Commit 34：數量唔係每手單位整數倍 → 拒絕下單；整數倍 → dispatch。"""
+    from engine.stock_catalog import StockEntry
+
+    w, fake = _make_window(monkeypatch)   # SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "TENCENT", lot_size=500),))
+
+    w._order_code.setText("HK.00700")     # auto-fill 500
+    w._order_price.setValue(10.0)
+    w._order_qty.setText("300")           # 唔係 500 整數倍
+    w._confirm_cb.setChecked(False)       # 跳過二次確認對話框（offscreen 會 block）
+    w._on_place_order("BUY")
+
+    assert fake.order_calls == []
+    assert "整數倍" in w._status_label.text()
+
+    w._order_qty.setText("1000")          # 500 × 2 → OK
+    w._on_place_order("BUY")
+    assert len(fake.order_calls) == 1
+
+
+def test_confirm_checkbox_no_cancels_dispatch(monkeypatch):
+    """Commit 34：二次確認 checkbox 開 + 彈框揀 No → 唔 dispatch + warn status。"""
+    calls: list = []
+
+    def fake_question(*a, **k):
+        calls.append(a)
+        return QMessageBox.No
+
+    monkeypatch.setattr(ow.QMessageBox, "question", fake_question)
+
+    w, fake = _make_window(monkeypatch)   # SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+    w._order_code.setText("HK.00700")
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    assert w._confirm_cb.isChecked() is True   # 默認開
+    w._on_place_order("BUY")
+
+    assert len(calls) == 1, "應該彈一次二次確認對話框"
+    assert fake.order_calls == []
+    assert "已取消下單（二次確認）" in w._status_label.text()
+
+
+def test_confirm_checkbox_yes_dispatches(monkeypatch):
+    """Commit 34：二次確認 checkbox 開 + 彈框揀 Yes → dispatch。"""
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+
+    w, fake = _make_window(monkeypatch)   # SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+    w._order_code.setText("HK.00700")
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    w._on_place_order("BUY")
+
+    assert len(fake.order_calls) == 1
+    assert fake.order_calls[0][5] == "SIMULATE"
+
+
+def test_confirm_checkbox_off_dispatches_directly(monkeypatch):
+    """Commit 34：checkbox 取消 → 唔彈框直接 dispatch（question 被調用即 fail）。"""
+    def boom(*a, **k):
+        raise AssertionError("checkbox 關閉時唔應該彈二次確認對話框")
+
+    monkeypatch.setattr(ow.QMessageBox, "question", boom)
+
+    w, fake = _make_window(monkeypatch)   # SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+    w._order_code.setText("HK.00700")
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    w._confirm_cb.setChecked(False)
+    w._on_place_order("BUY")
+
+    assert len(fake.order_calls) == 1
+
+
+def test_cancel_row_button_enabled_by_status(monkeypatch):
+    """Commit 34：訂單表 per-row「撤單」按鈕——pending 啟用、已成/已取消 disabled、無 order_id disabled。"""
+    rows = (
+        OrderRow("9001", "HK.00700", "BUY", "NORMAL", "SUBMITTED", 200, 55.5, 0, 0.0,
+                 "2026-10-02 09:30:00"),
+        OrderRow("9002", "US.AAPL", "SELL", "NORMAL", "FILLED_ALL", 10, 140.0, 10, 140.0,
+                 "2026-10-02 10:00:05"),
+        OrderRow("", "HK.00700", "BUY", "NORMAL", "SUBMITTED", 5, 10.0, 0, 0.0,
+                 "2026-10-02 10:01:00"),   # 無 order_id → 無法撤
+    )
+    w, fake = _make_window(monkeypatch)
+    fake.orders_updated.emit(rows)
+
+    b0 = w._orders_table.cellWidget(0, 11)
+    assert isinstance(b0, QPushButton) and b0.isEnabled() is True, "SUBMITTED → 撤單可用"
+    b1 = w._orders_table.cellWidget(1, 11)
+    assert isinstance(b1, QPushButton) and b1.isEnabled() is False, "FILLED_ALL → 撤單禁用"
+    b2 = w._orders_table.cellWidget(2, 11)
+    assert isinstance(b2, QPushButton) and b2.isEnabled() is False, "無 order_id → 撤單禁用"
+
+
+def test_cancel_row_dispatches_with_real_env(monkeypatch):
+    """Commit 34：per-row「撤單」Yes → engine.cancel_order（trd_env=REAL、acc_id 跟行）。"""
+    row = OrderRow("9001", "HK.00700", "BUY", "NORMAL", "SUBMITTED", 200, 55.5, 0, 0.0,
+                   "2026-10-02 09:30:00", acc_id=1)
+    w, fake = _make_window(monkeypatch)
+    fake.orders_updated.emit((row,))
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._on_cancel_row(w._displayed_orders[0])
+
+    assert fake.cancel_calls == [("9001", "HK.00700", "REAL", 1)]
+    _drain_queue(w, fake)
+    assert w._action_busy is False and w._action_queue == []
+
+
+def test_cancel_row_no_cancels(monkeypatch):
+    """Commit 34：per-row「撤單」No → 唔 dispatch + warn status。"""
+    row = OrderRow("9001", "HK.00700", "BUY", "NORMAL", "SUBMITTED", 200, 55.5, 0, 0.0,
+                   "2026-10-02 09:30:00")
+    w, fake = _make_window(monkeypatch)
+    fake.orders_updated.emit((row,))
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+    w._on_cancel_row(w._displayed_orders[0])
+
+    assert fake.cancel_calls == []
+    assert "已取消撤單（二次確認）" in w._status_label.text()
+
+
+def test_cancel_all_serialized(monkeypatch):
+    """Commit 34：「全部撤單」→ 逐筆 enqueue 串行（首筆即發、其餘排隊等 result）。"""
+    rows = tuple(
+        OrderRow(str(9001 + i), "HK.00700", "BUY", "NORMAL", "SUBMITTED", 10, 55.0, 0, 0.0,
+                 f"2026-10-02 09:3{i}:00")
+        for i in range(3)
+    )
+    w, fake = _make_window(monkeypatch)
+    fake.orders_updated.emit(rows)
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._on_cancel_all()
+
+    assert len(fake.cancel_calls) == 1, "首筆即發"
+    assert len(w._action_queue) == 2 and w._action_busy is True, "其餘兩筆排隊"
+
+    _drain_queue(w, fake)
+    assert len(fake.cancel_calls) == 3
+    assert w._action_busy is False and w._action_queue == []
+
+
+def test_close_row_long_sells_market(monkeypatch):
+    """Commit 34：per-row「平倉」長倉 → 市價 SELL（同帳戶/環境、market=True）。"""
+    row = PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0,
+                      6.67, 150.0, acc_id=7, trd_env="SIMULATE")
+    w, fake = _make_window(monkeypatch)   # SIMULATE mode（常解鎖）
+    fake.positions_updated.emit((row,))
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._on_close_row(w._displayed_positions[0])
+
+    assert fake.order_calls == [("HK.00700", TrdSide.SELL, 0.0, 100, None, "SIMULATE", 7, True)]
+    _drain_queue(w, fake)
+
+
+def test_close_row_short_buys_back(monkeypatch):
+    """Commit 34：per-row「平倉」短倉（qty<0）→ 市價 BUY_BACK、數量取 abs。"""
+    row = PositionRow("US.AAPL", "Apple", "US", -50, -50, 150.0, 140.0, -7000.0, 500.0,
+                      3.33, 20.0, acc_id=8, trd_env="SIMULATE")
+    w, fake = _make_window(monkeypatch)   # SIMULATE mode（常解鎖）
+    fake.positions_updated.emit((row,))
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._on_close_row(w._displayed_positions[0])
+
+    assert fake.order_calls == [("US.AAPL", TrdSide.BUY_BACK, 0.0, 50, None, "SIMULATE", 8, True)]
+    _drain_queue(w, fake)
+
+
+def test_close_real_position_requires_pin(monkeypatch):
+    """Commit 34：實盤持倉平倉 → PIN gate 喺 confirm dialog **之前**（未解鎖唔彈框）。"""
+    row = PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0,
+                      6.67, 150.0, acc_id=9)   # trd_env 默認 REAL
+
+    def boom(*a, **k):
+        raise AssertionError("未解鎖唔應該彈確認框")
+
+    monkeypatch.setattr(ow.QMessageBox, "question", boom)
+
+    w, fake = _make_window(monkeypatch)   # SIMULATE mode、無 PIN holder
+    fake.positions_updated.emit((row,))
+    w._on_close_row(w._displayed_positions[0])
+
+    assert fake.order_calls == []
+    assert "實盤未解鎖" in w._status_label.text()
+
+
+def test_close_all_dispatches_per_position(monkeypatch):
+    """Commit 34：「全部平倉」→ 逐筆 enqueue（長倉 SELL / 短倉 BUY_BACK、全部市價單）。"""
+    rows = (
+        PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0,
+                    6.67, 150.0, acc_id=7, trd_env="SIMULATE"),
+        PositionRow("US.AAPL", "Apple", "US", -50, -50, 150.0, 140.0, -7000.0, 500.0,
+                    3.33, 20.0, acc_id=8, trd_env="SIMULATE"),
+    )
+    w, fake = _make_window(monkeypatch)   # SIMULATE mode（常解鎖）
+    fake.positions_updated.emit(rows)
+
+    monkeypatch.setattr(ow.QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    w._on_close_all()
+
+    assert len(fake.order_calls) == 1 and len(w._action_queue) == 1, "首筆即發、其餘排隊"
+
+    _drain_queue(w, fake)
+    assert len(fake.order_calls) == 2
+    sides = {c[1] for c in fake.order_calls}
+    assert sides == {TrdSide.SELL, TrdSide.BUY_BACK}
+    assert all(c[7] is True for c in fake.order_calls), "全部市價單"
+
+
+def test_status_label_prominent_style(monkeypatch):
+    """Commit 34：交易成功/錯誤 status label 當眼明顯（深色底 + 粗體大字）。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.order_result.emit(True, "ok")
+    ss_ok = w._status_label.styleSheet()
+    assert "#0B3D2E" in ss_ok and "font-weight: bold" in ss_ok, "成功 → 深綠底粗體"
+
+    fake.order_result.emit(False, "err")
+    ss_err = w._status_label.styleSheet()
+    assert "#4A1420" in ss_err and "font-weight: bold" in ss_err, "失敗 → 深紅底粗體"
+
+
+def test_action_queue_keeps_buttons_disabled_until_drained(monkeypatch):
+    """Commit 34：action queue 未 drain 完 → 買賣按鍵保持 disabled（防並發下單）。"""
+    w, fake = _make_window(monkeypatch)   # SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+
+    w._order_code.setText("HK.00700")
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    w._confirm_cb.setChecked(False)       # 跳過二次確認對話框（offscreen 會 block）
+    w._on_place_order("BUY")              # action 1 in-flight → 禁用
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
+
+    w._enqueue_action(lambda: None)       # action 2 排隊
+    fake.order_result.emit(True, "ok")    # done 1 → pump 2（仍 busy）
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
+
+    fake.order_result.emit(True, "ok")    # done 2 → queue 空 → _apply_pin_state 恢復
+    assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True

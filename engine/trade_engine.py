@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
 
-from futu import RET_OK, OpenSecTradeContext, TrdEnv, TrdMarket, TrdSide
+from futu import OrderType, RET_OK, OpenSecTradeContext, TrdEnv, TrdMarket, TrdSide
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,7 @@ class TradeEngine(QObject):
     - orders_updated(tuple[OrderRow])：今日訂單 snapshot（30s 間隔、限頻安全）
     - status(str) / error(str)：連線與操作狀態訊息
     - order_result(bool, str)：(success, message)——下單結果（worker thread emit）
+    - cancel_result(bool, str)：(success, message)——撤單結果（worker thread emit）
     """
 
     accounts_updated = Signal(tuple)
@@ -178,6 +179,7 @@ class TradeEngine(QObject):
     status = Signal(str)
     error = Signal(str)
     order_result = Signal(bool, str)
+    cancel_result = Signal(bool, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -494,30 +496,31 @@ class TradeEngine(QObject):
     # ------------------------------------------------------------- place order（worker thread）
 
     def place_order(self, code: str, side: TrdSide, price: float, qty: int, pin: str | None = None,
-                    *, trd_env: str = "REAL", acc_id: int | None = None) -> None:
+                    *, trd_env: str = "REAL", acc_id: int | None = None, market: bool = False) -> None:
         """GUI-thread entry：sanity check + spawn 短命 daemon worker（阻塞 RPC 唔喺 GUI thread）。
 
         Commit 33：`trd_env`/`acc_id` keyword-only——UI 端按「模式選擇器 + 標的種類自動匹配帳戶」
         明確指定目標；兩者都省略時 fallback 舊行為（REAL + `_order_accs[market]`）。
+        Commit 34：`market=True` → 市價單（order_type=OrderType.MARKET、price=0）——平倉操作用。
         """
         with self._lock:
             if self._closed:
                 self.order_result.emit(False, "引擎已關閉，無法下單")
                 return
-            market = code.split(".", 1)[0].upper() if "." in code else ""
-            ctx = self._ctxs.get(market)
-            target_acc = acc_id if acc_id is not None else self._order_accs.get(market)
+            mkt = code.split(".", 1)[0].upper() if "." in code else ""
+            ctx = self._ctxs.get(mkt)
+            target_acc = acc_id if acc_id is not None else self._order_accs.get(mkt)
         if ctx is None:
             configured = ", ".join(sorted(self._ctxs)) or "（無）"
-            self.order_result.emit(False, f"市場 {market!r} 未連線（已配置：{configured}）")
+            self.order_result.emit(False, f"市場 {mkt!r} 未連線（已配置：{configured}）")
             return
         if target_acc is None:
             env_zh = "實盤" if trd_env == "REAL" else "模擬盤"
             self.order_result.emit(
-                False, f"{env_zh} {market!r} 冇可下單帳戶——需非 MASTER ACTIVE 帳戶且 trdmarket_auth 含 {market}")
+                False, f"{env_zh} {mkt!r} 冇可下單帳戶——需非 MASTER ACTIVE 帳戶且 trdmarket_auth 含 {mkt}")
             return
         thread = threading.Thread(
-            target=self._order_worker, args=(ctx, target_acc, code, side, price, qty, pin, trd_env),
+            target=self._order_worker, args=(ctx, target_acc, code, side, price, qty, pin, trd_env, market),
             name="trade-order", daemon=True)
         with self._lock:
             if self._closed:   # double-check：spawn 前一刻 stop() 咗
@@ -527,14 +530,20 @@ class TradeEngine(QObject):
         thread.start()
 
     def _order_worker(self, ctx, acc_id: int, code: str, side: TrdSide, price: float, qty: int, pin: str | None,
-                      trd_env: str = "REAL") -> None:
+                      trd_env: str = "REAL", market: bool = False) -> None:
         """阻塞 place_order（明確 acc_id + env）；「未解鎖」錯誤 + 有 PIN → unlock_trade 一次 + retry 一次（30s/10 次限制，無循環）。
 
         Commit 33：`trd_env` = "REAL"/"SIMULATE"——模擬盤無需交易密碼（futu 規則），pin 自然為 None。
+        Commit 34：`market=True` → OrderType.MARKET + price=0（市價單，平倉操作用）。
         """
         env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
+        order_kw: dict = {"code": code, "trd_side": side, "acc_id": acc_id, "trd_env": env_enum}
+        if market:
+            order_kw.update(price=0, order_type=OrderType.MARKET)   # 市價單：price 無意義（傳 0）
+        else:
+            order_kw["price"] = price                               # 限價單（默認 OrderType.NORMAL）
         try:
-            ret, msg = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id, trd_env=env_enum)
+            ret, msg = ctx.place_order(qty=qty, **order_kw)
             if ret == RET_OK and not _needs_unlock(str(msg)):
                 self.order_result.emit(True, f"下單成功 order_id={msg}")
                 return
@@ -544,8 +553,7 @@ class TradeEngine(QObject):
                 if uret != RET_OK:
                     self.order_result.emit(False, f"解鎖失敗：{umsg}")
                     return
-                ret2, msg2 = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id,
-                                             trd_env=env_enum)
+                ret2, msg2 = ctx.place_order(qty=qty, **order_kw)
                 if ret2 == RET_OK and not _needs_unlock(str(msg2)):
                     self.order_result.emit(True, f"下單成功（解鎖後重試）order_id={msg2}")
                 else:
@@ -557,6 +565,53 @@ class TradeEngine(QObject):
         except Exception as exc:  # noqa: BLE001 — worker exception 絕唔 crash engine
             logger.exception("place_order worker failed (code=%s)", code)
             self.order_result.emit(False, f"下單異常：{exc}")
+
+    # ------------------------------------------------------------- cancel order（worker thread）
+
+    def cancel_order(self, order_id: str, code: str, *, trd_env: str = "REAL", acc_id: int | None = None) -> None:
+        """GUI-thread entry：撤單 sanity check + spawn 短命 daemon worker。
+
+        Commit 34：`order_id`/`code` 由 UI 訂單表行提供（row.acc_id / row.trd_env）；
+        `acc_id=None` fallback `_order_accs[market]`（同 place_order）。結果經 `cancel_result` emit。
+        """
+        with self._lock:
+            if self._closed:
+                self.cancel_result.emit(False, "引擎已關閉，無法撤單")
+                return
+            market = code.split(".", 1)[0].upper() if "." in code else ""
+            ctx = self._ctxs.get(market)
+            target_acc = acc_id if acc_id is not None else self._order_accs.get(market)
+        if ctx is None:
+            configured = ", ".join(sorted(self._ctxs)) or "（無）"
+            self.cancel_result.emit(False, f"市場 {market!r} 未連線（已配置：{configured}）")
+            return
+        if target_acc is None:
+            env_zh = "實盤" if trd_env == "REAL" else "模擬盤"
+            self.cancel_result.emit(
+                False, f"{env_zh} {market!r} 冇可下單帳戶——需非 MASTER ACTIVE 帳戶且 trdmarket_auth 含 {market}")
+            return
+        thread = threading.Thread(
+            target=self._cancel_worker, args=(ctx, target_acc, order_id), kwargs={"trd_env": trd_env},
+            name="trade-cancel", daemon=True)
+        with self._lock:
+            if self._closed:   # double-check：spawn 前一刻 stop() 咗
+                self.cancel_result.emit(False, "引擎已關閉，無法撤單")
+                return
+            self._workers.append(thread)
+        thread.start()
+
+    def _cancel_worker(self, ctx, acc_id: int, order_id: str, *, trd_env: str = "REAL") -> None:
+        """阻塞 cancel_order（明確 acc_id + env）；結果經 `cancel_result` emit。"""
+        env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
+        try:
+            ret, msg = ctx.cancel_order(order_id=order_id, acc_id=acc_id, trd_env=env_enum)
+            if ret == RET_OK:
+                self.cancel_result.emit(True, f"撤單成功 order_id={order_id}")
+            else:
+                self.cancel_result.emit(False, str(msg))
+        except Exception as exc:  # noqa: BLE001 — worker exception 絕唔 crash engine
+            logger.exception("cancel_order worker failed (order_id=%s)", order_id)
+            self.cancel_result.emit(False, f"撤單異常：{exc}")
 
 
 def _account_info_from_row(acc_id: int, row) -> AccountInfo:

@@ -743,3 +743,47 @@ def test_catalog_ready_reemits_for_order_window(monkeypatch):
     entries = tuple(_entries())
     win._on_catalog_ready(entries)
     assert got == [entries], "catalog_ready 必須原樣 re-emit（OrderWindow 同源目錄）"
+
+
+# ------------------------------------------------------------- Commit 34：反向同步 switch_symbol
+
+def test_switch_symbol_from_order_window(monkeypatch):
+    """Commit 34：OrderWindow `code_changed` → MainWindow.switch_symbol → K 綫圖標的切換。"""
+    win, engine = _make_window(monkeypatch)
+    win._on_catalog_ready(tuple(_entries()))
+
+    win.switch_symbol("US.AAPL")
+
+    assert win.code_edit.text() == "US.AAPL"
+    assert engine.switch_calls == [("US.AAPL", _SIX_PANE_PERIODS)]
+
+
+def test_switch_symbol_unknown_code_noop(monkeypatch):
+    """Commit 34：目錄已載入但未知 code → no-op（唔切圖表去無效標的）。"""
+    win, engine = _make_window(monkeypatch)
+    win._on_catalog_ready(tuple(_entries()))
+
+    win.switch_symbol("HK.99999")   # 唔喺目錄
+
+    assert engine.switch_calls == []
+    assert win.code_edit.text() == "HK.HSImain"   # 原標的不變
+
+
+def test_switch_symbol_same_code_noop(monkeypatch):
+    """Commit 34：同當前標的 → no-op（防 K 綫 ↔ 下單雙向同步 loop）。"""
+    win, engine = _make_window(monkeypatch)
+    win._on_catalog_ready(tuple(_entries()))
+
+    win.switch_symbol("HK.HSImain")   # = 當前 code_edit 文本
+
+    assert engine.switch_calls == []
+
+
+def test_switch_symbol_empty_noop(monkeypatch):
+    """Commit 34：空字串 / None → no-op。"""
+    win, engine = _make_window(monkeypatch)
+
+    win.switch_symbol("")
+    win.switch_symbol(None)   # type: ignore[arg-type]
+
+    assert engine.switch_calls == []

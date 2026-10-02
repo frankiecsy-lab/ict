@@ -51,6 +51,7 @@ def main() -> int:
     window.code_changed.connect(order_window.set_symbol)
     window.last_price.connect(order_window.follow_price)
     window.catalog_ready.connect(order_window.set_stock_catalog)   # Commit 31：股票目錄 → 下單代碼補全/驗證
+    order_window.code_changed.connect(window.switch_symbol)   # Commit 34：反向同步——下單標的 → K 綫圖
     order_window.set_symbol(window.code_edit.text())   # 初始同步一次（UI-state restored code）
     window.show()
     order_window.show()
