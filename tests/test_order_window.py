@@ -16,7 +16,7 @@ from engine.trade_engine import AccountInfo, FundsSnapshot, OrderRow, PositionRo
 from futu import TrdSide
 
 import ui.order_window as ow
-from ui.order_window import OrderWindow, _PinHolder, _order_status_zh
+from ui.order_window import OrderWindow, _PinHolder, _order_status_zh, _price_step
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -29,7 +29,7 @@ class FakeTradeEngine(QObject):
 
     accounts_updated = Signal(tuple)
     positions_updated = Signal(tuple)
-    funds_updated = Signal(object)
+    account_funds_updated = Signal(int, str, object)   # (acc_id, trd_env "REAL"/"SIMULATE", FundsSnapshot)
     orders_updated = Signal(tuple)
     status = Signal(str)
     error = Signal(str)
@@ -83,8 +83,11 @@ def test_unlock_with_valid_pin_enables_trading(monkeypatch):
 
     assert w._pin_holder is not None
     assert w._place_btn.isEnabled() is True
-    for widget in (w._order_code, w._side_combo, w._order_price, w._order_qty):
+    for widget in (w._order_code, w._side_combo, w._order_qty):
         assert widget.isEnabled() is True
+    # 價格欄：follow mode（默認）→ 解鎖後仍 disabled（由市價驅動）；manual mode 需解鎖先可輸入
+    assert w._following is True and w._order_price.isEnabled() is False
+    assert w._follow_btn.isEnabled() is True, "模式切換按鍵唔係交易動作——永遠可用"
     assert w._lock_btn.isEnabled() is True
     assert "已解鎖" in w._status_label.text()
 
@@ -176,33 +179,46 @@ def test_positions_table_populated(monkeypatch):
 
 
 def test_funds_labels_updated(monkeypatch):
+    """Per-account 資金事件 → 該 env tab 9 欄（單帳戶 = 自己數值）+ 其他 env 唔受影響。"""
     funds = FundsSnapshot(
         total_assets=1_234_567.5, cash_hkd=500_000.0, cash_usd=10_000.25,
         withdraw_hkd=400_000.0, withdraw_usd=8_000.0, buying_power=2_000_000.0,
         initial_margin=50_000.0, maintenance_margin=30_000.0, risk_status="LEVEL3")
     w, fake = _make_window(monkeypatch)
 
-    fake.funds_updated.emit(funds)
+    fake.account_funds_updated.emit(7, "REAL", funds)
 
-    assert w._funds_labels["total_assets"].text() == "1,234,567.50"
-    assert w._funds_labels["cash_hkd"].text() == "500,000.00"
-    assert w._funds_labels["cash_usd"].text() == "10,000.25"
-    assert w._funds_labels["buying_power"].text() == "2,000,000.00"
-    assert w._funds_labels["initial_margin"].text() == "50,000.00"
-    assert w._funds_labels["risk_status"].text() == "安全", "LEVEL3 → 中文風控狀態"
+    real = w._env_funds_labels["REAL"]
+    assert real["total_assets"].text() == "1,234,567.50"
+    assert real["cash_hkd"].text() == "500,000.00"
+    assert real["cash_usd"].text() == "10,000.25"
+    assert real["buying_power"].text() == "2,000,000.00"
+    assert real["initial_margin"].text() == "50,000.00"
+    assert real["risk_status"].text() == "安全", "LEVEL3 → 中文風控狀態"
+
+    sim = w._env_funds_labels["SIMULATE"]
+    assert sim["total_assets"].text() == "—", "SIMULATE env 無事件 → 全 '—'"
 
 
 def _acc(acc_id: int, env: str = "REAL", acc_type: str = "MARGIN", sim_acc_type: str = "",
-         role: str = "", auth=("HK",), card: str = "12345678") -> AccountInfo:
-    """AccountInfo test factory（keyword 參數，字段順序無關）。"""
+         role: str = "", auth=("HK",), card: str = "12345678", acc_status: str = "ACTIVE") -> AccountInfo:
+    """AccountInfo test factory（keyword 參數，字段順序無關；默認 ACTIVE——非 ACTIVE 會被隱藏）。"""
     return AccountInfo(
         acc_id=acc_id, trd_env=env, acc_type=acc_type, sim_acc_type=sim_acc_type,
         uni_card_num=f"U{card}", card_num=card, security_firm="FUTUSECURITIES",
-        trdmarket_auth=tuple(auth), acc_role=role, acc_status="NORMAL")
+        trdmarket_auth=tuple(auth), acc_role=role, acc_status=acc_status)
+
+
+def _funds(total_assets: float = 0.0, **kw) -> FundsSnapshot:
+    """FundsSnapshot test factory（未指定字段默認 0 / LEVEL3）。"""
+    base = dict(cash_hkd=0.0, cash_usd=0.0, withdraw_hkd=0.0, withdraw_usd=0.0,
+                buying_power=0.0, initial_margin=0.0, maintenance_margin=0.0, risk_status="LEVEL3")
+    base.update(kw)
+    return FundsSnapshot(total_assets=total_assets, **base)
 
 
 def test_account_cards_render_per_account(monkeypatch):
-    """accounts_updated → per-account 卡片：每帳戶一張卡（按 acc_id 排序）+ 標籤 + 卡號末四位常駐可見。"""
+    """accounts_updated → per-account 卡片按 env tab 分類（REAL/SIMULATE、按 acc_id 排序）+ 標籤 + 卡號末四位常駐可見。"""
     w, fake = _make_window(monkeypatch)
 
     fake.accounts_updated.emit((
@@ -211,7 +227,8 @@ def test_account_cards_render_per_account(monkeypatch):
         _acc(3, env="SIMULATE", sim_acc_type="COMPETITION", auth=("US",)),   # SIMULATE 比賽
     ))
 
-    assert len(w._account_cards) == 3
+    assert len(w._env_card_lists["REAL"]) == 2          # 實盤 tab：兩卡
+    assert len(w._env_card_lists["SIMULATE"]) == 1      # 模擬 tab：一卡
     texts = "\n".join(l.text() for l in w.findChildren(QLabel))
     assert "1 · MARGIN" in texts          # 卡片 header：acc_id · acc_type
     assert "主帳戶" in texts               # MASTER → 「主帳戶」標籤
@@ -228,10 +245,10 @@ def test_account_cards_empty_snapshot(monkeypatch):
         _acc(2),
         _acc(1, role="MASTER"),
     ))
-    assert len(w._account_cards) == 2
+    assert sum(len(v) for v in w._env_card_lists.values()) == 2
 
     fake.accounts_updated.emit(())   # 空 snapshot（例如 OpenD 未連線 / 無帳戶）
-    assert len(w._account_cards) == 0
+    assert sum(len(v) for v in w._env_card_lists.values()) == 0
 
 
 def test_orders_table_populated_with_status_zh_and_color(monkeypatch):
@@ -292,7 +309,7 @@ def test_place_order_dispatches_to_engine(monkeypatch):
 
     w._order_code.setText("HK.00700")
     w._side_combo.setCurrentIndex(0)   # 買入
-    w._order_price.setText("55.5")
+    w._order_price.setValue(55.5)      # QDoubleSpinBox（programmatic setValue 唔受 disabled 影響）
     w._order_qty.setText("200")
     w._on_place_order()
 
@@ -308,7 +325,7 @@ def test_place_order_sell_side(monkeypatch):
 
     w._order_code.setText("US.AAPL")
     w._side_combo.setCurrentIndex(1)   # 賣出
-    w._order_price.setText("140.25")
+    w._order_price.setValue(140.25)
     w._order_qty.setText("10")
     w._on_place_order()
 
@@ -316,22 +333,22 @@ def test_place_order_sell_side(monkeypatch):
 
 
 def test_place_order_rejects_invalid_input(monkeypatch):
-    """代碼無 '.' / 非數字價格 → 唔 dispatch + 錯誤 status。"""
+    """代碼無 '.' / 價格 ≤ 0 → 唔 dispatch + 錯誤 status（非數字輸入由 spinbox validator 源頭攔截）。"""
     w, fake = _make_window(monkeypatch)
     _unlock(w)
 
     w._order_code.setText("NOPE")   # 無 market prefix
-    w._order_price.setText("10")
+    w._order_price.setValue(10.0)
     w._order_qty.setText("5")
     w._on_place_order()
     assert fake.order_calls == []
     assert "代碼格式錯誤" in w._status_label.text()
 
     w._order_code.setText("HK.00700")
-    w._order_price.setText("abc")   # 非數字（programmatic setText 繞過 validator）
+    w._order_price.setValue(0)   # QDoubleSpinBox 原生 range——剩餘非法值只係 0/負數
     w._on_place_order()
     assert fake.order_calls == []
-    assert "必須係數字" in w._status_label.text()
+    assert "必須大於 0" in w._status_label.text()
 
 
 def test_shutdown_stops_engine(monkeypatch):
@@ -339,3 +356,107 @@ def test_shutdown_stops_engine(monkeypatch):
     assert fake.started_cfg is not None, "constructor 應 start engine"
     w.shutdown()
     assert fake.stopped is True
+
+
+# ------------------------------------------------------------- 標的同步 / 跟隨市價 / stepper
+
+def test_price_step_magnitudes():
+    """_price_step 純函數：10^(floor(log10(p))−2) + clamp [0.001, 10]。"""
+    assert _price_step(55.5) == pytest.approx(0.1)
+    assert _price_step(5.5) == pytest.approx(0.01)
+    assert _price_step(555.0) == pytest.approx(1.0)
+    assert _price_step(0) == 0.001          # ≤0 → 最小步長
+    assert _price_step(-3.0) == 0.001
+    assert _price_step(99_999.0) == 10.0    # 上限 clamp
+    assert _price_step(0.05) == 0.001       # 下限 clamp
+
+
+def test_set_symbol_syncs_order_code_even_when_locked(monkeypatch):
+    """K 綫標的切換 → 下單代碼跟隨（PIN locked 都生效——純顯示，唔係交易動作）。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._order_code.isEnabled() is False   # LOCKED
+
+    w.set_symbol("US.AAPL")
+    assert w._order_code.text() == "US.AAPL"
+
+
+def test_follow_price_updates_only_in_follow_mode(monkeypatch):
+    """follow mode → 市價自動更新；manual mode → no-op（唔覆蓋用戶輸入）；重入 follow 還原最後市價。"""
+    w, _ = _make_window(monkeypatch)
+
+    assert w._following is True
+    w.follow_price(55.5)
+    assert w._order_price.value() == 55.5
+    assert w._last_followed_price == 55.5
+    w.follow_price(None)   # None / ≤0 → no-op
+    w.follow_price(-1.0)
+    assert w._order_price.value() == 55.5
+
+    # 切 manual mode → 市價唔再覆蓋
+    w._follow_btn.setChecked(False)
+    assert w._following is False
+    w.follow_price(99.0)
+    assert w._order_price.value() == 55.5, "manual mode 唔覆蓋用戶輸入"
+
+    # 重入 follow mode → 還原最後市價（55.5——manual mode 嘅 99.0 no-op、唔計跟隨）
+    w._follow_btn.setChecked(True)
+    assert w._following is True
+    assert w._order_price.value() == 55.5
+
+
+def test_follow_toggle_glyph_and_manual_requires_unlock(monkeypatch):
+    """🔗/✎ glyph toggle + manual mode 價格欄需 PIN 解鎖先可輸入。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._follow_btn.isChecked() is True and w._follow_btn.text() == "🔗"
+
+    # LOCKED + manual → 價格欄仍 disabled（交易動作要解鎖）
+    w._follow_btn.setChecked(False)
+    assert w._following is False and w._follow_btn.text() == "✎"
+    assert w._order_price.isEnabled() is False, "manual mode locked 時都要 PIN 解鎖先可輸入"
+
+    _unlock(w)
+    assert w._order_price.isEnabled() is True, "解鎖後 manual mode 可輸入"
+
+    # 切返 follow → 再 disabled（由市價驅動）
+    w._follow_btn.setChecked(True)
+    assert w._following is True and w._follow_btn.text() == "🔗"
+    assert w._order_price.isEnabled() is False
+
+
+def test_account_card_shows_own_funds(monkeypatch):
+    """Per-account 資金事件 → 該卡「總資產」label 更新（唔係 env 加總）；未收事件帳戶保持佔位。"""
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1), _acc(2)))
+
+    fake.account_funds_updated.emit(1, "REAL", _funds(total_assets=1_000_000.0))
+    assert w._card_funds_labels[("REAL", 1)].text() == "總資產 1,000,000.00"
+    assert w._card_funds_labels[("REAL", 2)].text() == "總資產 —"
+
+
+def test_env_funds_panel_sums_all_accounts_in_env(monkeypatch):
+    """右側資金面板 = env 加總（GUI 端 per-env fold，重用 engine._sum_funds）。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.account_funds_updated.emit(1, "REAL", _funds(total_assets=1_000_000.0, cash_hkd=500_000.0))
+    fake.account_funds_updated.emit(2, "REAL", _funds(total_assets=2_000_000.0, cash_hkd=300_000.0))
+
+    real = w._env_funds_labels["REAL"]
+    assert real["total_assets"].text() == "3,000,000.00"   # 1M + 2M
+    assert real["cash_hkd"].text() == "800,000.00"         # 500k + 300k
+
+    sim = w._env_funds_labels["SIMULATE"]
+    assert sim["total_assets"].text() == "—", "SIMULATE env 無事件 → 全 '—'"
+
+
+def test_non_active_accounts_hidden_from_cards(monkeypatch):
+    """acc_status != ACTIVE → 隱藏（數據源照 emit、顯示過濾喺 UI 層）。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.accounts_updated.emit((
+        _acc(1),                          # ACTIVE
+        _acc(2, acc_status="DISABLED"),   # 非 ACTIVE → 隱藏
+    ))
+
+    assert len(w._env_card_lists["REAL"]) == 1
+    texts = "\n".join(l.text() for l in w.findChildren(QLabel))
+    assert "2 · MARGIN" not in texts

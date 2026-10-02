@@ -137,7 +137,8 @@ def test_f_handles_invalid_values():
 
 def test_start_spawns_setup_and_poll_threads(monkeypatch):
     ctx = FakeTradeCtx()
-    ctx.acc_list = (RET_OK, _acc_df([{"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1"}]))
+    ctx.acc_list = (RET_OK, _acc_df([{"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
+                                      "acc_status": "ACTIVE"}]))
     _install_ctx_factory(monkeypatch, {"HK": ctx})
 
     pos_events: list = []
@@ -154,7 +155,8 @@ def test_start_spawns_setup_and_poll_threads(monkeypatch):
 
 def test_stop_is_idempotent_and_joins_threads(monkeypatch):
     ctx = FakeTradeCtx()
-    ctx.acc_list = (RET_OK, _acc_df([{"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1"}]))
+    ctx.acc_list = (RET_OK, _acc_df([{"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
+                                      "acc_status": "ACTIVE"}]))
     _install_ctx_factory(monkeypatch, {"HK": ctx})
 
     pos_events: list = []
@@ -186,7 +188,8 @@ def test_no_real_account_status_message(monkeypatch):
 def test_market_ctx_failure_continues_other_markets(monkeypatch):
     """HK context 建立失敗 → error emit + US 照常連線。"""
     us = FakeTradeCtx()
-    us.acc_list = (RET_OK, _acc_df([{"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2"}]))
+    us.acc_list = (RET_OK, _acc_df([{"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2",
+                                     "acc_status": "ACTIVE"}]))
 
     def factory(filter_trdmarket=None, **kw):
         name = getattr(filter_trdmarket, "name", None) or str(filter_trdmarket)
@@ -211,9 +214,10 @@ def test_market_ctx_failure_continues_other_markets(monkeypatch):
 # ------------------------------------------------------------- poll / queries
 
 def _wire_poll_state(engine: TradeEngine, ctx: FakeTradeCtx, acc_id: int = 7, order_acc: bool = True) -> None:
-    """Wire poll state：ctxs + REAL accounts（+ 可下單 acc_id，除非 order_acc=False）。"""
+    """Wire poll state：ctxs + REAL accounts（+ per-account funds target + 可下單 acc_id，除非 order_acc=False）。"""
     engine._ctxs["HK"] = ctx
     engine._accounts["HK"] = [(acc_id, "card")]
+    engine._funds_targets = [("HK", acc_id, "REAL")]   # per-account funds polling（雙 env、ACTIVE only）
     if order_acc:
         engine._order_accs["HK"] = acc_id
 
@@ -267,7 +271,7 @@ def test_positions_dataframe_input_normalized():
 
 
 def test_funds_dataframe_input_normalized():
-    """live bug regression：accinfo_query 成功返回 **DataFrame** → _rows() normalize + risk_status。"""
+    """live bug regression：accinfo_query 成功返回 **DataFrame** → _rows() normalize + per-account event。"""
     ctx = FakeTradeCtx()
     ctx.funds = (RET_OK, pd.DataFrame([{
         "total_assets": 500_000.0, "hk_cash": 200_000.0, "us_cash": 1_000.0,
@@ -279,11 +283,12 @@ def test_funds_dataframe_input_normalized():
     _wire_poll_state(engine, ctx)
 
     funds_events: list = []
-    engine.funds_updated.connect(funds_events.append)
+    engine.account_funds_updated.connect(lambda *a: funds_events.append(a))   # 3-arg signal → tuple
     engine._poll_once()
 
     assert len(funds_events) == 1, "DataFrame 必須 normalize（舊 isinstance(data, list) live 靜默失敗）"
-    f = funds_events[0]
+    acc_id, env_str, f = funds_events[0]
+    assert (acc_id, env_str) == (7, "REAL"), "per-account event：(acc_id, trd_env, snapshot)"
     assert f.total_assets == 500_000.0 and f.buying_power == 900_000.0
     assert f.risk_status == "LEVEL3"
 
@@ -321,8 +326,8 @@ def test_positions_query_failure_returns_empty():
     assert pos_events == [()], "查詢失敗 → 空 tuple（唔 crash）"
 
 
-def test_funds_signal_emits_snapshot_totals():
-    """多帳戶 accinfo_query → 跨帳戶加總成一個 FundsSnapshot。"""
+def test_funds_signal_emits_per_account_events():
+    """多帳戶 accinfo_query → **逐個 emit** per-account event（各自總額；engine 唔再加總——GUI 端按 env 分組加總）。"""
     ctx = FakeTradeCtx()
     base = {
         "total_assets": 1_000_000.0, "hk_cash": 500_000.0, "us_cash": 10_000.0,
@@ -333,27 +338,27 @@ def test_funds_signal_emits_snapshot_totals():
     ctx.funds = (RET_OK, [base])
     engine = TradeEngine()
     _wire_poll_state(engine, ctx)
-    # 第二個帳戶：加總驗證
-    engine._accounts["HK"] = [(7, "c1"), (8, "c2")]
+    # 第二個帳戶：per-account event（GUI 端按 env 分組加總）
+    engine._funds_targets = [("HK", 7, "REAL"), ("HK", 8, "REAL")]
 
     funds_events: list = []
-    engine.funds_updated.connect(funds_events.append)
+    engine.account_funds_updated.connect(lambda *a: funds_events.append(a))   # 3-arg signal → tuple
     engine._poll_once()
 
-    assert len(funds_events) == 1
-    f = funds_events[0]
-    assert f.total_assets == 2_000_000.0, "兩帳戶加總"
-    assert f.cash_hkd == 1_000_000.0 and f.cash_usd == 20_000.0
-    assert f.withdraw_hkd == 800_000.0 and f.withdraw_usd == 16_000.0
-    assert f.buying_power == 4_000_000.0
-    assert f.initial_margin == 100_000.0 and f.maintenance_margin == 60_000.0
-    assert f.risk_status == "LEVEL3"
+    assert len(funds_events) == 2, "每帳戶一個獨立 event（唔再跨帳戶加總）"
+    by_acc = {acc_id: snap for acc_id, _env, snap in funds_events}
+    assert set(by_acc) == {7, 8}
+    for f in by_acc.values():
+        assert f.total_assets == 1_000_000.0, "各自總額（engine 唔加總）"
+        assert f.cash_hkd == 500_000.0 and f.cash_usd == 10_000.0
+        assert f.withdraw_hkd == 400_000.0 and f.withdraw_usd == 8_000.0
+        assert f.buying_power == 2_000_000.0
 
 
-def test_funds_risk_status_takes_most_severe():
-    """跨帳戶 risk_status 聚合取最嚴重（LEVEL1 > LEVEL2 > LEVEL3；空 = 無資訊）。"""
+def test_funds_risk_status_per_account_passthrough():
+    """per-account event：risk_status 原樣透傳（跨帳戶「取最嚴重」係 GUI 端 _sum_funds 嘅事）。"""
     ctx = FakeTradeCtx()
-    # 兩帳戶：acc 7 LEVEL3、acc 8 LEVEL1 → 加總後應係 LEVEL1
+    # 兩帳戶：acc 7 LEVEL3、acc 8 LEVEL1 → 各自 event 保留自己嘅 risk_status
     responses = {7: {"total_assets": 100.0, "risk_status": "LEVEL3"},
                  8: {"total_assets": 200.0, "risk_status": "LEVEL1"}}
 
@@ -364,20 +369,20 @@ def test_funds_risk_status_takes_most_severe():
     ctx.accinfo_query = accinfo_query   # instance attr shadow method（per-acc response）
     engine = TradeEngine()
     _wire_poll_state(engine, ctx)
-    engine._accounts["HK"] = [(7, "c1"), (8, "c2")]
+    engine._funds_targets = [("HK", 7, "REAL"), ("HK", 8, "REAL")]
 
     funds_events: list = []
-    engine.funds_updated.connect(funds_events.append)
+    engine.account_funds_updated.connect(lambda *a: funds_events.append(a))   # 3-arg signal → tuple
     engine._poll_once()
 
-    assert len(funds_events) == 1
-    f = funds_events[0]
-    assert f.total_assets == 300.0
-    assert f.risk_status == "LEVEL1", "跨帳戶聚合取最嚴重"
+    by_acc = {acc_id: snap for acc_id, _env, snap in funds_events}
+    assert set(by_acc) == {7, 8}
+    assert by_acc[7].total_assets == 100.0 and by_acc[7].risk_status == "LEVEL3"
+    assert by_acc[8].total_assets == 200.0 and by_acc[8].risk_status == "LEVEL1", "per-account 原樣透傳"
 
 
 def test_funds_query_failure_skips_account():
-    """單帳戶 accinfo 失敗 → 唔 emit funds（got_funds=False），positions 照常。"""
+    """單帳戶 accinfo 失敗 → 唔 emit account_funds_updated（GUI 保留上次值），positions 照常。"""
     ctx = FakeTradeCtx()
     ctx.funds = (-1, "accinfo failed")
     engine = TradeEngine()
@@ -386,7 +391,7 @@ def test_funds_query_failure_skips_account():
     pos_events: list = []
     funds_events: list = []
     engine.positions_updated.connect(pos_events.append)
-    engine.funds_updated.connect(funds_events.append)
+    engine.account_funds_updated.connect(lambda *a: funds_events.append(a))   # 3-arg signal → tuple
     engine._poll_once()
     assert pos_events == [()]
     assert funds_events == [], "無有效資金數據唔應 emit"
@@ -530,15 +535,15 @@ def test_setup_classifies_all_accounts_and_excludes_master(monkeypatch):
         # acc 1：REAL MASTER 主帳戶（auth HK,US）→ 分類可見、polling 計入、但唔可落單
         {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1", "uni_card_num": "U1",
          "acc_type": "MARGIN", "sim_acc_type": "", "security_firm": "FUTUSECURITIES",
-         "trdmarket_auth": ("HK", "US"), "acc_role": "MASTER", "acc_status": "NORMAL"},
+         "trdmarket_auth": ("HK", "US"), "acc_role": "MASTER", "acc_status": "ACTIVE"},
         # acc 2：REAL 非 MASTER（auth HK）→ HK 市場下單帳戶
         {"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2", "uni_card_num": "U2",
          "acc_type": "MARGIN", "sim_acc_type": "", "security_firm": "FUTUSECURITIES",
-         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "NORMAL"},
+         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "ACTIVE"},
         # acc 3：SIMULATE 比賽帳戶 → 分類面板可見、唔入 polling / 下單
         {"acc_id": 3, "trd_env": "SIMULATE", "card_num": "C3", "uni_card_num": "U3",
          "acc_type": "MARGIN", "sim_acc_type": "COMPETITION", "security_firm": "",
-         "trdmarket_auth": ("US",), "acc_role": "", "acc_status": "NORMAL"},
+         "trdmarket_auth": ("US",), "acc_role": "", "acc_status": "ACTIVE"},
     ]
     ctx.acc_list = (RET_OK, _acc_df(rows))
     _install_ctx_factory(monkeypatch, {"HK": ctx})
@@ -569,9 +574,9 @@ def test_setup_dedupes_accounts_across_market_contexts(monkeypatch):
     ctx = FakeTradeCtx()   # HK/US 共用同一 fake（get_acc_list 返回相同）
     rows = [
         {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
-         "trdmarket_auth": ("HK", "US"), "acc_role": ""},
+         "trdmarket_auth": ("HK", "US"), "acc_role": "", "acc_status": "ACTIVE"},
         {"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2",
-         "trdmarket_auth": ("US",), "acc_role": ""},
+         "trdmarket_auth": ("US",), "acc_role": "", "acc_status": "ACTIVE"},
     ]
     ctx.acc_list = (RET_OK, _acc_df(rows))
     _install_ctx_factory(monkeypatch, {"HK": ctx, "US": ctx})
@@ -588,6 +593,56 @@ def test_setup_dedupes_accounts_across_market_contexts(monkeypatch):
     # per-market polling list 各自獨立（每個 context 查自己嗰份 REAL 帳戶）
     assert {aid for aid, _c in engine._accounts["HK"]} == {1, 2}
     assert {aid for aid, _c in engine._accounts["US"]} == {1, 2}
+    # funds_targets 按 (env, acc_id) dedupe：首個發現嘅 market（HK）決定用邊個 ctx
+    assert [(m, a, e) for m, a, e in engine._funds_targets] == [("HK", 1, "REAL"), ("HK", 2, "REAL")]
+
+
+def test_setup_excludes_non_active_accounts_from_polling(monkeypatch):
+    """acc_status != "ACTIVE"（DISABLED）→ 排除出 _accounts / _funds_targets / 下單選擇，但 accounts_updated 仍可見。"""
+    ctx = FakeTradeCtx()
+    rows = [
+        {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
+         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "DISABLED"},
+        {"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2",
+         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "ACTIVE"},
+    ]
+    ctx.acc_list = (RET_OK, _acc_df(rows))
+    _install_ctx_factory(monkeypatch, {"HK": ctx})
+
+    engine = TradeEngine()
+    accounts_events: list = []
+    engine.accounts_updated.connect(accounts_events.append)
+    engine._cfg = _cfg(("HK",))
+    engine._setup()
+
+    accs = accounts_events[0]
+    assert {a.acc_id for a in accs} == {1, 2}, "accounts_updated 照舊 emit 全部帳戶（含 DISABLED）"
+    by_id = {a.acc_id: a for a in accs}
+    assert by_id[1].acc_status == "DISABLED" and by_id[2].acc_status == "ACTIVE"
+    # DISABLED 排除出 polling / funds / 下單選擇（三處一致）
+    assert {aid for aid, _c in engine._accounts["HK"]} == {2}, "DISABLED 唔入 positions/orders polling"
+    assert [(m, a, e) for m, a, e in engine._funds_targets] == [("HK", 2, "REAL")], "DISABLED 唔入資金輪詢"
+    assert engine._order_accs.get("HK") == 2, "下單帳戶 = 唯一 ACTIVE"
+
+
+def test_setup_funds_targets_cover_both_envs_active_only(monkeypatch):
+    """_funds_targets 覆蓋雙 env（REAL + SIMULATE）全部 ACTIVE 帳戶——GUI per-account 資金面板數據源。"""
+    ctx = FakeTradeCtx()
+    rows = [
+        {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
+         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "ACTIVE"},
+        {"acc_id": 2, "trd_env": "SIMULATE", "card_num": "C2",
+         "trdmarket_auth": ("US",), "acc_role": "", "acc_status": "ACTIVE"},
+    ]
+    ctx.acc_list = (RET_OK, _acc_df(rows))
+    _install_ctx_factory(monkeypatch, {"HK": ctx})
+
+    engine = TradeEngine()
+    engine._cfg = _cfg(("HK",))
+    engine._setup()
+
+    assert [(m, a, e) for m, a, e in engine._funds_targets] == [
+        ("HK", 1, "REAL"), ("HK", 2, "SIMULATE")], "雙 env ACTIVE 帳戶都入資金輪詢"
 
 
 def test_orders_poll_interval_respects_30s_limit():

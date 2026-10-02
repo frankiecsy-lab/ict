@@ -1,4 +1,6 @@
-"""下單版面視窗：實倉資金/持倉/今日訂單顯示 + 全帳戶分類 + 限價買賣下單 + 六位數 PIN 交易解鎖。
+"""下單版面視窗：帳戶卡片按環境 tab 分類（只 ACTIVE）+ per-account 資金 + env 加總資金面板
++ 持倉/今日訂單顯示 + 限價買賣下單（代碼跟隨 K 綫標的、價格默認跟隨市價 + icon 切換手動 + stepper）
++ 六位數 PIN 交易解鎖。
 
 PIN 安全設計（用戶要求：6 位臨時密碼絕不明文顯示）:
 - input = QLineEdit EchoMode.Password + [0-9]{0,6} validator → UI 永遠圓點；
@@ -11,18 +13,18 @@ Threading：TradeEngine 係 child QObject；所有 RPC 喺 engine worker thread�
 """
 from __future__ import annotations
 
+import math
 import time
 
 from PySide6.QtCore import QRegularExpression, QTimer
-from PySide6.QtGui import (QColor, QDoubleValidator, QIntValidator,
-                           QRegularExpressionValidator)
-from PySide6.QtWidgets import (QComboBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget, QAbstractItemView)
+from PySide6.QtGui import QColor, QIntValidator, QRegularExpressionValidator
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QMainWindow, QPushButton, QScrollArea, QTabWidget, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from config import Config
 from engine.trade_engine import (AccountInfo, FundsSnapshot, OrderRow, PositionRow,
-                                 TradeEngine)
+                                 TradeEngine, _sum_funds)
 from futu import TrdSide
 
 # 狀態色（跟 MainWindow 深色主題語義）
@@ -90,11 +92,20 @@ def _fmt_money(v: float) -> str:
     return f"{v:,.2f}"
 
 
+def _price_step(price: float) -> float:
+    """自適應 stepper 步長 = 10^(floor(log10(p))−2)——55.5→0.1、5.5→0.01、555→1.0；clamp [0.001, 10]。"""
+    if price <= 0:
+        return 0.001
+    step = 10 ** (math.floor(math.log10(price)) - 2)
+    return max(0.001, min(step, 10.0))
+
+
 class OrderWindow(QMainWindow):
     """下單版面（獨立 top-level 視窗，可拖去第二螢幕）。
 
-    佈局：PIN bar → main_row[左欄（帳戶卡片 + 持倉/訂單左右並排表）| 右欄全高（資金/訂金 + 限價下單 form）] → status label。
-    LOCKED（默認）：下單表單全 disabled；UNLOCKED：啟用 + countdown 顯示剩餘時間。
+    佈局：PIN bar → main_row[左欄（帳戶卡片 tabs + 持倉/訂單左右並排表）| 右欄全高（資金/訂金 env tabs + 限價下單 form）] → status label。
+    LOCKED（默認）：下單表單 disabled（follow 按鍵除外——模式切換唔係交易動作）；UNLOCKED：啟用 + countdown。
+    價格欄：follow mode（默認）由市價驅動、disabled；manual mode 需解鎖先可輸入，stepper 自適應步長。
     """
 
     def __init__(self, cfg: Config, *, clock=time.time, unlock_ttl_seconds: float = 24 * 3600) -> None:
@@ -113,12 +124,18 @@ class OrderWindow(QMainWindow):
             f"QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {cfg.axis_text_color}; }}"
             f"QLineEdit, QComboBox {{ background: #1A212B; border: 1px solid {cfg.grid_color}; "
             f"color: {cfg.text_color}; padding: 3px 6px; }}"
+            f"QDoubleSpinBox {{ background: #1A212B; border: 1px solid {cfg.grid_color}; "
+            f"color: {cfg.text_color}; padding: 3px 6px; }}"
             f"QPushButton {{ background: #1E2836; border: 1px solid {cfg.grid_color}; "
             f"color: {cfg.text_color}; padding: 4px 14px; }}"
             f"QPushButton:hover {{ background: #27354A; }}"
             f"QPushButton:disabled {{ color: #4A5568; background: #151B23; }}"
             f"QTableWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
             f"QFrame#accountCard {{ background: #1A212B; border: 1px solid {cfg.grid_color}; border-radius: 6px; }}"
+            f"QTabWidget::pane {{ border: 1px solid {cfg.grid_color}; top: -1px; }}"
+            f"QTabBar::tab {{ background: #151B23; color: {cfg.axis_text_color}; padding: 4px 10px; "
+            f"border: 1px solid {cfg.grid_color}; border-bottom: none; margin-right: 2px; }}"
+            f"QTabBar::tab:selected {{ background: #1A212B; color: {cfg.text_color}; font-weight: bold; }}"
             f"QHeaderView::section {{ background: #1A212B; color: {cfg.axis_text_color}; "
             f"border: none; padding: 3px; }}"
         )
@@ -151,11 +168,17 @@ class OrderWindow(QMainWindow):
         self._engine = TradeEngine(self)
         self._engine.accounts_updated.connect(self._on_accounts)
         self._engine.positions_updated.connect(self._on_positions)
-        self._engine.funds_updated.connect(self._on_funds)
+        self._engine.account_funds_updated.connect(self._on_account_funds)   # per-account（雙 env、ACTIVE）
         self._engine.orders_updated.connect(self._on_orders)
         self._engine.status.connect(lambda m: self._set_status(m, cfg.axis_text_color))
         self._engine.error.connect(lambda m: self._set_status(m, _ERR_COLOR))
         self._engine.order_result.connect(self._on_order_result)
+
+        # Per-account 資金 + 跟隨市價狀態（Commit 30）：
+        self._funds_by_acc: dict[tuple[str, int], FundsSnapshot] = {}   # (trd_env, acc_id) → snapshot；失敗帳戶保留上次值
+        self._card_funds_labels: dict[tuple[str, int], QLabel] = {}     # (trd_env, acc_id) → 卡片「總資產」label
+        self._following = True                                          # 默認跟隨市價模式（manual mode 需 PIN 解鎖先可輸入）
+        self._last_followed_price: float | None = None                  # 最後市價（重入 follow mode 時還原）
 
         # PIN 狀態：None = LOCKED（默認）；QTimer countdown tick。
         self._pin_holder: _PinHolder | None = None
@@ -195,20 +218,29 @@ class OrderWindow(QMainWindow):
         self._lock_btn.clicked.connect(self._on_lock_clicked)
         return bar
 
-    def _build_account_cards(self) -> QScrollArea:
-        """帳戶卡片區：每個帳戶一張卡（環境/類型/標籤/卡號末四位/市場/券商/狀態常駐可見）。"""
-        self._account_cards: list[QFrame] = []
-        self._cards_layout = QVBoxLayout()
-        self._cards_layout.setContentsMargins(0, 0, 0, 0)
-        self._cards_layout.setSpacing(6)
-        container = QWidget()
-        container.setLayout(self._cards_layout)
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        area.setFrameShape(QFrame.Shape.NoFrame)
-        area.setWidget(container)
-        area.setFixedHeight(200)   # 約 3–4 張卡可見；帳戶多咗自動滾動
-        return area
+    def _build_account_cards(self) -> QTabWidget:
+        """帳戶卡片區：按環境 tab 分類（實盤 REAL / 模擬 SIMULATE），每帳戶一張卡。
+
+        只顯示 ACTIVE 帳戶（_on_accounts 過濾）；非 ACTIVE（DISABLED/N/A）隱藏。
+        """
+        self._cards_tabs = QTabWidget()
+        self._env_card_layouts: dict[str, QVBoxLayout] = {}
+        self._env_card_lists: dict[str, list[QFrame]] = {}
+        for env in ("REAL", "SIMULATE"):
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+            container = QWidget()
+            container.setLayout(layout)
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setWidget(container)
+            area.setFixedHeight(200)   # 約 3–4 張卡可見；帳戶多咗自動滾動
+            self._cards_tabs.addTab(area, "實盤 REAL" if env == "REAL" else "模擬 SIMULATE")
+            self._env_card_layouts[env] = layout
+            self._env_card_lists[env] = []
+        return self._cards_tabs
 
     def _make_account_card(self, a: AccountInfo) -> QFrame:
         """單一帳戶卡片：header = id·類型[環境]（標籤）；detail = 卡號末四位/市場/券商/狀態。"""
@@ -227,20 +259,25 @@ class OrderWindow(QMainWindow):
         env_zh = "實盤 REAL" if a.trd_env == "REAL" else "模擬 SIMULATE"
         header = QLabel(f"{a.acc_id} · {a.acc_type or '—'} [{env_zh}]{tag_text}")
         header.setStyleSheet(f"font-weight: bold; color: {cfg.text_color};")
+        funds_label = QLabel("總資產 —")   # per-account 資金（_on_account_funds 更新）
+        funds_label.setStyleSheet(f"font-weight: bold; color: {cfg.text_color};")
+        self._card_funds_labels[(a.trd_env, a.acc_id)] = funds_label
         card_num = a.uni_card_num or a.card_num
         detail = (f"卡號 …{card_num[-4:] if card_num else '—'} · 市場 {'/'.join(a.trdmarket_auth) or '—'}\n"
                   f"券商 {a.security_firm or '—'} · 狀態 {a.acc_status or '—'}")
         info = QLabel(detail)
         info.setStyleSheet("color: #7A8699;")
         v.addWidget(header)
+        v.addWidget(funds_label)
         v.addWidget(info)
         return card
 
     def _build_funds_group(self) -> QGroupBox:
-        """資金/訂金 group：9 個 label（總資產/現金 HKD/USD/可提 HKD/USD/購買力/初始保證金/維持保證金/風控狀態）。"""
+        """資金/訂金 group：按環境 tab 分類（實盤/模擬），各 tab = 該 env 全部 ACTIVE 帳戶加總嘅 9 欄。"""
         box = QGroupBox("資金 / 訂金")
-        grid = QVBoxLayout(box)
-        self._funds_labels: dict[str, QLabel] = {}
+        outer = QVBoxLayout(box)
+        self._funds_tabs = QTabWidget()
+        self._env_funds_labels: dict[str, dict[str, QLabel]] = {}
         rows = [
             ("total_assets", "總資產"), ("cash_hkd", "現金 HKD"),
             ("cash_usd", "現金 USD"), ("withdraw_hkd", "可提 HKD"),
@@ -248,17 +285,24 @@ class OrderWindow(QMainWindow):
             ("initial_margin", "初始保證金（訂金）"), ("maintenance_margin", "維持保證金"),
             ("risk_status", "風控狀態"),
         ]
-        for key, label_text in rows:
-            row = QHBoxLayout()
-            name = QLabel(f"{label_text}：")
-            name.setStyleSheet("color: #7A8699;")
-            value = QLabel("—")
-            value.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
-            self._funds_labels[key] = value
-            row.addWidget(name)
-            row.addStretch(1)
-            row.addWidget(value)
-            grid.addLayout(row)
+        for env in ("REAL", "SIMULATE"):
+            page = QWidget()
+            grid = QVBoxLayout(page)
+            labels: dict[str, QLabel] = {}
+            for key, label_text in rows:
+                row = QHBoxLayout()
+                name = QLabel(f"{label_text}：")
+                name.setStyleSheet("color: #7A8699;")
+                value = QLabel("—")
+                value.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
+                labels[key] = value
+                row.addWidget(name)
+                row.addStretch(1)
+                row.addWidget(value)
+                grid.addLayout(row)
+            self._env_funds_labels[env] = labels
+            self._funds_tabs.addTab(page, "實盤 REAL" if env == "REAL" else "模擬 SIMULATE")
+        outer.addWidget(self._funds_tabs)
         return box
 
     def _build_positions_table(self) -> QTableWidget:
@@ -295,9 +339,19 @@ class OrderWindow(QMainWindow):
         self._side_combo = QComboBox()
         self._side_combo.addItems(["買入", "賣出"])
         price_label = QLabel("價格")
-        self._order_price = QLineEdit()
-        self._order_price.setValidator(QDoubleValidator(0.0, 1e12, 4))
-        self._order_price.setPlaceholderText("限價")
+        # 價格 = QDoubleSpinBox：原生 range/validator + 上下箭頭 stepper（自適應步長）；默認跟隨市價模式
+        self._order_price = QDoubleSpinBox()
+        self._order_price.setRange(0.0, 1e12)
+        self._order_price.setDecimals(4)
+        self._order_price.setValue(0.0)
+        self._order_price.setSingleStep(_price_step(1.0))   # = 0.01；valueChanged 後自適應
+        self._follow_btn = QPushButton("🔗")
+        self._follow_btn.setCheckable(True)
+        self._follow_btn.blockSignals(True)                 # 防 setChecked 喺 state 未就緒時觸發 _on_follow_toggled
+        self._follow_btn.setChecked(True)                   # 默認跟隨市價模式
+        self._follow_btn.blockSignals(False)
+        self._follow_btn.setFixedWidth(34)
+        self._follow_btn.setToolTip("跟隨市價（報價自動更新）；點擊切換手動輸入")
         qty_label = QLabel("數量")
         self._order_qty = QLineEdit()
         self._order_qty.setValidator(QIntValidator(1, 10**9))
@@ -307,11 +361,15 @@ class OrderWindow(QMainWindow):
         h.addWidget(self._order_code, 2)
         h.addWidget(self._side_combo)
         h.addWidget(price_label)
-        h.addWidget(self._order_price)
+        h.addWidget(self._order_price, 1)
+        h.addWidget(self._follow_btn)
         h.addWidget(qty_label)
         h.addWidget(self._order_qty)
         h.addWidget(self._place_btn)
         self._place_btn.clicked.connect(self._on_place_order)
+        # toggled 只有單一 (bool) overload → slot 帶明確 bool 參數係正確綁定（唔似 clicked 雙 overload）
+        self._follow_btn.toggled.connect(self._on_follow_toggled)
+        self._order_price.valueChanged.connect(self._on_price_value_changed)
         return box
 
     # ------------------------------------------------------------- PIN 狀態機
@@ -322,8 +380,11 @@ class OrderWindow(QMainWindow):
         self._pin_edit.setEnabled(not unlocked)
         self._unlock_btn.setEnabled(not unlocked)
         self._lock_btn.setEnabled(unlocked)
-        for w in (self._order_code, self._side_combo, self._order_price, self._order_qty):
+        for w in (self._order_code, self._side_combo, self._order_qty):
             w.setEnabled(unlocked)
+        # 價格欄：「解鎖 AND 手動模式」先可編輯——follow mode 由市價驅動（disabled 防用戶輸入被覆蓋）
+        self._order_price.setEnabled(unlocked and not self._following)
+        # follow 按鍵係模式切換（唔係交易動作）→ locked 都可用
         # 下單按鍵跟隨鎖狀態（in-flight guard 由 _on_place_order/_on_order_result 短暫覆蓋）
         self._place_btn.setEnabled(unlocked)
 
@@ -370,17 +431,65 @@ class OrderWindow(QMainWindow):
         m, s = divmod(rem, 60)
         self._countdown_label.setText(f"剩餘 {h:02d}:{m:02d}:{s:02d}")
 
+    # ------------------------------------------------------------- 跨視窗同步（main.py 接線：MainWindow.code_changed / last_price）
+
+    def set_symbol(self, code: str) -> None:
+        """K 綫標的切換 → 下單代碼跟隨（PIN locked 都生效——純顯示，唔涉及交易）。"""
+        self._order_code.blockSignals(True)
+        try:
+            self._order_code.setText(code or "")
+        finally:
+            self._order_code.blockSignals(False)
+
+    def follow_price(self, price: float | None) -> None:
+        """最新市價 → 自動更新下單價格（只喺 follow mode；manual mode no-op——唔覆蓋用戶輸入）。"""
+        if not self._following or price is None or price <= 0:
+            return
+        self._last_followed_price = price
+        self._order_price.blockSignals(True)   # 防 valueChanged → _on_price_value_changed round-trip
+        try:
+            self._order_price.setValue(price)
+            self._order_price.setSingleStep(_price_step(price))
+        finally:
+            self._order_price.blockSignals(False)
+
+    def _on_follow_toggled(self, on: bool) -> None:
+        """follow 按鍵 toggle：跟隨市價（🔗）↔ 手動輸入（✎）。"""
+        self._following = on
+        if on:
+            self._follow_btn.setText("🔗")
+            self._follow_btn.setToolTip("跟隨市價（報價自動更新）；點擊切換手動輸入")
+            if self._last_followed_price is not None:   # 重入 follow mode → 還原最後市價
+                self.follow_price(self._last_followed_price)
+        else:
+            self._follow_btn.setText("✎")
+            self._follow_btn.setToolTip("手動輸入模式；點擊切換跟隨市價")
+        self._apply_pin_state()
+
+    def _on_price_value_changed(self, value: float) -> None:
+        """價格變動 → 自適應 stepper 步長（10^(floor(log10(p))−2)）。"""
+        self._order_price.setSingleStep(_price_step(value))
+
     # ------------------------------------------------------------- engine signal handlers（GUI thread）
 
     def _on_accounts(self, accounts: tuple[AccountInfo, ...]) -> None:
-        """帳戶 snapshot → 卡片重繪（每帳戶一張卡、按 acc_id 排序；先清舊卡防殘留）。"""
-        for c in self._account_cards:
-            c.setParent(None)
-        self._account_cards.clear()
-        for a in sorted(accounts, key=lambda x: x.acc_id):
-            card = self._make_account_card(a)
-            self._cards_layout.addWidget(card)
-            self._account_cards.append(card)
+        """帳戶 snapshot → 按 env tab 重繪卡片（只 ACTIVE；非 ACTIVE 隱藏；先清舊卡防殘留）。"""
+        for env in ("REAL", "SIMULATE"):
+            for c in self._env_card_lists[env]:
+                c.setParent(None)
+            self._env_card_lists[env].clear()
+        self._card_funds_labels.clear()
+        active = [a for a in accounts if a.acc_status == "ACTIVE"]
+        for env in ("REAL", "SIMULATE"):
+            for a in sorted((x for x in active if x.trd_env == env), key=lambda x: x.acc_id):
+                card = self._make_account_card(a)
+                self._env_card_layouts[env].addWidget(card)
+                self._env_card_lists[env].append(card)
+        # 已收到嘅 per-account 資金 reapply 去新卡（帳戶列表更新後唔會消失）
+        for (env, acc_id), snap in self._funds_by_acc.items():
+            lbl = self._card_funds_labels.get((env, acc_id))
+            if lbl is not None:
+                lbl.setText(f"總資產 {_fmt_money(snap.total_assets)}")
 
     def _on_positions(self, rows: tuple[PositionRow, ...]) -> None:
         """持倉 snapshot → table 重繪（字段同富途 APP 對齊）。"""
@@ -402,25 +511,31 @@ class OrderWindow(QMainWindow):
                     item.setForeground(QColor(color))
                 table.setItem(r, c, item)
 
-    def _on_funds(self, funds: FundsSnapshot) -> None:
-        """資金 snapshot → 8 個金額 label + 風控狀態 label（LEVEL1 紅 / LEVEL2 黃）。"""
-        mapping = {
-            "total_assets": funds.total_assets,
-            "cash_hkd": funds.cash_hkd,
-            "cash_usd": funds.cash_usd,
-            "withdraw_hkd": funds.withdraw_hkd,
-            "withdraw_usd": funds.withdraw_usd,
-            "buying_power": funds.buying_power,
-            "initial_margin": funds.initial_margin,
-            "maintenance_margin": funds.maintenance_margin,
-        }
-        for key, value in mapping.items():
-            self._funds_labels[key].setText(_fmt_money(value))
-        risk_label = self._funds_labels["risk_status"]
-        risk_label.setText(_RISK_STATUS_ZH.get(funds.risk_status, funds.risk_status or "—"))
-        if funds.risk_status == "LEVEL1":
+    def _on_account_funds(self, acc_id: int, trd_env: str, funds: FundsSnapshot) -> None:
+        """Per-account 資金事件 → 卡片「總資產」+ 該 env tab 加總（GUI 端 per-env fold，重用 engine._sum_funds）。"""
+        self._funds_by_acc[(trd_env, acc_id)] = funds   # 累積；失敗帳戶保留上次值
+        lbl = self._card_funds_labels.get((trd_env, acc_id))
+        if lbl is not None:
+            lbl.setText(f"總資產 {_fmt_money(funds.total_assets)}")
+        total: FundsSnapshot | None = None
+        for (e, _a), s in self._funds_by_acc.items():
+            if e == trd_env:
+                total = s if total is None else _sum_funds(total, s)
+        labels = self._env_funds_labels.get(trd_env)
+        if labels is None:   # 理論上唔會（只 emit REAL/SIMULATE）；防禦性 return
+            return
+        for key in ("total_assets", "cash_hkd", "cash_usd", "withdraw_hkd", "withdraw_usd",
+                    "buying_power", "initial_margin", "maintenance_margin"):
+            labels[key].setText("—" if total is None else _fmt_money(getattr(total, key)))
+        risk_label = labels["risk_status"]
+        if total is None:   # 該 env 零帳戶 / 全部查詢失敗 → 全 "—"
+            risk_label.setText("—")
+            risk_label.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
+            return
+        risk_label.setText(_RISK_STATUS_ZH.get(total.risk_status, total.risk_status or "—"))
+        if total.risk_status == "LEVEL1":
             risk_label.setStyleSheet(f"font-weight: bold; color: {_ERR_COLOR};")
-        elif funds.risk_status == "LEVEL2":
+        elif total.risk_status == "LEVEL2":
             risk_label.setStyleSheet(f"font-weight: bold; color: {_WARN_COLOR};")
         else:
             risk_label.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
@@ -464,16 +579,15 @@ class OrderWindow(QMainWindow):
     def _on_place_order(self) -> None:
         """GUI 驗證 → engine.place_order（worker thread 做阻塞 RPC）。"""
         code = self._order_code.text().strip()
-        price_text = self._order_price.text().strip()
+        price = self._order_price.value()   # QDoubleSpinBox 原生 range/validator（0–1e12、4 小數）
         qty_text = self._order_qty.text().strip()
         if not code or "." not in code:
             self._set_status("代碼格式錯誤（例：HK.00700 / US.AAPL）", _ERR_COLOR)
             return
         try:
-            price = float(price_text)
             qty = int(qty_text)
         except ValueError:
-            self._set_status("價格/數量必須係數字", _ERR_COLOR)
+            self._set_status("數量必須係數字", _ERR_COLOR)
             return
         if price <= 0 or qty <= 0:
             self._set_status("價格與數量必須大於 0", _ERR_COLOR)

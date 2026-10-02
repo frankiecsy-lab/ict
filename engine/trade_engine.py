@@ -160,7 +160,7 @@ class TradeEngine(QObject):
     Signals（全部 auto-queue 去 GUI）:
     - accounts_updated(tuple[AccountInfo])：setup 完成後嘅全帳戶分類 snapshot（全 env、dedupe）
     - positions_updated(tuple[PositionRow])：每輪 poll 後嘅全量持倉 snapshot
-    - funds_updated(FundsSnapshot)：跨帳戶加總資金/訂金 + 風控狀態
+    - account_funds_updated(int, str, object)：per-account (acc_id, trd_env, FundsSnapshot)——雙 env、ACTIVE only（GUI 端按 env 分組加總）
     - orders_updated(tuple[OrderRow])：今日訂單 snapshot（30s 間隔、限頻安全）
     - status(str) / error(str)：連線與操作狀態訊息
     - order_result(bool, str)：(success, message)——下單結果（worker thread emit）
@@ -168,7 +168,7 @@ class TradeEngine(QObject):
 
     accounts_updated = Signal(tuple)
     positions_updated = Signal(tuple)
-    funds_updated = Signal(object)
+    account_funds_updated = Signal(int, str, object)  # (acc_id, trd_env "REAL"/"SIMULATE", FundsSnapshot)——per-account、雙 env、ACTIVE only
     orders_updated = Signal(tuple)
     status = Signal(str)
     error = Signal(str)
@@ -178,7 +178,8 @@ class TradeEngine(QObject):
         super().__init__(parent)
         self._cfg = None
         self._ctxs: dict[str, OpenSecTradeContext] = {}      # {market → ctx}
-        self._accounts: dict[str, list[tuple[int, str]]] = {}  # {market → [(acc_id, card_num)]} REAL only（持倉/資金輪詢）
+        self._accounts: dict[str, list[tuple[int, str]]] = {}  # {market → [(acc_id, card_num)]} REAL + ACTIVE only（持倉/訂單輪詢）
+        self._funds_targets: list[tuple[str, int, str]] = []   # [(market, acc_id, trd_env_str)]：雙 env、ACTIVE only（資金 per-account 輪詢，(env,acc_id) dedupe）
         self._order_accs: dict[str, int] = {}                 # {market → 可下單 acc_id}：非 MASTER + trdmarket_auth 含該市場
         self._all_accounts: list[AccountInfo] = []            # 全帳戶 dedupe（分類面板）
         self._thread: threading.Thread | None = None         # setup thread
@@ -206,6 +207,7 @@ class TradeEngine(QObject):
             self._cfg = cfg
             self._ctxs.clear()          # restart-safe：清舊 state（stop() 後重啟唔會累積重複帳戶）
             self._accounts.clear()
+            self._funds_targets.clear()
             self._order_accs.clear()
             self._all_accounts.clear()
             self._last_order_poll = 0.0
@@ -288,10 +290,14 @@ class TradeEngine(QObject):
                 acc_id = int(row.acc_id)
                 env = str(row.trd_env)
                 key = (env, acc_id)
+                active = _s(getattr(row, "acc_status", "")) == "ACTIVE"  # SDK: ACTIVE / DISABLED / N/A——只保留 ACTIVE
                 if key not in seen:
                     seen.add(key)
                     self._all_accounts.append(_account_info_from_row(acc_id, row))
-                if env == TrdEnv.REAL:
+                    if active:
+                        # 首個發現嘅 market 決定用邊個 ctx；seen dedupe 保證 (env, acc_id) 只入一次
+                        self._funds_targets.append((market, acc_id, env))
+                if env == TrdEnv.REAL and active:
                     real_accounts.append((acc_id, str(row.card_num)))
             with self._lock:
                 self._ctxs[market] = ctx
@@ -305,6 +311,8 @@ class TradeEngine(QObject):
             for acc_id, _card in accs:
                 info = by_id.get(acc_id)
                 if info is None or info.trd_env != TrdEnv.REAL:
+                    continue
+                if info.acc_status != "ACTIVE":   # 防禦性：_accounts 上游已過濾，此處雙保險
                     continue
                 if info.acc_role == "MASTER":
                     continue
@@ -348,13 +356,11 @@ class TradeEngine(QObject):
             self._poll_stop.wait(_POLL_INTERVAL)
 
     def _poll_once(self) -> None:
-        """單輪 poll：逐 (market, account) 查持倉 + 資金；訂單按獨立 30s 間隔查（限頻安全）。
+        """單輪 poll：逐 (market, account) 查持倉；資金 per-account（雙 env、ACTIVE）獨立 emit；訂單按獨立 30s 間隔查。
 
         每次查詢獨立 try/except（單筆失敗唔殺整輪）。
         """
         positions: list[PositionRow] = []
-        funds = FundsSnapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "")
-        got_funds = False
         for market in sorted(self._ctxs):
             ctx = self._ctxs.get(market)
             if ctx is None:
@@ -362,10 +368,14 @@ class TradeEngine(QObject):
             for acc_id, _card in self._accounts.get(market, ()):
                 rows = self._query_positions(ctx, acc_id)
                 positions.extend(rows)
-                info = self._query_funds(ctx, acc_id)
-                if info is not None:
-                    funds = _sum_funds(funds, info)
-                    got_funds = True
+        # 資金輪詢：per-account、雙 env（accinfo_query 無文檔限頻）；逐個 emit，失敗帳戶跳過（GUI 保留上次值）
+        for market, acc_id, trd_env in self._funds_targets:
+            ctx = self._ctxs.get(market)
+            if ctx is None:
+                continue
+            info = self._query_funds(ctx, acc_id, trd_env)
+            if info is not None and not self._closed:
+                self.account_funds_updated.emit(acc_id, trd_env, info)
         # 訂單輪詢：獨立 30s 間隔（order_list_query 限頻 10 次/30s）；首輪即查（_last_order_poll=0.0）
         if self._time_fn() - self._last_order_poll >= _ORDER_POLL_INTERVAL:
             self._last_order_poll = self._time_fn()
@@ -381,8 +391,6 @@ class TradeEngine(QObject):
         if self._closed:
             return   # emit 前最後一道防線（stop() 已 set _closed）
         self.positions_updated.emit(tuple(positions))
-        if got_funds:
-            self.funds_updated.emit(funds)
 
     # ------------------------------------------------------------- queries（poll thread 內）
 
@@ -415,10 +423,11 @@ class TradeEngine(QObject):
                 logger.exception("bad position row skipped")
         return out
 
-    def _query_funds(self, ctx, acc_id: int) -> FundsSnapshot | None:
-        """accinfo_query → 單帳戶 FundsSnapshot；失敗/無數據 → None。"""
+    def _query_funds(self, ctx, acc_id: int, trd_env: str) -> FundsSnapshot | None:
+        """accinfo_query → 單帳戶 FundsSnapshot；失敗/無數據 → None。trd_env = "REAL"/"SIMULATE"（顯式映射 enum）。"""
+        env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
         try:
-            ret, data = ctx.accinfo_query(trd_env=TrdEnv.REAL, acc_id=acc_id, refresh_cache=False)
+            ret, data = ctx.accinfo_query(trd_env=env_enum, acc_id=acc_id, refresh_cache=False)
         except Exception as exc:  # noqa: BLE001 — 單筆查詢失敗唔殺整輪 poll
             logger.exception("accinfo_query failed (acc=%s)", acc_id)
             return None

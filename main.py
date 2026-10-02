@@ -47,6 +47,10 @@ def main() -> int:
     # 雙視窗默認 windowed（非全屏）——各自可拖去不同螢幕；K 線視窗 F11 仍可切全屏幕。
     window = MainWindow(cfg)
     order_window = OrderWindow(cfg)
+    # 跨視窗同步：K 綫標的切換 → 下單代碼；最新收市價 → 跟隨市價（auto-queue 跨 thread）
+    window.code_changed.connect(order_window.set_symbol)
+    window.last_price.connect(order_window.follow_price)
+    order_window.set_symbol(window.code_edit.text())   # 初始同步一次（UI-state restored code）
     window.show()
     order_window.show()
 

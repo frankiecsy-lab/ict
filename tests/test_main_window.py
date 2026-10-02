@@ -567,3 +567,50 @@ def test_connection_state_updates_label(monkeypatch):
     engine.connection_state.emit(False, -1.0)
     assert win._conn_label.text() == "● OpenD 未連線"
     assert "#F23645" in win._conn_label.styleSheet()     # 斷線 → 紅
+
+
+# ------------------------------------------------------------- 跨視窗同步 signals（code_changed / last_price）
+
+def _bars_with_close(close: float = 1.5):
+    """(time_key, o, h, l, c, v) bar tuple——close = index 4。"""
+    from datetime import datetime, timedelta
+    base = datetime(2026, 1, 5, 9, 30)
+    return tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                  1.0, 2.0, 0.5, close, 1.0) for i in range(3))
+
+
+def test_code_changed_emitted_on_apply_code_switch(monkeypatch):
+    """_apply_code_switch → code_changed emit（所有入口：returnPressed / dropdown activated）。"""
+    win, _engine = _make_window(monkeypatch)
+    events: list[str] = []
+    win.code_changed.connect(events.append)
+
+    win._apply_code_switch("US.AAPL")
+    assert events == ["US.AAPL"]
+
+
+def test_last_price_emitted_from_primary_handlers(monkeypatch):
+    """_on_history_ready / _on_bars_changed → last_price = bars[-1][4]（收市價）。"""
+    win, _engine = _make_window(monkeypatch)
+    prices: list[float] = []
+    win.last_price.connect(prices.append)
+
+    win._on_history_ready("K_1M", _bars_with_close(320.75))
+    assert prices == [320.75]
+
+    win._on_bars_changed("K_1M", _bars_with_close(321.5))
+    assert prices == [320.75, 321.5]
+
+
+def test_last_price_not_emitted_on_empty_or_smt(monkeypatch):
+    """空 bars → 唔 emit；SMT 副標的 handler → 唔 emit（副標的價唔應該驅動主下單欄）。"""
+    win, _engine = _make_window(monkeypatch)
+    prices: list[float] = []
+    win.last_price.connect(prices.append)
+
+    win._on_history_ready("K_1M", ())      # 空 snapshot → 唔 emit
+    win._on_bars_changed("K_1M", ())       # 同上
+    assert prices == []
+
+    win._on_smt_bars("K_1M", _bars_with_close(99.0))   # SMT handler → 無 last_price emit
+    assert prices == []

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QLineEdit, QMainWindow, QPushButton, QVBoxLayout, QWidget)
@@ -63,6 +63,10 @@ def format_latency(ms: float | None) -> str:
 
 
 class MainWindow(QMainWindow):
+    # 跨視窗同步 signal（main.py 接線去 OrderWindow）：K 綫標的切換 / 最新收市價
+    code_changed = Signal(str)
+    last_price = Signal(float)
+
     def __init__(self, cfg):
         super().__init__()
         self._cfg = cfg
@@ -438,6 +442,7 @@ class MainWindow(QMainWindow):
             self._syncing = False
         self._engine.switch(code=code, periods=list(self._desired_periods()))
         self._save_ui_state()   # 標的改變 → 記憶（code + 當前 layout/periods/indicators）
+        self.code_changed.emit(code)   # 跨視窗同步：OrderWindow 下單代碼跟隨 K 綫標的
 
     def _on_code_text_changed(self, text: str) -> None:
         """onChange guard：欄位出現「code + 名稱」（含空白）→ 即刻剝離返純 code。
@@ -513,10 +518,14 @@ class MainWindow(QMainWindow):
     def _on_history_ready(self, period: str, bars) -> None:
         """Engine seed/switch 完成 → 路由完整 snapshot 去對應 pane（per-period signal）。"""
         self._route_period_bars(period, bars)
+        if bars:
+            self.last_price.emit(bars[-1][4])   # 跨視窗同步：OrderWindow 跟隨市價（bars = (time_key,o,h,l,c,v)）
 
     def _on_bars_changed(self, period: str, bars) -> None:
         """Tick 聚合更新 → 路由新 snapshot 去對應 pane。"""
         self._route_period_bars(period, bars)
+        if bars:
+            self.last_price.emit(bars[-1][4])   # 跨視窗同步：OrderWindow 跟隨市價（bars = (time_key,o,h,l,c,v)）
 
     def _on_smt_bars(self, period: str, bars) -> None:
         """SMT 配對副標的 snapshot（seed/switch/tick）→ 同週期路由去各 pane（set_smt_bars 只存 + coalesce repaint）。"""
