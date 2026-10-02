@@ -133,6 +133,49 @@ def test_canonical_code_unknown_or_empty():
     assert c.canonical_code(None) is None
 
 
+# ---------------------------------------------------------------- resolve_unique（Commit 37：Enter 自動解析）
+
+def test_resolve_unique_exact_suffix():
+    """bare '00700' → HK.00700；seed 'hsimain' → HK.HSImain。"""
+    c = _catalog()
+    assert c.resolve_unique("00700").code == "HK.00700"
+    assert c.resolve_unique("HSIMAIN").code == "HK.HSImain"
+
+
+def test_resolve_unique_exact_code_ci():
+    """exact code（CI）rank 0 → canonical entry。"""
+    c = _catalog()
+    e = c.resolve_unique("hk.00700")
+    assert e is not None and e.code == "HK.00700"
+
+
+def test_resolve_unique_ambiguous_same_rank_none():
+    """兩個 entry 同 suffix（rank 1 多義）→ None（留俾 dropdown 揀）。"""
+    c = StockCatalog()
+    c.replace([StockEntry("HK.XYZ123", "甲", ""), StockEntry("US.XYZ123", "乙", "")])
+    assert c.resolve_unique("xyz123") is None
+
+
+def test_resolve_unique_zero_hits_none():
+    c = _catalog()
+    assert c.resolve_unique("99999") is None
+
+
+def test_resolve_unique_prefix_or_substring_never_auto():
+    """rank 2+（prefix / substring / fuzzy）一律唔自動解析。"""
+    c = _catalog()
+    assert c.resolve_unique("us.aap") is None      # code prefix（rank 2）
+    assert c.resolve_unique("appl") is None        # en substring（rank 6）
+
+
+def test_resolve_unique_empty_or_none():
+    c = _catalog()
+    assert c.resolve_unique("") is None
+    assert c.resolve_unique(None) is None
+    empty = StockCatalog()
+    assert empty.resolve_unique("00700") is None   # 空目錄 → None
+
+
 # ---------------------------------------------------------------- search ranking
 
 def test_search_exact_code_ci():

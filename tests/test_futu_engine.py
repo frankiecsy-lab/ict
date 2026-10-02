@@ -1443,6 +1443,40 @@ class TestStartCodeParam:
         eng.start(cfg, periods=["K_5M", "k_15m"], code="US.AAPL")
         assert eng.state.periods == frozenset({"K_5M", "K_15M"})
 
+    def test_start_invalid_code_falls_back_to_env(self, monkeypatch):
+        """Commit 37：bare '00700'（無市場前綴）→ OpenD 拒收會殺死 _setup → fallback cfg.trading_code + error。"""
+        eng = FutuEngine()
+        monkeypatch.setattr(eng, "_setup", lambda: None)
+        errors: list[str] = []
+        eng.error.connect(errors.append)
+        cfg = make_cfg(trading_code="HK.HSImain")
+        eng.start(cfg, periods=["K_1M"], code="00700")
+        assert eng.state.code == "HK.HSImain"   # 自愈：唔會帶無效 code 入 _setup
+        assert any("格式錯誤" in e for e in errors)
+
+    def test_start_invalid_smt_disables_smt(self, monkeypatch):
+        """Commit 37：smt=True + SMT_CODE 無市場前綴 → 停用 SMT（唔連累主標的 K 綫）+ error。"""
+        eng = FutuEngine()
+        monkeypatch.setattr(eng, "_setup", lambda: None)
+        errors: list[str] = []
+        eng.error.connect(errors.append)
+        cfg = make_cfg(trading_code="HK.HSImain", smt_code="QQQ")   # bare、無 US. 前綴
+        eng.start(cfg, periods=["K_1M"], code="US.AAPL", smt=True)
+        assert eng.state.smt_code is None
+        assert any("格式錯誤" in e for e in errors)
+
+
+class TestIsValidCode:
+    """is_valid_code：完整股票編號格式（HK./US. 前綴 + 非空 suffix）——UI save/switch 前置校驗。"""
+
+    @pytest.mark.parametrize("raw", ["HK.00700", "US.AAPL", "hk.hsimain", " HK.09988 ", "us.tsla"])
+    def test_valid(self, raw):
+        assert fe.is_valid_code(raw) is True
+
+    @pytest.mark.parametrize("raw", ["00700", "AAPL", "", "   ", None, "HK.", ".00700", "XX.00700"])
+    def test_invalid(self, raw):
+        assert fe.is_valid_code(raw) is False
+
 
 # ---------------------------------------------------------------- OpenD 定時 ping（連線狀態 + RTT）
 

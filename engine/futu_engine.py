@@ -104,6 +104,16 @@ def _normalize_code(raw: str) -> str:
     return _CODE_ALIASES.get(code, code)
 
 
+def is_valid_code(raw: str | None) -> bool:
+    """完整股票編號格式檢查（HK./US. 前綴 + 非空 suffix）；UI 層 save/switch 前置校驗用。
+
+    Commit 37：OpenD 拒收無市場前綴嘅 bare code（ret=-1 'format of code 00700 is wrong'）——
+    呢類值若入咗 engine `_setup()` fetch 會 raise → close quote ctx（K 綫圖永久卡死）。
+    UI 層必須先校驗，engine `start()` 亦設同格式 gate 做 defense-in-depth。
+    """
+    return bool(raw) and bool(_CODE_RE.match(str(raw).strip()))
+
+
 def _cell_str(value) -> str:
     """DataFrame cell → 乾淨 string（None/NaN 空欄位 → ""，防 "nan" 字串混入目錄）。"""
     if value is None:
@@ -386,10 +396,22 @@ class FutuEngine(QObject):
             self._cfg = cfg
             self._db_path = db_path
             code = _normalize_code(code if code is not None else cfg.trading_code)
+            # Commit 37：格式 gate——無市場前綴嘅 bare code（例 UI 記憶還原 '00700'）會被 OpenD 拒收，
+            # `_setup()` fetch raise → close quote ctx（K 綫圖永久卡死）。預設有效 → fallback 自愈；
+            # 兩者都無效 → 保留原值行 _setup error path（OpenD 錯誤訊息明確、唔靜默）。
+            if not _CODE_RE.match(code):
+                default = _normalize_code(cfg.trading_code)
+                if _CODE_RE.match(default) and default != code:
+                    self.error.emit(f"標的 {code!r} 格式錯誤（需要 HK./US. 前綴，例：HK.00700）——已改用預設 {default}")
+                    code = default
             initial = frozenset(p.strip().upper() for p in periods) if periods else frozenset({cfg.kline_type})
             aggregators = {p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
                            for p in sorted(initial)}
             smt_code = _normalize_code(cfg.smt_code) if (smt and cfg.smt_code) else None
+            # Commit 37：SMT_CODE 格式 gate——無效配對 code 唔應該連累主標的 K 綫圖 → 本次啟動停用 SMT。
+            if smt_code is not None and not _CODE_RE.match(smt_code):
+                self.error.emit(f"SMT_CODE {smt_code!r} 格式錯誤（需要 HK./US. 前綴）——本次啟動 SMT Divergence 已停用")
+                smt_code = None
             smt_aggregators = ({p: CandleAggregator(kline_period_minutes(p) or cfg.period_minutes)
                                 for p in sorted(initial)} if smt_code else {})
             self._state = _State(code, None, initial, aggregators, smt_code, smt_aggregators)

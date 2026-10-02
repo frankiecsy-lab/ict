@@ -161,6 +161,63 @@ def test_do_switch_before_catalog_passthrough(monkeypatch):
     assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
 
 
+def test_do_switch_catalog_bare_code_resolves_unique(monkeypatch):
+    """Commit 37：目錄已載入 + bare '00700'（exact suffix 唯一命中）→ 自動解析 HK.00700。"""
+    win, engine = _make_window(monkeypatch)
+    win._on_catalog_ready(_entries())
+    win.code_edit.setText("00700")
+    win._do_switch()
+    assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
+    assert win.code_edit.text() == "HK.00700"
+
+
+def test_do_switch_before_catalog_bare_code_rejected(monkeypatch):
+    """Commit 37：目錄未載入 + bare 數字（無市場前綴）→ 拒絕（無法校驗、唔放行入 engine）。"""
+    win, engine = _make_window(monkeypatch)
+    win.code_edit.setText("00700")
+    win._do_switch()
+    assert engine.switch_calls == []
+
+
+def test_load_ui_state_invalid_saved_code_falls_back_to_default(monkeypatch):
+    """Commit 37：saved code '00700'（無市場前綴）→ 唔傳去 engine、輸入欄顯示預設。"""
+    win, engine = _make_window(monkeypatch, saved_state={"code": "00700"})
+    assert win.code_edit.text() == "HK.HSImain"   # fallback cfg.trading_code
+    assert engine.start_code is None              # 無效 code 唔會入 engine
+
+
+def test_load_ui_state_valid_saved_code_restored(monkeypatch):
+    """Regression：有效 saved code → 照舊還原（現有行為不變）。"""
+    win, engine = _make_window(monkeypatch, saved_state={"code": "US.AAPL"})
+    assert win.code_edit.text() == "US.AAPL"
+    assert engine.start_code == "US.AAPL"
+
+
+def test_save_ui_state_skips_invalid_code(monkeypatch):
+    """Commit 37：輸入欄 bare '00700' → 唔寫入記憶（防無效狀態殺死開機）。"""
+    win, _engine = _make_window(monkeypatch)
+    win.code_edit.setText("00700")
+    win._save_ui_state()
+    assert len(win._state_store.saved) == 1
+    assert "code" not in win._state_store.saved[-1]
+
+
+def test_switch_symbol_bare_code_resolves_unique(monkeypatch):
+    """Commit 37：反向同步（下單頁 → K 綫圖）bare '00700' + 目錄已載入 → 解析 HK.00700。"""
+    win, engine = _make_window(monkeypatch)
+    win._on_catalog_ready(_entries())
+    win.switch_symbol("00700")
+    assert engine.switch_calls == [("HK.00700", _SIX_PANE_PERIODS)]  # sorted() 字典序
+    assert win.code_edit.text() == "HK.00700"
+
+
+def test_switch_symbol_bare_code_no_catalog_noop(monkeypatch):
+    """Commit 37：反向同步 + 目錄未載入 + bare 數字 → no-op（無法校驗）。"""
+    win, engine = _make_window(monkeypatch)
+    win.switch_symbol("00700")
+    assert engine.switch_calls == []
+
+
 def test_catalog_ready_initializes_name_label(monkeypatch):
     """catalog_ready → 用當前輸入欄 code（預設 HK.HSImain）初始化名稱 LABEL。"""
     win, _engine = _make_window(monkeypatch)

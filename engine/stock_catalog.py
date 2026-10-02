@@ -154,6 +154,27 @@ class StockCatalog:
             return None
         return self._code_ci.get(raw.strip().lower())
 
+    def resolve_unique(self, query: str | None) -> StockEntry | None:
+        """Exact code（CI）/ exact suffix 唯一命中 → canonical entry；多義或零命中 → None。
+
+        Commit 37：Enter 自動解析只接受 rank 0/1 兩個最強訊號——bare '00700' → HK.00700、
+        'hsimain' → HK.HSImain（seed）；prefix / substring / fuzzy 一律留俾 dropdown 揀，
+        自動解析唔會多義。
+        """
+        q = (query or "").strip().lower()
+        if not q or not self._entries:
+            return None
+        best_rank, hits = 2, []
+        for i, (code_l, suffix_l, _en_l, _cn_s) in enumerate(self._idx):
+            rank = 0 if code_l == q else (1 if suffix_l == q else None)
+            if rank is None:
+                continue
+            if rank < best_rank:
+                best_rank, hits = rank, [i]
+            elif rank == best_rank:
+                hits.append(i)
+        return self._entries[hits[0]] if len(hits) == 1 else None
+
     def search(self, query: str, limit: int = 20) -> list[StockEntry]:
         """模糊搜尋：rank-based 兩段式（見 module docstring）。返回按 rank 排序嘅 entries。"""
         q = (query or "").strip()

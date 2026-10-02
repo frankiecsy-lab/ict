@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QGridLayout, QHB
                                QVBoxLayout, QWidget)
 
 from config import KLINE_TYPES
-from engine.futu_engine import FutuEngine
+from engine.futu_engine import FutuEngine, is_valid_code
 from engine.stock_catalog import basic_info_text, name_text
 from engine.ui_state_store import UIStateStore, default_ui_state_path
 from .candle_chart import CandleChart
@@ -501,12 +501,22 @@ class MainWindow(QMainWindow):
         # code：set 輸入欄（blockSignals 避免觸發 textChanged guard）+ 返回俾 start()
         code = state.get("code")
         if isinstance(code, str) and code.strip():
+            if is_valid_code(code):
+                self.code_edit.blockSignals(True)
+                try:
+                    self.code_edit.setText(code)
+                finally:
+                    self.code_edit.blockSignals(False)
+                return code
+            # Commit 37：saved code 格式無效（例 bare '00700' 無市場前綴）→ 唔傳去 engine
+            # （OpenD 拒收、_setup close quote ctx、K 綫圖永久卡死）；fallback 預設 + 提示用戶。
             self.code_edit.blockSignals(True)
             try:
-                self.code_edit.setText(code)
+                self.code_edit.setText(self._cfg.trading_code)
             finally:
                 self.code_edit.blockSignals(False)
-            return code
+            self.statusBar().showMessage(
+                f"記憶標的 {code.strip()} 格式無效（需要 HK./US. 前綴），已改用預設 {self._cfg.trading_code}", 10000)
         return None
 
     def _save_ui_state(self) -> None:
@@ -523,7 +533,8 @@ class MainWindow(QMainWindow):
                 "theme": self._theme.name,   # Commit 35 R6：主題偏好（單行 JSON blob、schema 演化免費）
             }
             code = self.code_edit.text().strip()
-            if code:
+            # Commit 37：只保存有效完整代碼——bare '00700' 等唔會入記憶（防無效狀態殺死開機）
+            if code and is_valid_code(code):
                 state["code"] = code
             self._state_store.save(state)
         except Exception:  # noqa: BLE001 — persistence is best-effort，唔阻斷主流程
@@ -544,11 +555,20 @@ class MainWindow(QMainWindow):
             # 目錄已載入 → 驗證存在 + 正規化嚴格大小寫（例：hk.00700 → HK.00700）
             code = catalog.canonical_code(raw)
             if code is None:
-                self.statusBar().showMessage(f"股票編號唔存在：{raw.strip()}", 8000)
-                return
+                # Commit 37：exact miss → 試唯一解析（exact suffix，例 bare '00700' → HK.00700）；多義/零命中仍 reject
+                entry = catalog.resolve_unique(raw)
+                if entry is not None:
+                    code = entry.code
+                else:
+                    self.statusBar().showMessage(f"股票編號唔存在：{raw.strip()}", 8000)
+                    return
         else:
-            # 目錄未載入（catalog fetch 失敗等）→ 放行俾 engine/OpenD 最終校驗
-            code = raw.strip()
+            # 目錄未載入（catalog fetch 失敗等）→ 無法解析 bare 數字，只放行完整代碼俾 engine/OpenD 最終校驗
+            if is_valid_code(raw):
+                code = raw.strip()
+            else:
+                self.statusBar().showMessage(f"股票編號格式錯誤：{raw.strip()}（例：HK.00700 / US.AAPL）", 8000)
+                return
         self.code_edit.setText(code)
         self._update_name_label(code)
         self._apply_code_switch(code)
@@ -583,8 +603,14 @@ class MainWindow(QMainWindow):
         if len(catalog):
             resolved = catalog.canonical_code(code)
             if resolved is None:
-                return   # 未知標的 → no-op（唔切圖表去無效代碼）
+                # Commit 37：exact miss → 試唯一解析（bare '00700' → HK.00700）；多義/零命中 no-op
+                entry = catalog.resolve_unique(code)
+                if entry is None:
+                    return   # 未知標的 → no-op（唔切圖表去無效代碼）
+                resolved = entry.code
             code = resolved
+        elif not is_valid_code(code):
+            return   # Commit 37：目錄未載入 + bare 數字無市場前綴 → 無法校驗，no-op（防無效代碼入 engine）
         if code == self.code_edit.text().strip():
             return   # 同當前標的 → no-op（防 loop）
         self.code_edit.setText(code)
