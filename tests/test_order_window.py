@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必須喺 PySide6 impo
 
 import pytest
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from config import Config
 from engine.trade_engine import AccountInfo, FundsSnapshot, OrderRow, PositionRow
@@ -201,8 +201,8 @@ def _acc(acc_id: int, env: str = "REAL", acc_type: str = "MARGIN", sim_acc_type:
         trdmarket_auth=tuple(auth), acc_role=role, acc_status="NORMAL")
 
 
-def test_accounts_tree_groups_by_env_with_tags(monkeypatch):
-    """accounts_updated → 樹：頂層 REAL/SIMULATE 分組 + 比賽/主帳戶標記 + tooltip 卡號末四位。"""
+def test_account_cards_render_per_account(monkeypatch):
+    """accounts_updated → per-account 卡片：每帳戶一張卡（按 acc_id 排序）+ 標籤 + 卡號末四位常駐可見。"""
     w, fake = _make_window(monkeypatch)
 
     fake.accounts_updated.emit((
@@ -211,19 +211,27 @@ def test_accounts_tree_groups_by_env_with_tags(monkeypatch):
         _acc(3, env="SIMULATE", sim_acc_type="COMPETITION", auth=("US",)),   # SIMULATE 比賽
     ))
 
-    tree = w._acc_tree
-    assert tree.topLevelItemCount() == 2
-    real_top, sim_top = tree.topLevelItem(0), tree.topLevelItem(1)
-    assert real_top.text(0) == "實盤 REAL（2）"
-    assert sim_top.text(0) == "模擬 SIMULATE（1）"
-    # 子項按 acc_id 排序；MASTER → 「主帳戶」標記
-    assert real_top.childCount() == 2
-    assert real_top.child(0).text(0) == "1 · MARGIN（主帳戶）"
-    assert real_top.child(1).text(0) == "2 · MARGIN"
-    # 比賽帳戶 → 「比賽」標記 + tooltip 卡號末四位
-    comp = sim_top.child(0)
-    assert comp.text(0) == "3 · MARGIN（比賽）"
-    assert "…5678" in comp.toolTip(0), "tooltip 應含卡號末四位"
+    assert len(w._account_cards) == 3
+    texts = "\n".join(l.text() for l in w.findChildren(QLabel))
+    assert "1 · MARGIN" in texts          # 卡片 header：acc_id · acc_type
+    assert "主帳戶" in texts               # MASTER → 「主帳戶」標籤
+    assert "3 · MARGIN" in texts
+    assert "比賽" in texts                 # COMPETITION → 「比賽」標籤
+    assert "…5678" in texts               # 卡號末四位（uni_card_num U12345678）
+
+
+def test_account_cards_empty_snapshot(monkeypatch):
+    """accounts_updated 空 snapshot → 零卡片、無殘留（先有卡再清空）。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.accounts_updated.emit((
+        _acc(2),
+        _acc(1, role="MASTER"),
+    ))
+    assert len(w._account_cards) == 2
+
+    fake.accounts_updated.emit(())   # 空 snapshot（例如 OpenD 未連線 / 無帳戶）
+    assert len(w._account_cards) == 0
 
 
 def test_orders_table_populated_with_status_zh_and_color(monkeypatch):

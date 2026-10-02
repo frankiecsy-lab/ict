@@ -192,42 +192,47 @@ def test_unknown_code_clears_name_and_info_labels(monkeypatch):
     assert win.info_label.text() == ""
 
 
-def test_zoom_buttons_wired_to_chart(monkeypatch):
-    """control bar 放大/縮小按鍵 → 全部可見 pane 時間視窗 ×/÷1.25（中心錨定）。
+def test_pane_zoom_button_affects_only_own_pane(monkeypatch):
+    """每 pane 獨立縮放按鍵（異步縮放）：click pane 0「放大」只改 pane 0，其他 pane 不受影響。
 
-    用**真實分鐘 datetime key**：_zoom_all 走 time_window()/set_time_window() 時間空間路徑，
-    fake key（bar_key_to_dt parse 唔到）會令 zoom no-op。
+    按鍵接線用零參數 lambda——PySide6 clicked 有 (bool checked) 重載，直接 connect
+    zoom_in(steps=1) 會靜默綁定 bool 版 → no-op（踩坑記錄見 AGENTS.md 附錄 #4）。
     """
-    from datetime import datetime, timedelta
-    win, _engine = _make_window(monkeypatch)
-    base = datetime(2026, 1, 5, 9, 30)
-    bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
-                  100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200))
-    win.chart.update_bars(bars)   # 先餵數據（chart 無 bars 時 zoom no-op）
-    assert win.chart._view_count == 120  # Config 預設 visible_bars
-    win.zoom_in_btn.click()
-    assert win.chart._view_count == 96   # 120min 視窗 ×0.8 → 96 根分鐘 bar
-    win.zoom_out_btn.click()
-    assert win.chart._view_count == 120  # round-trip 還原（×1.25）
-
-
-def test_pane_view_changed_broadcasts_time_window(monkeypatch):
-    """用戶喺 pane 0 pan/zoom → 時間視窗廣播去其他可見 pane（跨週期 span-overlap 對齊）。"""
     from datetime import datetime, timedelta
     win, _engine = _make_window(monkeypatch)
     base = datetime(2026, 1, 5, 9, 30)
     m_bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
                     100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200))
     w_bars = tuple(((base + timedelta(minutes=3 * j)).strftime("%Y-%m-%d %H:%M"),
-                    100.0, 101.0, 99.5, 100.5, 1.0) for j in range(100))
-    win._panes[0].update_bars(m_bars)   # pane 0 = K_1M（200 根分鐘 bar）
-    win._panes[1].update_bars(w_bars)   # pane 1 = K_3M（100 根 3 分鐘 bar）
+                    100.0, 101.0, 99.5, 100.5, 1.0) for j in range(200))
+    win._panes[0].update_bars(m_bars)   # pane 0（200 根分鐘 bar）
+    win._panes[1].update_bars(w_bars)   # pane 1（200 根 3 分鐘 bar）
     win._set_pane_count(2)              # 顯示 2 pane
+    assert win._panes[0]._view_count == 120
+    assert win._panes[1]._view_count == 120
+    win._pane_zoom_in[0].click()        # click pane 0 嘅「放大」按鍵
+    assert win._panes[0]._view_count == 96   # 120 / 1.25 → 96（中心錨定）
+    assert win._panes[1]._view_count == 120  # pane 1 不受影響——無跨 pane 同步
+
+
+def test_no_cross_pane_sync_on_zoom(monkeypatch):
+    """異步縮放：用戶喺 pane 0 zoom/pan（wheel/drag/按鍵路徑 → emit view_changed）唔會廣播去其他 pane。"""
+    from datetime import datetime, timedelta
+    win, _engine = _make_window(monkeypatch)
+    base = datetime(2026, 1, 5, 9, 30)
+    m_bars = tuple(((base + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                    100.0, 101.0, 99.5, 100.5, 1.0) for i in range(200))
+    w_bars = tuple(((base + timedelta(minutes=3 * j)).strftime("%Y-%m-%d %H:%M"),
+                    100.0, 101.0, 99.5, 100.5, 1.0) for j in range(200))
+    win._panes[0].update_bars(m_bars)   # pane 0 = K_1M（200 根分鐘 bar）
+    win._panes[1].update_bars(w_bars)   # pane 1 = K_3M（200 根 3 分鐘 bar）
+    win._set_pane_count(2)              # 顯示 2 pane
+    before = (win._panes[1]._view_count, win._panes[1]._right_offset)
+    win._panes[0].zoom_in()             # 模擬用戶喺 pane 0 zoom（emit view_changed）
     start = base + timedelta(minutes=80)
     end = base + timedelta(minutes=200)
-    win._on_pane_view_changed(0, start, end)   # 模擬用戶喺 pane 0 zoom/pan
-    assert win._panes[1]._view_count == 41      # [B+80,B+200) ∩ 3min bars = j∈[26..66]
-    assert round(win._panes[1]._right_offset) == 33   # 尾根可見 bar = j=66 → offset = 99-66
+    assert win._panes[0].set_time_window(start, end)   # 模擬用戶 pan/zoom 時間視窗改變
+    assert (win._panes[1]._view_count, win._panes[1]._right_offset) == before  # pane 1 完全不變
 
 
 def test_pane_period_change_pushes_active_snapshot(monkeypatch):

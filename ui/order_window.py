@@ -16,10 +16,9 @@ import time
 from PySide6.QtCore import QRegularExpression, QTimer
 from PySide6.QtGui import (QColor, QDoubleValidator, QIntValidator,
                            QRegularExpressionValidator)
-from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QPushButton, QTableWidget, QTableWidgetItem,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
-                               QAbstractItemView)
+from PySide6.QtWidgets import (QComboBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QMainWindow, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget, QAbstractItemView)
 
 from config import Config
 from engine.trade_engine import (AccountInfo, FundsSnapshot, OrderRow, PositionRow,
@@ -94,7 +93,7 @@ def _fmt_money(v: float) -> str:
 class OrderWindow(QMainWindow):
     """下單版面（獨立 top-level 視窗，可拖去第二螢幕）。
 
-    佈局：PIN bar → [帳戶分類樹 | 資金/訂金] → 持倉 table → 今日訂單 table → 下單 group → status label。
+    佈局：PIN bar → main_row[左欄（帳戶卡片 + 持倉/訂單左右並排表）| 右欄全高（資金/訂金 + 限價下單 form）] → status label。
     LOCKED（默認）：下單表單全 disabled；UNLOCKED：啟用 + countdown 顯示剩餘時間。
     """
 
@@ -104,7 +103,7 @@ class OrderWindow(QMainWindow):
         self._clock = clock
         self._unlock_ttl = unlock_ttl_seconds
         self.setWindowTitle("ICT Trader — 下單版面")
-        self.resize(1000, 820)
+        self.resize(1280, 860)   # 左右並排表格（持倉 11 欄 + 訂單 9 欄）需要寬度
 
         # 深色主題（跟 MainWindow 配色）
         self.setStyleSheet(
@@ -118,7 +117,8 @@ class OrderWindow(QMainWindow):
             f"color: {cfg.text_color}; padding: 4px 14px; }}"
             f"QPushButton:hover {{ background: #27354A; }}"
             f"QPushButton:disabled {{ color: #4A5568; background: #151B23; }}"
-            f"QTableWidget, QTreeWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
+            f"QTableWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
+            f"QFrame#accountCard {{ background: #1A212B; border: 1px solid {cfg.grid_color}; border-radius: 6px; }}"
             f"QHeaderView::section {{ background: #1A212B; color: {cfg.axis_text_color}; "
             f"border: none; padding: 3px; }}"
         )
@@ -128,13 +128,20 @@ class OrderWindow(QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
         root.addWidget(self._build_pin_bar())
-        top_row = QHBoxLayout()
-        top_row.addWidget(self._build_accounts_tree())
-        top_row.addWidget(self._build_funds_group(), 1)
-        root.addLayout(top_row)
-        root.addWidget(self._build_positions_table(), 1)   # stretch：持倉表佔剩餘空間
-        root.addWidget(self._build_orders_group())
-        root.addWidget(self._build_order_group())
+        # 主區左右佈局：左欄 = 監控側（帳戶卡片 + 持倉/訂單並排表）；右欄 = 交易側全高（資金/訂金 + 限價下單 form）。
+        main_row = QHBoxLayout()
+        left_col = QVBoxLayout()
+        left_col.addWidget(self._build_account_cards())
+        tables_row = QHBoxLayout()
+        tables_row.addWidget(self._build_positions_table(), 1)   # 左：持倉表
+        tables_row.addWidget(self._build_orders_group(), 1)      # 右：今日訂單 group
+        left_col.addLayout(tables_row, 1)                        # stretch：表格佔左欄剩餘高度
+        right_col = QVBoxLayout()
+        right_col.addWidget(self._build_funds_group())
+        right_col.addWidget(self._build_order_group(), 1)        # 下單 form 填右欄剩餘高度（交易按鍵喺內）
+        main_row.addLayout(left_col, 3)
+        main_row.addLayout(right_col, 2)
+        root.addLayout(main_row, 1)
         self._status_label = QLabel("等待連線…")
         self._status_label.setStyleSheet(f"color: {cfg.axis_text_color};")
         root.addWidget(self._status_label)
@@ -188,12 +195,46 @@ class OrderWindow(QMainWindow):
         self._lock_btn.clicked.connect(self._on_lock_clicked)
         return bar
 
-    def _build_accounts_tree(self) -> QTreeWidget:
-        """帳戶分類樹：頂層 = REAL/SIMULATE 環境，子項 = 個別帳戶（類型/角色/卡號/市場）。"""
-        self._acc_tree = QTreeWidget()
-        self._acc_tree.setHeaderHidden(True)
-        self._acc_tree.setFixedWidth(340)
-        return self._acc_tree
+    def _build_account_cards(self) -> QScrollArea:
+        """帳戶卡片區：每個帳戶一張卡（環境/類型/標籤/卡號末四位/市場/券商/狀態常駐可見）。"""
+        self._account_cards: list[QFrame] = []
+        self._cards_layout = QVBoxLayout()
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(6)
+        container = QWidget()
+        container.setLayout(self._cards_layout)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(container)
+        area.setFixedHeight(200)   # 約 3–4 張卡可見；帳戶多咗自動滾動
+        return area
+
+    def _make_account_card(self, a: AccountInfo) -> QFrame:
+        """單一帳戶卡片：header = id·類型[環境]（標籤）；detail = 卡號末四位/市場/券商/狀態。"""
+        cfg = self._cfg
+        card = QFrame()
+        card.setObjectName("accountCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(8, 6, 8, 6)
+        v.setSpacing(2)
+        tags = []
+        if a.sim_acc_type == "COMPETITION":
+            tags.append("比賽")
+        if a.acc_role == "MASTER":
+            tags.append("主帳戶")
+        tag_text = f"（{'、'.join(tags)}）" if tags else ""
+        env_zh = "實盤 REAL" if a.trd_env == "REAL" else "模擬 SIMULATE"
+        header = QLabel(f"{a.acc_id} · {a.acc_type or '—'} [{env_zh}]{tag_text}")
+        header.setStyleSheet(f"font-weight: bold; color: {cfg.text_color};")
+        card_num = a.uni_card_num or a.card_num
+        detail = (f"卡號 …{card_num[-4:] if card_num else '—'} · 市場 {'/'.join(a.trdmarket_auth) or '—'}\n"
+                  f"券商 {a.security_firm or '—'} · 狀態 {a.acc_status or '—'}")
+        info = QLabel(detail)
+        info.setStyleSheet("color: #7A8699;")
+        v.addWidget(header)
+        v.addWidget(info)
+        return card
 
     def _build_funds_group(self) -> QGroupBox:
         """資金/訂金 group：9 個 label（總資產/現金 HKD/USD/可提 HKD/USD/購買力/初始保證金/維持保證金/風控狀態）。"""
@@ -232,7 +273,7 @@ class OrderWindow(QMainWindow):
         return self._pos_table
 
     def _build_orders_group(self) -> QGroupBox:
-        """今日訂單 group：fixed-height table（9 欄）。"""
+        """今日訂單 group：stretchable table（9 欄）——同持倉表左右並排、各佔半邊。"""
         box = QGroupBox("今日訂單")
         v = QVBoxLayout(box)
         self._orders_table = QTableWidget(0, 9)
@@ -241,7 +282,6 @@ class OrderWindow(QMainWindow):
         self._orders_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._orders_table.verticalHeader().setVisible(False)
         self._orders_table.horizontalHeader().setStretchLastSection(True)
-        self._orders_table.setFixedHeight(150)
         v.addWidget(self._orders_table)
         return box
 
@@ -333,28 +373,14 @@ class OrderWindow(QMainWindow):
     # ------------------------------------------------------------- engine signal handlers（GUI thread）
 
     def _on_accounts(self, accounts: tuple[AccountInfo, ...]) -> None:
-        """帳戶分類 snapshot → 樹重繪（按環境分組：實盤 REAL / 模擬 SIMULATE）。"""
-        tree = self._acc_tree
-        tree.clear()
-        real = [a for a in accounts if a.trd_env == "REAL"]
-        sim = [a for a in accounts if a.trd_env != "REAL"]
-        for title, group in (("實盤 REAL", real), ("模擬 SIMULATE", sim)):
-            top = QTreeWidgetItem([f"{title}（{len(group)}）"])
-            tree.addTopLevelItem(top)
-            for a in sorted(group, key=lambda x: x.acc_id):
-                tags = []
-                if a.sim_acc_type == "COMPETITION":
-                    tags.append("比賽")
-                if a.acc_role == "MASTER":
-                    tags.append("主帳戶")
-                tag_text = f"（{'、'.join(tags)}）" if tags else ""
-                item = QTreeWidgetItem([f"{a.acc_id} · {a.acc_type or '—'}{tag_text}"])
-                card = a.uni_card_num or a.card_num
-                detail = (f"卡號：…{card[-4:]}（末四位）\n市場：{'/'.join(a.trdmarket_auth) or '—'}\n"
-                          f"券商：{a.security_firm or '—'}\n狀態：{a.acc_status or '—'}")
-                item.setToolTip(0, detail)
-                top.addChild(item)
-            top.setExpanded(True)
+        """帳戶 snapshot → 卡片重繪（每帳戶一張卡、按 acc_id 排序；先清舊卡防殘留）。"""
+        for c in self._account_cards:
+            c.setParent(None)
+        self._account_cards.clear()
+        for a in sorted(accounts, key=lambda x: x.acc_id):
+            card = self._make_account_card(a)
+            self._cards_layout.addWidget(card)
+            self._account_cards.append(card)
 
     def _on_positions(self, rows: tuple[PositionRow, ...]) -> None:
         """持倉 snapshot → table 重繪（字段同富途 APP 對齊）。"""

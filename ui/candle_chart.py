@@ -101,6 +101,7 @@ _MIN_X_BARS = 5       # X 軸縮放下限（可見根數）
 _MAX_X_BARS = 2000    # X 軸縮放上限
 _Y_ZOOM_FLOOR = 1e-4  # Y 軸 span 下限（相對於當前 span，防退化範圍 / 除零爆炸）
 _WHEEL_NOTCH_DEG = 120.0  # Windows 標準 wheel 單 notch angleDelta.y() 幅度
+_RIGHT_MARGIN_BARS = 5    # 右側留白：5 個空 bar-slot（bar 唔貼住價格軸，易閱讀；純視覺、唔改數據窗口）
 
 
 def wheel_notches(angle_delta_y: int) -> float:
@@ -477,11 +478,12 @@ class CandleChart(QWidget):
 
     def _bar_x(self, i: int, n: int, rect: QRectF) -> float:
         """第 i 根 bar（0-based，左→右）嘅中心 x。"""
-        slot = rect.width() / max(1, n)
+        slot = self._bar_slot(n, rect)
         return rect.x() + (i + 0.5) * slot
 
     def _bar_slot(self, n: int, rect: QRectF) -> float:
-        return rect.width() / max(1, n)
+        """單一 bar-slot 寬度：plot 寬 ÷（可見根數 + 右側留白）——右端恆空出 5 個 slot。"""
+        return rect.width() / max(1, n + _RIGHT_MARGIN_BARS)
 
     # ------------------------------------------------------------- events
 

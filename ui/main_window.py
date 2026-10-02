@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
@@ -79,14 +78,16 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         sb.showMessage("連線 OpenD 中…", 0)
 
-        self._syncing = False   # 時間同步重入 guard（程序化 set_time_window/reset/zoom 期間阻 view_changed 傳播）
+        self._syncing = False   # Defensive 保留：移除跨 pane 同步後已無 reader；仍包住會 emit view_changed 嘅 reset_view()，防日後重接 listener 誤廣播
 
         self.chart = CandleChart(cfg)
         # 多 pane 圖表區：pane 0 = self.chart（兼容既有測試）；panes 1..3 預建、由 1/2/4 layout 按鍵顯示。
-        # 每個 pane = 頂部週期 combo + CandleChart（各 pane 獨立選週期）。
+        # 每個 pane = 頂部週期 combo + 獨立放大/縮小按鍵 + CandleChart（各 pane 獨立選週期、異步縮放）。
         self._panes: list[CandleChart] = []
         self._pane_combos: list[QComboBox] = []
         self._pane_widgets: list[QWidget] = []
+        self._pane_zoom_in: list[QPushButton] = []
+        self._pane_zoom_out: list[QPushButton] = []
         for i in range(4):
             widget, combo, pane = self._build_pane_widget(i)
             self._pane_widgets.append(widget)
@@ -138,7 +139,7 @@ class MainWindow(QMainWindow):
         self._engine.start(cfg, periods=list(self._desired_periods()), code=saved_code, smt=smt_on)
 
     def _build_pane_widget(self, index: int) -> tuple[QWidget, QComboBox, CandleChart]:
-        """單一 pane：頂部週期 combo + CandleChart。返回 (container, combo, chart)。"""
+        """單一 pane：頂部週期 combo + 獨立放大/縮小按鍵 + CandleChart。返回 (container, combo, chart)。"""
         cfg = self._cfg
         container = QWidget()
         v = QVBoxLayout(container)
@@ -160,9 +161,24 @@ class MainWindow(QMainWindow):
         combo.currentTextChanged.connect(lambda _t, i=index: self._on_pane_period_changed(i))
 
         chart = CandleChart(cfg) if index else self.chart
-        # 時間同步：用戶喺任何 pane zoom/pan → 廣播 time window 去其餘 pane（_syncing guard 防回授）
-        chart.view_changed.connect(lambda s, e, i=index: self._on_pane_view_changed(i, s, e))
-        v.addWidget(combo)
+        # 異步縮放：每個 pane 完全獨立（wheel/drag/按鍵都只影響本 pane），無跨 pane 時間同步。
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(combo)
+        header.addStretch(1)
+        zin = QPushButton("放大")
+        zout = QPushButton("縮小")
+        for _b in (zin, zout):
+            _b.setCursor(Qt.CursorShape.PointingHandCursor)
+        # lambda 包零參數調用：PySide6 clicked 有 (bool checked) 重載，直接 connect zoom_in(steps=1)
+        # 會靜默綁定 bool 版 → no-op（踩坑記錄見 AGENTS.md 附錄）；closure 捕獲本 pane chart、天然獨立。
+        zin.clicked.connect(lambda: chart.zoom_in())
+        zout.clicked.connect(lambda: chart.zoom_out())
+        header.addWidget(zin)
+        header.addWidget(zout)
+        v.addLayout(header)
+        self._pane_zoom_in.append(zin)
+        self._pane_zoom_out.append(zout)
         v.addWidget(chart, 1)
         return container, combo, chart
 
@@ -269,18 +285,8 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
 
-        # K 線放大/縮小按鍵（右側）：對所有可見 pane 一齊分步 X 軸縮放（每點擊 ×/÷1.25）
-        self.zoom_in_btn = QPushButton("放大")
-        self.zoom_out_btn = QPushButton("縮小")
-        for _b in (self.zoom_in_btn, self.zoom_out_btn):
-            _b.setCursor(Qt.CursorShape.PointingHandCursor)
-            h.addWidget(_b)
-
         self.code_edit.returnPressed.connect(self._do_switch)
-        # lambda 包零參數調用：PySide6 clicked 有 (bool checked) 重載，直接 connect 方法會綁定
-        # bool 版 → zoom_all(False) no-op（踩坑記錄見 AGENTS.md 附錄）；時間空間統一縮放全部可見 pane
-        self.zoom_in_btn.clicked.connect(lambda: self._zoom_all(1 / 1.25))
-        self.zoom_out_btn.clicked.connect(lambda: self._zoom_all(1.25))
+        # 放大/縮小按鍵已移去各 pane header row（異步縮放、每 pane 獨立，見 _build_pane_widget）。
         v.addLayout(h)
 
         # 第二行：當前標的基本資料（每手股數 / 上市日期）——目錄載入後由 _update_name_label() 填充；
@@ -541,14 +547,6 @@ class MainWindow(QMainWindow):
             self._panes[i].update_bars(state.aggregators[new_period].bars())
         self._save_ui_state()   # per-pane 週期改變 → 記憶
 
-    def _on_pane_view_changed(self, i: int, start_dt, end_dt) -> None:
-        """用戶喺某 pane pan/zoom → 廣播時間視窗去其他可見 pane（時間軸同步）。"""
-        if self._syncing or start_dt is None or end_dt is None:
-            return
-        for j in range(self._pane_count):
-            if j != i:
-                self._panes[j].set_time_window(start_dt, end_dt)
-
     def _on_layout_clicked(self) -> None:
         """1/2/4 layout 按鍵 → 顯示/隱藏 pane + grid 重排（pane 數據保留、唔重建）。"""
         btn = self._layout_group.checkedButton()
@@ -562,32 +560,6 @@ class MainWindow(QMainWindow):
             self._pane_grid.removeWidget(self._pane_widgets[i])
         self._layout_panes()
         self._save_ui_state()   # layout 改變 → 記憶（early return 已確保只喺真改變時 save）
-
-    def _zoom_all(self, factor: float) -> None:
-        """放大/縮小按鍵 → 對所有可見 pane 統一縮放時間視窗（factor<1=放大 / >1=縮小），中心錨定。
-
-        用**時間空間**而唔係 bar index：各 pane 週期不同，bar count ×/÷1.25 唔等於
-        相同時間跨度——必須統一縮放 (start_dt, end_dt) 先至跨 pane 對齊得返。
-        """
-        if self._syncing:
-            return
-        ref = None
-        for i in range(self._pane_count):
-            rng = self._panes[i].time_window()
-            if rng is not None:
-                ref = rng
-                break
-        if ref is None:
-            return   # 無數據 → no-op
-        s, e = ref
-        center = s + (e - s) / 2
-        half = timedelta(seconds=(e - s).total_seconds() * factor / 2.0)
-        self._syncing = True
-        try:
-            for i in range(self._pane_count):
-                self._panes[i].set_time_window(center - half, center + half)
-        finally:
-            self._syncing = False
 
     def _on_indicator_toggled(self, key: str, on: bool) -> None:
         """指標開關 → 同步全部 4 pane（含隱藏——狀態同 pane 數據一樣保留）。

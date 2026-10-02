@@ -82,6 +82,24 @@ class TestZoomButtons:
         assert (ch._view_count, ch._right_offset) == (120, 0.0)
 
 
+class TestRightMargin:
+    """右側留白 5 bar-slot：slot 寬 = plot 寬 ÷（可見根數 + 5），bar 唔貼住價格軸。"""
+
+    def test_bar_slot_includes_right_margin(self):
+        ch = _chart(100)
+        ch.resize(800, 600)
+        plot, _, _ = ch._panes()
+        assert ch._bar_slot(100, plot) == pytest.approx(plot.width() / (100 + 5))
+
+    def test_last_bar_leaves_five_empty_slots(self):
+        ch = _chart(100)
+        ch.resize(800, 600)
+        plot, _, _ = ch._panes()
+        slot = ch._bar_slot(100, plot)
+        last_slot_right = plot.left() + 100 * slot
+        assert plot.right() - last_slot_right == pytest.approx(5 * slot)
+
+
 class TestLastPriceLine:
     """last-price 虛線 + 右軸 tag 回歸測試（offscreen pixel 級驗證）。"""
 
