@@ -712,6 +712,28 @@ def test_clear_tick_feed_on_code_switch(monkeypatch):
     assert win._tick_buffer == []
 
 
+def test_tick_toggle_collapse_expand(monkeypatch):
+    """Commit 33：👁 顯示/隱藏按鍵——收合 → width 34 + 標題/hint/table 隱藏；展開（默認）→ 270。"""
+    win, _engine = _make_window(monkeypatch)
+
+    # 默認展開（isHidden：offscreen 未 show 視窗下 isVisible 恆 False）
+    assert win._tick_toggle_btn.isChecked() is True
+    assert win._tick_box.width() == 270
+    assert win._tick_title.isHidden() is False and win._tick_table.isHidden() is False
+
+    # 收合
+    win._tick_toggle_btn.setChecked(False)
+    assert win._tick_box.width() == 34
+    assert win._tick_title.isHidden() is True
+    assert win._tick_hint.isHidden() is True
+    assert win._tick_table.isHidden() is True
+
+    # 再展開
+    win._tick_toggle_btn.setChecked(True)
+    assert win._tick_box.width() == 270
+    assert win._tick_title.isHidden() is False and win._tick_table.isHidden() is False
+
+
 def test_catalog_ready_reemits_for_order_window(monkeypatch):
     """Commit 31：engine catalog_ready → MainWindow re-emit catalog_ready（→ OrderWindow StockCompleter）。"""
     win, _engine = _make_window(monkeypatch)

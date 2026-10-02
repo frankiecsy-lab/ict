@@ -154,6 +154,7 @@ class OrderRow:
     dealt_qty: float
     dealt_avg_price: float
     create_time: str
+    acc_id: int = 0          # 來源帳戶（Commit 33：訂單表 per-account 顯示；default 保舊構造相容）
 
 
 class TradeEngine(QObject):
@@ -484,6 +485,7 @@ class TradeEngine(QObject):
                     dealt_qty=_f(row.get("dealt_qty")),
                     dealt_avg_price=_f(row.get("dealt_avg_price")),
                     create_time=_s(row.get("create_time")),
+                    acc_id=acc_id,
                 ))
             except Exception:  # noqa: BLE001 — 單行損壞跳過
                 logger.exception("bad order row skipped")
@@ -491,25 +493,31 @@ class TradeEngine(QObject):
 
     # ------------------------------------------------------------- place order（worker thread）
 
-    def place_order(self, code: str, side: TrdSide, price: float, qty: int, pin: str | None = None) -> None:
-        """GUI-thread entry：sanity check + spawn 短命 daemon worker（阻塞 RPC 唔喺 GUI thread）。"""
+    def place_order(self, code: str, side: TrdSide, price: float, qty: int, pin: str | None = None,
+                    *, trd_env: str = "REAL", acc_id: int | None = None) -> None:
+        """GUI-thread entry：sanity check + spawn 短命 daemon worker（阻塞 RPC 唔喺 GUI thread）。
+
+        Commit 33：`trd_env`/`acc_id` keyword-only——UI 端按「模式選擇器 + 標的種類自動匹配帳戶」
+        明確指定目標；兩者都省略時 fallback 舊行為（REAL + `_order_accs[market]`）。
+        """
         with self._lock:
             if self._closed:
                 self.order_result.emit(False, "引擎已關閉，無法下單")
                 return
             market = code.split(".", 1)[0].upper() if "." in code else ""
             ctx = self._ctxs.get(market)
-            acc_id = self._order_accs.get(market)
+            target_acc = acc_id if acc_id is not None else self._order_accs.get(market)
         if ctx is None:
             configured = ", ".join(sorted(self._ctxs)) or "（無）"
             self.order_result.emit(False, f"市場 {market!r} 未連線（已配置：{configured}）")
             return
-        if acc_id is None:
+        if target_acc is None:
+            env_zh = "實盤" if trd_env == "REAL" else "模擬盤"
             self.order_result.emit(
-                False, f"市場 {market!r} 冇可下單帳戶——需非 MASTER 實倉帳戶且 trdmarket_auth 含 {market}")
+                False, f"{env_zh} {market!r} 冇可下單帳戶——需非 MASTER ACTIVE 帳戶且 trdmarket_auth 含 {market}")
             return
         thread = threading.Thread(
-            target=self._order_worker, args=(ctx, acc_id, code, side, price, qty, pin),
+            target=self._order_worker, args=(ctx, target_acc, code, side, price, qty, pin, trd_env),
             name="trade-order", daemon=True)
         with self._lock:
             if self._closed:   # double-check：spawn 前一刻 stop() 咗
@@ -518,10 +526,15 @@ class TradeEngine(QObject):
             self._workers.append(thread)
         thread.start()
 
-    def _order_worker(self, ctx, acc_id: int, code: str, side: TrdSide, price: float, qty: int, pin: str | None) -> None:
-        """阻塞 place_order（明確 acc_id）；「未解鎖」錯誤 + 有 PIN → unlock_trade 一次 + retry 一次（30s/10 次限制，無循環）。"""
+    def _order_worker(self, ctx, acc_id: int, code: str, side: TrdSide, price: float, qty: int, pin: str | None,
+                      trd_env: str = "REAL") -> None:
+        """阻塞 place_order（明確 acc_id + env）；「未解鎖」錯誤 + 有 PIN → unlock_trade 一次 + retry 一次（30s/10 次限制，無循環）。
+
+        Commit 33：`trd_env` = "REAL"/"SIMULATE"——模擬盤無需交易密碼（futu 規則），pin 自然為 None。
+        """
+        env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
         try:
-            ret, msg = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id)
+            ret, msg = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id, trd_env=env_enum)
             if ret == RET_OK and not _needs_unlock(str(msg)):
                 self.order_result.emit(True, f"下單成功 order_id={msg}")
                 return
@@ -531,7 +544,8 @@ class TradeEngine(QObject):
                 if uret != RET_OK:
                     self.order_result.emit(False, f"解鎖失敗：{umsg}")
                     return
-                ret2, msg2 = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id)
+                ret2, msg2 = ctx.place_order(price=price, qty=qty, code=code, trd_side=side, acc_id=acc_id,
+                                             trd_env=env_enum)
                 if ret2 == RET_OK and not _needs_unlock(str(msg2)):
                     self.order_result.emit(True, f"下單成功（解鎖後重試）order_id={msg2}")
                 else:

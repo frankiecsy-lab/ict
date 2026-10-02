@@ -47,8 +47,9 @@ class FakeTradeEngine(QObject):
     def stop(self):
         self.stopped = True
 
-    def place_order(self, code, side, price, qty, pin=None):
-        self.order_calls.append((code, side, price, qty, pin))
+    def place_order(self, code, side, price, qty, pin=None, *, trd_env="REAL", acc_id=None):
+        """Commit 33：dispatch 帶 trd_env（模式）+ acc_id（自動匹配帳戶）。"""
+        self.order_calls.append((code, side, price, qty, pin, trd_env, acc_id))
 
 
 def _make_window(monkeypatch, **kwargs) -> tuple[OrderWindow, FakeTradeEngine]:
@@ -65,25 +66,41 @@ def _unlock(w: OrderWindow, pin: str = "123456") -> None:
 
 # ------------------------------------------------------------- PIN 狀態機
 
-def test_default_state_is_locked(monkeypatch):
-    """默認 LOCKED：下單表單全 disabled、解鎖/PIN 欄啟用、鎖定禁用。"""
+def test_default_state_simulate_unlocked(monkeypatch):
+    """Commit 33：默認模擬盤——永遠解鎖（futu 規則：模擬無需交易密碼）；PIN 區隱藏。"""
     w, _ = _make_window(monkeypatch)
+    assert w._mode == "SIMULATE"
     assert w._pin_holder is None
-    assert w._place_btn.isEnabled() is False
-    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_price, w._order_qty):   # Commit 31：買賣按鍵跟隨鎖狀態
+    assert w._pin_box.isHidden() is True        # PIN 區只喺 REAL 顯示（isHidden：offscreen 未 show 視窗下 isVisible 恆 False）
+    assert w._sim_hint.isHidden() is False
+    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_qty):
+        assert widget.isEnabled() is True       # 模擬盤直接可交易
+    assert w._order_price.isEnabled() is False   # follow mode：由市價驅動
+    assert w._lock_btn.isEnabled() is False      # 無 holder → 唔使鎖
+
+
+def test_real_mode_locked_until_pin(monkeypatch):
+    """Commit 33：切實盤 → PIN 區顯示 + 下單表單 disabled（直到輸入六位數 PIN）。"""
+    w, _ = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
+
+    assert w._mode == "REAL"
+    assert w._pin_box.isHidden() is False       # PIN 區顯示（isHidden：offscreen 未 show 視窗下 isVisible 恆 False）
+    assert w._sim_hint.isHidden() is True
+    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_qty):
         assert widget.isEnabled() is False
-    assert w._unlock_btn.isEnabled() is True
-    assert w._pin_edit.isEnabled() is True
-    assert w._lock_btn.isEnabled() is False
 
 
 def test_unlock_with_valid_pin_enables_trading(monkeypatch):
+    """Commit 33：實盤 + 6 位數字 PIN → holder 建立 + 下單表單啟用。"""
     w, _ = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
+    assert w._buy_btn.isEnabled() is False
+
     _unlock(w)
 
     assert w._pin_holder is not None
-    assert w._place_btn.isEnabled() is True
-    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_qty):   # Commit 31：買賣按鍵跟隨鎖狀態
+    for widget in (w._order_code, w._buy_btn, w._sell_btn, w._order_qty):
         assert widget.isEnabled() is True
     # 價格欄：follow mode（默認）→ 解鎖後仍 disabled（由市價驅動）；manual mode 需解鎖先可輸入
     assert w._following is True and w._order_price.isEnabled() is False
@@ -95,26 +112,28 @@ def test_unlock_with_valid_pin_enables_trading(monkeypatch):
 def test_reject_short_or_non_digit_pin(monkeypatch):
     """5 位 / 含非數字 → 拒絕（validator 只攔用戶輸入，handler 有自己驗證）。"""
     w, _ = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
 
     w._pin_edit.setText("12345")   # 太短
     w._on_unlock_clicked()
-    assert w._pin_holder is None and w._place_btn.isEnabled() is False
+    assert w._pin_holder is None and w._buy_btn.isEnabled() is False
     assert "PIN 必須係 6 位數字" in w._status_label.text()
 
     w._pin_edit.setText("12a456")   # 非數字（programmatic setText 繞過 validator）
     w._on_unlock_clicked()
-    assert w._pin_holder is None and w._place_btn.isEnabled() is False
+    assert w._pin_holder is None and w._buy_btn.isEnabled() is False
 
 
 def test_lock_button_clears_pin_immediately(monkeypatch):
     """鎖定：holder 立即清空 + 下單表單 disabled（下次要重新輸入）。"""
     w, _ = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
     _unlock(w)
     assert w._pin_holder is not None
 
     w._on_lock_clicked()
     assert w._pin_holder is None
-    assert w._place_btn.isEnabled() is False
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
     assert w._order_code.isEnabled() is False
     assert w._lock_btn.isEnabled() is False
     assert w._unlock_btn.isEnabled() is True, "鎖定後可以重新解鎖"
@@ -126,6 +145,7 @@ def test_expiry_auto_locks_after_ttl(monkeypatch):
     """Fake clock 過 deadline → _on_tick 自動鎖定（同手動鎖定一樣嘅路徑）。"""
     now = [1000.0]
     w, _ = _make_window(monkeypatch, clock=lambda: now[0], unlock_ttl_seconds=60)
+    w._mode_real_btn.setChecked(True)
 
     _unlock(w)
     assert w._pin_holder is not None
@@ -138,7 +158,7 @@ def test_expiry_auto_locks_after_ttl(monkeypatch):
     now[0] = 1061.0   # 過期 → 自動鎖定
     w._on_tick()
     assert w._pin_holder is None
-    assert w._place_btn.isEnabled() is False
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
     assert "解鎖已過期" in w._status_label.text()
 
 
@@ -149,6 +169,7 @@ def test_pin_never_in_plaintext_repr(monkeypatch):
     assert "246810" not in repr(h)
 
     w, _ = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
     _unlock(w, pin="246810")
     assert w._pin_edit.text() == "", "解鎖後欄位必須清空——臨時密碼唔留喺 UI"
     assert repr(w._pin_holder) == "***"
@@ -254,22 +275,29 @@ def test_account_cards_empty_snapshot(monkeypatch):
 
 
 def test_orders_table_populated_with_status_zh_and_color(monkeypatch):
-    """orders_updated → table：時間 HH:MM:SS + 方向/狀態中文映射 + 狀態格上色。"""
+    """Commit 33：orders_updated → table 11 欄全細節（訂單號/代碼/方向/類型/狀態/數量/價格/已成交/均價/時間/帳戶）。"""
     w, fake = _make_window(monkeypatch)
 
     fake.orders_updated.emit((
-        OrderRow("1", "HK.00700", "BUY", "NORMAL", "FILLED_ALL", 200, 55.5, 200, 55.4,
+        OrderRow("9001", "HK.00700", "BUY", "NORMAL", "FILLED_ALL", 200, 55.5, 200, 55.4,
                  "2026-10-02 09:30:00"),
-        OrderRow("2", "US.AAPL", "SELL", "NORMAL", "SUBMITTED", 10, 140.0, 0, 0.0,
+        OrderRow("9002", "US.AAPL", "SELL", "NORMAL", "SUBMITTED", 10, 140.0, 0, 0.0,
                  "2026-10-02 10:00:05"),
     ))
 
     table = w._orders_table
     assert table.rowCount() == 2
-    assert table.item(0, 0).text() == "09:30:00"      # HH:MM:SS（SDK 'YYYY-MM-DD HH:MM:SS'）
-    assert table.item(0, 1).text() == "HK.00700"
+    assert table.columnCount() == 11, "Commit 33：訂單表 11 欄全細節"
+    assert table.item(0, 0).text() == "9001"          # 訂單號
+    assert table.item(0, 1).text() == "HK.00700"      # 代碼
     assert table.item(0, 2).text() == "買入"           # 方向中文映射
+    assert table.item(0, 3).text() == "NORMAL"        # 類型
     assert table.item(0, 4).text() == "全部已成"       # 狀態中文映射
+    assert table.item(0, 5).text() == "200"           # 數量 %g
+    assert table.item(0, 6).text() == "55.50"         # 價格
+    assert table.item(0, 7).text() == "200"           # 已成交
+    assert table.item(0, 8).text() == "55.40"         # 成交均價
+    assert table.item(0, 9).text() == "09:30:00"      # HH:MM:SS（SDK 'YYYY-MM-DD HH:MM:SS'）
     assert table.item(1, 2).text() == "賣出"
     assert table.item(1, 4).text() == "已提交"
 
@@ -286,69 +314,103 @@ def test_order_status_zh_fallback_returns_raw():
 
 
 def test_order_result_updates_status_label(monkeypatch):
-    """成功/失敗 → status label 更新；unlocked 時 re-enable 下單按鍵、locked 保持 disabled。"""
+    """成功/失敗 → status label 更新；in-flight guard re-enable（Commit 33：買賣雙按鍵）。"""
     w, fake = _make_window(monkeypatch)
 
-    # LOCKED：order_result 唔應啟用下單
+    # REAL + LOCKED：order_result 唔應啟用下單
+    w._mode_real_btn.setChecked(True)
     fake.order_result.emit(False, "引擎已關閉，無法下單")
     assert "引擎已關閉" in w._status_label.text()
-    assert w._place_btn.isEnabled() is False
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
 
     # UNLOCKED + in-flight（btn disabled）→ result 後 re-enable
     _unlock(w)
-    w._place_btn.setEnabled(False)   # 模擬 in-flight guard
+    w._buy_btn.setEnabled(False)   # 模擬 in-flight guard
     fake.order_result.emit(True, "下單成功 order_id=1")
     assert "下單成功" in w._status_label.text()
-    assert w._place_btn.isEnabled() is True
+    assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True
 
 
 # ------------------------------------------------------------- 下單流程
 
 def test_place_order_dispatches_to_engine(monkeypatch):
-    """GUI 驗證通過 → engine.place_order（pin = holder value）+ in-flight guard。"""
+    """Commit 33：GUI 驗證通過 → engine.place_order（pin + trd_env + acc_id）+ in-flight guard。"""
     w, fake = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
+    fake.accounts_updated.emit((_acc(1, env="REAL", acc_type="CASH"),))
+    assert w._matched_acc is not None
     _unlock(w, pin="246810")
 
     w._order_code.setText("HK.00700")
-    assert w._buy_btn.isChecked() is True        # Commit 31：默認買入（彩色按鍵取代 combo）
     w._order_price.setValue(55.5)      # QDoubleSpinBox（programmatic setValue 唔受 disabled 影響）
     w._order_qty.setText("200")
-    w._on_place_order()
+    w._on_place_order("BUY")
 
     assert len(fake.order_calls) == 1
-    code, side, price, qty, pin = fake.order_calls[0]
-    assert (code, side, price, qty, pin) == ("HK.00700", TrdSide.BUY, 55.5, 200, "246810")
-    assert w._place_btn.isEnabled() is False, "in-flight 期間禁用下單按鍵"
+    code, side, price, qty, pin, trd_env, acc_id = fake.order_calls[0]
+    assert (code, side, price, qty, pin, trd_env, acc_id) == \
+        ("HK.00700", TrdSide.BUY, 55.5, 200, "246810", "REAL", 1)
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False, "in-flight 期間禁用買賣按鍵"
 
 
 def test_place_order_sell_side(monkeypatch):
+    """Commit 33：賣出特大按鍵 → TrdSide.SELL（模擬盤無需 PIN）。"""
     w, fake = _make_window(monkeypatch)
-    _unlock(w)
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH", auth=("US",)),))
 
     w._order_code.setText("US.AAPL")
-    w._sell_btn.setChecked(True)      # Commit 31：賣出按鍵（exclusive group → buy 自動 uncheck）
     w._order_price.setValue(140.25)
     w._order_qty.setText("10")
-    w._on_place_order()
+    w._on_place_order("SELL")
 
     assert fake.order_calls[0][1] is TrdSide.SELL
+    assert fake.order_calls[0][5] == "SIMULATE"   # trd_env = 當前模式
+
+
+def test_place_order_requires_matched_account(monkeypatch):
+    """Commit 33：無匹配帳戶（env/市場授權唔符）→ 阻止下單 + 錯誤 status。"""
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", auth=("US",)),))   # US-only
+
+    w._order_code.setText("HK.00700")   # HK ∉ auth → 無匹配
+    assert w._matched_acc is None
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    w._on_place_order("BUY")
+
+    assert fake.order_calls == []
+    assert "無匹配" in w._status_label.text()
+
+
+def test_place_order_real_mode_requires_pin(monkeypatch):
+    """Commit 33：實盤未解鎖 → 阻止下單（模擬盤恆解鎖、唔受此限制）。"""
+    w, fake = _make_window(monkeypatch)
+    w._mode_real_btn.setChecked(True)
+    fake.accounts_updated.emit((_acc(1, env="REAL", acc_type="CASH"),))
+
+    w._order_code.setText("HK.00700")
+    w._order_price.setValue(55.5)
+    w._order_qty.setText("200")
+    w._on_place_order("BUY")
+
+    assert fake.order_calls == []
+    assert "實盤未解鎖" in w._status_label.text()
 
 
 def test_place_order_rejects_invalid_input(monkeypatch):
     """代碼無 '.' / 價格 ≤ 0 → 唔 dispatch + 錯誤 status（非數字輸入由 spinbox validator 源頭攔截）。"""
     w, fake = _make_window(monkeypatch)
-    _unlock(w)
 
     w._order_code.setText("NOPE")   # 無 market prefix
     w._order_price.setValue(10.0)
     w._order_qty.setText("5")
-    w._on_place_order()
+    w._on_place_order("BUY")
     assert fake.order_calls == []
     assert "代碼格式錯誤" in w._status_label.text()
 
     w._order_code.setText("HK.00700")
     w._order_price.setValue(0)   # QDoubleSpinBox 原生 range——剩餘非法值只係 0/負數
-    w._on_place_order()
+    w._on_place_order("BUY")
     assert fake.order_calls == []
     assert "必須大於 0" in w._status_label.text()
 
@@ -376,7 +438,8 @@ def test_price_step_magnitudes():
 def test_set_symbol_syncs_order_code_even_when_locked(monkeypatch):
     """K 綫標的切換 → 下單代碼跟隨（PIN locked 都生效——純顯示，唔係交易動作）。"""
     w, _ = _make_window(monkeypatch)
-    assert w._order_code.isEnabled() is False   # LOCKED
+    w._mode_real_btn.setChecked(True)   # REAL + LOCKED
+    assert w._order_code.isEnabled() is False
 
     w.set_symbol("US.AAPL")
     assert w._order_code.text() == "US.AAPL"
@@ -411,7 +474,8 @@ def test_follow_toggle_glyph_and_manual_requires_unlock(monkeypatch):
     w, _ = _make_window(monkeypatch)
     assert w._follow_btn.isChecked() is True and w._follow_btn.text() == "🔗"
 
-    # LOCKED + manual → 價格欄仍 disabled（交易動作要解鎖）
+    # REAL LOCKED + manual → 價格欄仍 disabled（交易動作要解鎖）
+    w._mode_real_btn.setChecked(True)
     w._follow_btn.setChecked(False)
     assert w._following is False and w._follow_btn.text() == "✎"
     assert w._order_price.isEnabled() is False, "manual mode locked 時都要 PIN 解鎖先可輸入"
@@ -557,42 +621,162 @@ def test_place_order_catalog_validation(monkeypatch):
     """Commit 31：目錄已載入 → 未知代碼拒絕 + 已知代碼正規化大小寫；未載入 → 放行俾 engine/OpenD。"""
     from engine.stock_catalog import StockEntry
 
-    w, fake = _make_window(monkeypatch)
-    _unlock(w)
+    w, fake = _make_window(monkeypatch)   # 默認 SIMULATE（常解鎖）
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
     w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "Tencent"),))
 
     # 未知代碼 → 拒絕（唔 dispatch）
     w._order_code.setText("XX.99999")
     w._order_price.setValue(10.0)
     w._order_qty.setText("5")
-    w._on_place_order()
+    w._on_place_order("BUY")
     assert fake.order_calls == []
     assert "股票編號唔存在" in w._status_label.text()
 
     # 已知代碼（小寫輸入）→ 正規化 canonical HK.00700 + dispatch
     w._order_code.setText("hk.00700")
-    w._on_place_order()
+    w._on_place_order("BUY")
     assert fake.order_calls[0][0] == "HK.00700"
 
     # 目錄未載入（新視窗）→ 放行俾 engine/OpenD 最終校驗
     w2, fake2 = _make_window(monkeypatch)
-    _unlock(w2)
+    fake2.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH", auth=("SG",)),))
     w2._order_code.setText("SG.D05")
     w2._order_price.setValue(1.0)
     w2._order_qty.setText("1")
-    w2._on_place_order()
+    w2._on_place_order("BUY")
     assert fake2.order_calls[0][0] == "SG.D05"
 
 
-def test_buy_sell_buttons_exclusive_and_follow_pin(monkeypatch):
-    """Commit 31：買賣按鍵 exclusive（QButtonGroup）+ 跟隨 PIN 鎖狀態。"""
-    w, _ = _make_window(monkeypatch)
-    assert w._buy_btn.isChecked() is True and w._sell_btn.isChecked() is False   # 默認買入
-    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False  # LOCKED
+def test_big_buy_sell_buttons_style_and_pin(monkeypatch):
+    """Commit 33：買賣大按鍵（≥64px、買紅 #F23645 / 賣綠 #089981）+ 跟隨 PIN 鎖狀態。"""
+    from ui import order_window as ow
 
+    w, _ = _make_window(monkeypatch)
+    assert w._buy_btn.minimumHeight() >= ow._BIG_BTN_MIN_HEIGHT
+    assert "F23645" in w._buy_btn.styleSheet(), "買入按鍵必須紅色"
+    assert "089981" in w._sell_btn.styleSheet(), "賣出按鍵必須綠色"
+
+    # 默認 SIMULATE → 常解鎖、兩按鍵啟用
+    assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True
+
+    # REAL + LOCKED → 禁用；PIN 解鎖後恢復
+    w._mode_real_btn.setChecked(True)
+    assert w._buy_btn.isEnabled() is False and w._sell_btn.isEnabled() is False
     _unlock(w)
     assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True
 
-    # exclusive：check sell → buy 自動 uncheck
-    w._sell_btn.setChecked(True)
-    assert w._sell_btn.isChecked() is True and w._buy_btn.isChecked() is False
+
+# ------------------------------------------------------------- Commit 33：模式選擇 / 帳戶匹配 / live label
+
+def test_mode_selector_toggles_pin_visibility(monkeypatch):
+    """Commit 33：模式選擇器——SIMULATE 隱藏 PIN 區、REAL 顯示；_mode 字串同步。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._mode == "SIMULATE" and w._pin_box.isHidden() is True
+
+    w._mode_real_btn.setChecked(True)
+    assert w._mode == "REAL" and w._pin_box.isHidden() is False and w._sim_hint.isHidden() is True
+
+    w._mode_sim_btn.setChecked(True)
+    assert w._mode == "SIMULATE" and w._pin_box.isHidden() is True and w._sim_hint.isHidden() is False
+
+
+def test_is_equity_symbol_heuristic():
+    """Commit 33：股票 vs 期貨/期權 heuristic——suffix 'main' = 期貨主連、長代碼 = 期權。"""
+    from ui.order_window import _is_equity_symbol
+    assert _is_equity_symbol("HK.00700") is True
+    assert _is_equity_symbol("US.AAPL") is True
+    assert _is_equity_symbol("SG.D05") is True
+    assert _is_equity_symbol("HK.HSImain") is False      # 期貨主連
+    assert _is_equity_symbol("SG.CNmain") is False
+    assert _is_equity_symbol("US.AAPL251219C00200000") is False   # 期權（長代碼）
+    assert _is_equity_symbol("NOPE") is False            # 無市場前綴 → 唔係股票
+
+
+def test_match_order_account_prefers_cash_for_equity():
+    """Commit 33：股票優選 CASH 帳戶；期貨/期權優選 MARGIN / STOCK_AND_OPTION。"""
+    from ui.order_window import _match_order_account
+    cash = _acc(1, env="SIMULATE", acc_type="CASH")
+    margin = _acc(2, env="SIMULATE", acc_type="MARGIN")
+
+    assert _match_order_account((cash, margin), "HK.00700", "SIMULATE").acc_id == 1
+    assert _match_order_account((cash, margin), "HK.HSImain", "SIMULATE").acc_id == 2
+
+
+def test_match_order_account_filters():
+    """Commit 33：env 唔符 / 非 ACTIVE / MASTER / 市場唔喺授權——全部過濾。"""
+    from ui.order_window import _match_order_account
+    accounts = (
+        _acc(1, env="REAL", acc_type="CASH"),                    # env 唔符（mode=SIMULATE）
+        _acc(2, env="SIMULATE", acc_status="DISABLED"),          # 非 ACTIVE
+        _acc(3, env="SIMULATE", role="MASTER"),                  # MASTER 主帳戶
+        _acc(4, env="SIMULATE", auth=("US",)),                   # 市場 HK 唔喺授權
+    )
+    assert _match_order_account(accounts, "HK.00700", "SIMULATE") is None
+
+    ok = _acc(5, env="SIMULATE", acc_type="CASH")
+    assert _match_order_account((ok,) + accounts, "HK.00700", "SIMULATE").acc_id == 5
+
+
+def test_total_label_qty_times_price(monkeypatch):
+    """Commit 33：合計金額 label = 數量 × 價格 live 更新（任一欄空/0 → —）。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._total_label.text() == "合計 —"
+
+    w._order_qty.setText("200")          # price 仍 0 → —
+    assert w._total_label.text() == "合計 —"
+
+    w._order_price.setValue(55.5)        # 200 × 55.5 = 11,100.00
+    assert w._total_label.text() == "合計 11,100.00"
+
+
+def test_name_label_shows_catalog_names(monkeypatch):
+    """Commit 33：代碼輸入後顯示目錄中文名/英文名；未知 code → 空。"""
+    from engine.stock_catalog import StockEntry
+    w, _ = _make_window(monkeypatch)
+    w.set_stock_catalog((StockEntry("HK.00700", "騰訊控股", "Tencent"),))
+
+    w._order_code.setText("HK.00700")
+    assert w._name_label.text() == "騰訊控股 Tencent"   # name_text = 中 + 英單空格 join
+
+    w._order_code.setText("US.AAPL")                    # 目錄未收錄 → 空
+    assert w._name_label.text() == ""
+
+
+def test_matched_account_info_label(monkeypatch):
+    """Commit 33：匹配帳戶 info label——env · 類型 · 卡號末四位 · 餘額（資金到即同步）。"""
+    w, fake = _make_window(monkeypatch)
+    # 初始 code = cfg.trading_code（HK.HSImain，非空）但零帳戶 → 「無匹配」
+    assert w._acc_info_label.text() == "帳戶 —（無匹配帳戶）"
+
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH"),))
+    w.set_symbol("HK.00700")
+    assert w._acc_info_label.text() == "帳戶 模擬 · CASH · 卡號 …5678 · 餘額 —"
+
+    fake.account_funds_updated.emit(1, "SIMULATE", _funds(total_assets=999_999.0))
+    assert w._acc_info_label.text() == "帳戶 模擬 · CASH · 卡號 …5678 · 餘額 999,999.00"
+
+
+def test_orders_table_account_column(monkeypatch):
+    """Commit 33：訂單表第 11 欄 = 來源帳戶（卡號末四位）。"""
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1),))   # REAL、card 12345678
+
+    row = OrderRow(order_id="9001", code="HK.00700", side="BUY", order_type="NORMAL",
+                   status="FILLED_ALL", qty=200, price=55.5, dealt_qty=200,
+                   dealt_avg_price=55.4, create_time="2026-10-02 09:30:00", acc_id=1)
+    fake.orders_updated.emit((row,))
+
+    assert w._orders_table.item(0, 10).text() == "…5678"
+
+
+def test_set_symbol_refreshes_labels(monkeypatch):
+    """Commit 33：set_symbol（K 綫標的切換）→ code + 名稱 label 同步。"""
+    from engine.stock_catalog import StockEntry
+    w, fake = _make_window(monkeypatch)
+    fake.accounts_updated.emit((_acc(1, env="SIMULATE", acc_type="CASH", auth=("US",)),))
+    w.set_stock_catalog((StockEntry("US.AAPL", "Apple Inc.", "Apple"),))
+
+    w.set_symbol("US.AAPL")
+    assert w._order_code.text() == "US.AAPL"
+    assert w._name_label.text() == "Apple Inc. Apple"

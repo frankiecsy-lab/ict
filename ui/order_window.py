@@ -1,6 +1,15 @@
-"""下單版面視窗：帳戶卡片按環境 tab 分類（只 ACTIVE，撳卡可按該帳戶過濾持倉）+ per-account 資金 + env 加總資金面板
-+ 持倉/今日訂單顯示（持倉帶帳戶標記、雙 env 覆蓋）+ 限價買賣下單（代碼模糊自動補全 + 目錄驗證同 K 綫圖、
-買入/賣出 = 綠/紅互斥按鍵、價格默認跟隨市價 + icon 切換手動 + stepper）+ 六位數 PIN 交易解鎖。
+"""下單版面視窗（Commit 33 專業化改版）：
+
+- **模式選擇器**：模擬盤 SIMULATE / 實盤 REAL——只有實盤先顯示六位數 PIN 輸入 + 解鎖/上鎖按鍵；
+  模擬盤無需交易密碼（futu 規則），下單直接 dispatch `trd_env="SIMULATE"`。
+- **標的種類自動匹配帳戶**：股票 → 優先 CASH 帳戶、期貨期權 → 優先 MARGIN/STOCK_AND_OPTION
+  （`_is_equity_symbol()` + `_match_order_account()` 純函數），下單模塊即時顯示匹配帳戶卡號末四位 + 餘額。
+- **底部特大買賣按鍵**：買入=紅 / 賣出=綠（Commit 31 起嘅綠/紅已對調），撳即落單（direct execution，
+  專業交易軟件慣例）；in-flight 期間兩按同時禁用。
+- **下單即時資訊**：合計金額 = 數量 × 價格 live label + 代碼輸入後顯示中文/英文名稱。
+- **訂單表全細節**：11 欄（時間/訂單號/代碼/方向/類型/狀態/數量/價格/已成交/成交均價/帳戶）。
+- **水平二分**：今日訂單喺上、持倉喺下（Commit 31 前係左右並排）。
+- 帳戶卡片按環境 tab 分類（只 ACTIVE，撳卡可按該帳戶過濾持倉）+ per-account 資金 + env 加總資金面板。
 
 PIN 安全設計（用戶要求：6 位臨時密碼絕不明文顯示）:
 - input = QLineEdit EchoMode.Password + [0-9]{0,6} validator → UI 永遠圓點；
@@ -26,6 +35,7 @@ from config import Config
 from engine.trade_engine import (AccountInfo, FundsSnapshot, OrderRow, PositionRow,
                                  TradeEngine, _sum_funds)
 from futu import TrdSide
+from engine.stock_catalog import name_text
 from .stock_completer import StockCompleter, code_from_completion
 
 # 狀態色（跟 MainWindow 深色主題語義）
@@ -33,15 +43,61 @@ _OK_COLOR = "#089981"
 _ERR_COLOR = "#F23645"
 _WARN_COLOR = "#FFB020"
 
-# 買入/賣出按鍵（Commit 31）：買=綠 / 賣=紅互斥 checkable——取代舊 QComboBox
+# 買入/賣出特大按鍵（Commit 33）：買=紅 / 賣=綠（用戶指定，同 Commit 31 嘅綠/紅對調）。
+# direct execution——撳即落單；:hover 微亮提示可點、:disabled = PIN locked / in-flight。
 _BUY_BTN_STYLE = (
-    "QPushButton { background: #0B3D2E; border: 1px solid #089981; color: #69F0AE; font-weight: bold; }"
-    "QPushButton:checked { background: #089981; color: #FFFFFF; }"
+    "QPushButton { background: #4A1420; border: 2px solid #F23645; color: #FF8A80;"
+    " font-weight: bold; font-size: 18px; }"
+    "QPushButton:hover { background: #6B1D2E; color: #FFFFFF; }"
     "QPushButton:disabled { background: #151B23; border-color: #2A3441; color: #4A5568; }")
 _SELL_BTN_STYLE = (
-    "QPushButton { background: #4A1420; border: 1px solid #F23645; color: #FF8A80; font-weight: bold; }"
-    "QPushButton:checked { background: #F23645; color: #FFFFFF; }"
+    "QPushButton { background: #0B3D2E; border: 2px solid #089981; color: #69F0AE;"
+    " font-weight: bold; font-size: 18px; }"
+    "QPushButton:hover { background: #0E5C47; color: #FFFFFF; }"
     "QPushButton:disabled { background: #151B23; border-color: #2A3441; color: #4A5568; }")
+
+# 特大按鍵最小高度（px）——「特別大」嘅量化定義，測試斷言用
+_BIG_BTN_MIN_HEIGHT = 64
+
+
+def _is_equity_symbol(code: str) -> bool:
+    """標的種類 heuristic：股票 vs 期貨/期權（Commit 33 帳戶自動匹配用）。
+
+    - suffix 以 'main' 結尾 = 主力連續合約 → 期貨（HK.HSImain / SG.CNmain）；
+    - suffix 長度 ≥12 = 期權代碼（ticker + 到期日 + 行權價，如 AAPL251219C00200000）；
+    - 其餘 = 股票（HK.00700 / US.AAPL / SG.D05——美股 ticker 係字母、唔可以淨係睇數字）。
+    """
+    suffix = code.split(".", 1)[1] if "." in code else ""
+    if not suffix:
+        return False
+    if suffix.lower().endswith("main"):
+        return False
+    if len(suffix) >= 12:
+        return False
+    return True
+
+
+def _match_order_account(accounts, code: str, trd_env: str):
+    """按「模式 + 標的種類」自動匹配下單帳戶（純函數、可單測）。
+
+    過濾：trd_env 匹配 + ACTIVE + 非 MASTER + market ∈ trdmarket_auth。
+    優先序：股票 → CASH 帳戶優先；期貨/期權 → MARGIN / STOCK_AND_OPTION 優先；其餘類型殿後。
+    無候選 → None（UI 顯示 ⚠ 並阻止下單）。
+    """
+    market = code.split(".", 1)[0].upper() if "." in code else ""
+    candidates = [
+        a for a in accounts
+        if a.trd_env == trd_env and a.acc_status == "ACTIVE"
+        and a.acc_role != "MASTER" and market in a.trdmarket_auth
+    ]
+    if not candidates:
+        return None
+    preferred = {"CASH"} if _is_equity_symbol(code) else {"MARGIN", "STOCK_AND_OPTION"}
+
+    def rank(a):
+        return 0 if a.acc_type in preferred else 1
+
+    return sorted(candidates, key=rank)[0]
 
 # OrderStatus → 繁體中文（唔喺表內 fallback 原文）
 _ORDER_STATUS_ZH = {
@@ -114,11 +170,13 @@ def _price_step(price: float) -> float:
 class OrderWindow(QMainWindow):
     """下單版面（獨立 top-level 視窗，可拖去第二螢幕）。
 
-    佈局：PIN bar → main_row[左欄（帳戶卡片 tabs + 持倉/訂單左右並排表）| 右欄全高（資金/訂金 env tabs + 限價下單 form）] → status label。
-    LOCKED（默認）：下單表單 disabled（follow 按鍵除外——模式切換唔係交易動作）；UNLOCKED：啟用 + countdown。
+    佈局（Commit 33）：PIN bar（含模式選擇器——只實盤先顯示 PIN 輸入）→ main_row[左欄（帳戶卡片 tabs +
+    今日訂單/持倉**上下水平二分**表）| 右欄全高（資金/訂金 env tabs + 限價下單 form，底部特大買=紅/賣=綠按鍵）] → status label。
+    LOCKED（默認、只實盤有意義）：下單表單 disabled；UNLOCKED：啟用 + countdown。模擬盤無需 PIN、永遠可交易。
     價格欄：follow mode（默認）由市價驅動、disabled；manual mode 需解鎖先可輸入，stepper 自適應步長。
     Commit 31：帳戶卡片撳一下 → 持倉表過濾該帳戶（持倉帶 acc_id/trd_env 標記、雙 env 覆蓋）；下單代碼 =
-    模糊自動補全 + 目錄驗證（同 K 綫圖）、買入/賣出 = 綠/紅互斥按鍵。
+    模糊自動補全 + 目錄驗證（同 K 綫圖）。Commit 33：買賣按鍵改 direct execution（撳即落單）、
+    合計金額/名稱 live label、帳戶按標的種類自動匹配。
     """
 
     def __init__(self, cfg: Config, *, clock=time.time, unlock_ttl_seconds: float = 24 * 3600) -> None:
@@ -127,7 +185,7 @@ class OrderWindow(QMainWindow):
         self._clock = clock
         self._unlock_ttl = unlock_ttl_seconds
         self.setWindowTitle("ICT Trader — 下單版面")
-        self.resize(1280, 860)   # 左右並排表格（持倉 12 欄 + 訂單 9 欄）需要寬度
+        self.resize(1280, 860)   # 左欄訂單/持倉上下二分（各 11-12 欄）需要寬度
 
         # 深色主題（跟 MainWindow 配色）
         self.setStyleSheet(
@@ -158,13 +216,14 @@ class OrderWindow(QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
         root.addWidget(self._build_pin_bar())
-        # 主區左右佈局：左欄 = 監控側（帳戶卡片 + 持倉/訂單並排表）；右欄 = 交易側全高（資金/訂金 + 限價下單 form）。
+        # 主區左右佈局：左欄 = 監控側（帳戶卡片 + 今日訂單/持倉上下水平二分）；右欄 = 交易側全高（資金/訂金 + 限價下單 form）。
         main_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.addWidget(self._build_account_cards())
-        tables_row = QHBoxLayout()
-        tables_row.addWidget(self._build_positions_table(), 1)   # 左：持倉表
-        tables_row.addWidget(self._build_orders_group(), 1)      # 右：今日訂單 group
+        # Commit 33：水平二分——訂單喺上、持倉喺下（Commit 31 前係左右並排）；各 stretch=1 均分高度。
+        tables_row = QVBoxLayout()
+        tables_row.addWidget(self._build_orders_group(), 1)      # 上：今日訂單 group（全細節 11 欄）
+        tables_row.addWidget(self._build_positions_table(), 1)   # 下：持倉表
         left_col.addLayout(tables_row, 1)                        # stretch：表格佔左欄剩餘高度
         right_col = QVBoxLayout()
         right_col.addWidget(self._build_funds_group())
@@ -203,18 +262,50 @@ class OrderWindow(QMainWindow):
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._on_tick)
 
-        self._apply_pin_state()   # 初始 LOCKED：下單表單 disabled
+        # Commit 33：模式選擇器 + 標的種類自動匹配帳戶 + 名稱/合計 live label
+        self._mode = "SIMULATE"   # 默認模擬盤（安全預設；實盤需明確切換 + PIN 解鎖）
+        self._all_accounts: list[AccountInfo] = []          # 全帳戶 snapshot（_on_accounts 更新、匹配用）
+        self._matched_acc: AccountInfo | None = None        # 當前匹配嘅下單帳戶（code × mode 決定）
+        self._code_names: dict[str, str] = {}               # canonical code → 「中文名 英文名」（set_stock_catalog 建）
+
+        self._on_code_changed()   # Commit 33：初始代碼（cfg.trading_code）→ 名稱/合計/帳戶 label 就緒
+        self._apply_pin_state()   # 初始：SIMULATE 默認 → 表單 enabled；PIN 區隱藏
         self._engine.start(cfg)
 
     # ------------------------------------------------------------- widget builders
 
     def _build_pin_bar(self) -> QWidget:
-        """PIN bar：標題 + masked PIN input + 解鎖/鎖定按鍵 + countdown label。"""
+        """PIN bar（Commit 33）：模式選擇器（模擬/實盤互斥）+ PIN 輸入區——**只實盤先顯示**。
+
+        模擬盤無需交易密碼（futu 規則）→ `_pin_box` 隱藏、顯示提示 label；實盤 → masked PIN input +
+        解鎖/鎖定按鍵 + countdown。模式切換唔會清空已解鎖嘅 PIN holder（24h 狀態跨模式保留）。
+        """
         bar = QWidget()
         h = QHBoxLayout(bar)
         h.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("交易解鎖")
+        title = QLabel("交易模式")
         title.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
+
+        # 模式選擇器：互斥 checkable（QButtonGroup）；SIMULATE 默認選中（安全預設）
+        self._mode_sim_btn = QPushButton("模擬盤 SIMULATE")
+        self._mode_real_btn = QPushButton("實盤 REAL")
+        for btn, checked in ((self._mode_sim_btn, True), (self._mode_real_btn, False)):
+            btn.setCheckable(True)
+            btn.setChecked(checked)
+            btn.setStyleSheet(
+                "QPushButton { background: #1E2836; border: 1px solid #2A3441; color: #7A8699; font-weight: bold; }"
+                "QPushButton:checked { background: #27435C; border-color: #4FC3F7; color: #FFFFFF; }")
+        mode_group = QButtonGroup(self)
+        mode_group.setExclusive(True)
+        mode_group.addButton(self._mode_sim_btn)
+        mode_group.addButton(self._mode_real_btn)
+
+        # PIN 輸入區（REAL only）：包喺獨立 container → setVisible 一鍵收放
+        self._pin_box = QWidget()
+        ph = QHBoxLayout(self._pin_box)
+        ph.setContentsMargins(8, 0, 0, 0)
+        pin_title = QLabel("交易解鎖")
+        pin_title.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
         self._pin_edit = QLineEdit()
         self._pin_edit.setEchoMode(QLineEdit.EchoMode.Password)   # 永遠圓點，無明文
         self._pin_edit.setPlaceholderText("六位數 PIN")
@@ -223,17 +314,37 @@ class OrderWindow(QMainWindow):
         self._pin_edit.setFixedWidth(140)
         self._unlock_btn = QPushButton("解鎖")
         self._lock_btn = QPushButton("鎖定")
+        ph.addWidget(pin_title)
+        ph.addWidget(self._pin_edit)
+        ph.addWidget(self._unlock_btn)
+        ph.addWidget(self._lock_btn)
+
+        # 模擬盤提示（SIMULATE only）
+        self._sim_hint = QLabel("模擬盤無需交易密碼——下單直接執行")
+        self._sim_hint.setStyleSheet(f"color: {self._cfg.axis_text_color}; font-size: 12px;")
+
         self._countdown_label = QLabel("")
         self._countdown_label.setStyleSheet(f"color: {_WARN_COLOR};")
         h.addWidget(title)
-        h.addWidget(self._pin_edit)
-        h.addWidget(self._unlock_btn)
-        h.addWidget(self._lock_btn)
+        h.addWidget(self._mode_sim_btn)
+        h.addWidget(self._mode_real_btn)
+        h.addWidget(self._pin_box)
+        h.addWidget(self._sim_hint)
         h.addStretch(1)
         h.addWidget(self._countdown_label)
+
         self._unlock_btn.clicked.connect(self._on_unlock_clicked)
         self._lock_btn.clicked.connect(self._on_lock_clicked)
+        # 模式切換：lambda 包零參數調用（toggled 雖只有一個 (bool) overload，統一 lambda 最穩）
+        self._mode_sim_btn.toggled.connect(lambda: self._sync_mode())
+        self._mode_real_btn.toggled.connect(lambda: self._sync_mode())
         return bar
+
+    def _sync_mode(self) -> None:
+        """模式按鍵 toggled → 更新 `self._mode` + PIN 區可見性 + 帳戶重新匹配（env 變咗）。"""
+        self._mode = "SIMULATE" if self._mode_sim_btn.isChecked() else "REAL"
+        self._refresh_matched_account()   # 匹配依賴 env——切換即刻重算
+        self._apply_pin_state()
 
     def _build_account_cards(self) -> QTabWidget:
         """帳戶卡片區：按環境 tab 分類（實盤 REAL / 模擬 SIMULATE），每帳戶一張卡。
@@ -355,12 +466,17 @@ class OrderWindow(QMainWindow):
         return self._pos_table
 
     def _build_orders_group(self) -> QGroupBox:
-        """今日訂單 group：stretchable table（9 欄）——同持倉表左右並排、各佔半邊。"""
+        """今日訂單 group：stretchable table（11 欄）——Commit 33 加「訂單號」+「帳戶」。
+
+        Commit 33：訂單在上、持倉在下（垂直二分）；訂單表顯示所有細節
+        （訂單號 / 代碼 / 方向 / 類型 / 狀態 / 數量 / 價格 / 已成交 / 成交均價 / 下單時間 / 帳戶）。
+        """
         box = QGroupBox("今日訂單")
         v = QVBoxLayout(box)
-        self._orders_table = QTableWidget(0, 9)
+        self._orders_table = QTableWidget(0, 11)
         self._orders_table.setHorizontalHeaderLabels(
-            ["時間", "代碼", "方向", "類型", "狀態", "數量", "價格", "已成交", "成交均價"])
+            ["訂單號", "代碼", "方向", "類型", "狀態", "數量", "價格",
+             "已成交", "成交均價", "下單時間", "帳戶"])
         self._orders_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._orders_table.verticalHeader().setVisible(False)
         self._orders_table.horizontalHeader().setStretchLastSection(True)
@@ -368,10 +484,17 @@ class OrderWindow(QMainWindow):
         return box
 
     def _build_order_group(self) -> QGroupBox:
-        """下單 group：code（模糊自動補全 + 目錄驗證）/ 買賣彩色按鍵 / price / qty / 下單按鍵。"""
+        """下單 group（Commit 33）：垂直佈局——code+中文名 / price+follow+qty / 合計金額 / 匹配帳戶 / 底部特大買賣按鍵。
+
+        買=紅、賣=綠，**直接執行**（撳即落單，專業交易軟件慣例），min height 64px；
+        取代舊「互斥 checkable side selector + 獨立下單按鍵」。
+        """
         box = QGroupBox("限價下單")
-        h = QHBoxLayout(box)
+        v = QVBoxLayout(box)
         cfg = self._cfg
+
+        # Row 1：代碼（模糊自動補全 + 目錄驗證）+ 中文名稱 label
+        row1 = QHBoxLayout()
         code_label = QLabel("代碼")
         self._order_code = QLineEdit(cfg.trading_code)
         # Commit 31：模糊自動補全 + 目錄驗證（同報價 K 綫圖）——保證標的係存在嘅
@@ -381,19 +504,17 @@ class OrderWindow(QMainWindow):
         self._code_completer.activated.connect(self._on_code_activated)
         # onChange guard（同 MainWindow）：completer setCompletion() 寫入完整「code + 名稱」→ 剝離返純 code
         self._order_code.textChanged.connect(self._on_code_text_changed)
-        # Commit 31：買入/賣出 = 兩個互斥 checkable 按鍵（買=綠 / 賣=紅），取代舊 QComboBox
-        self._side_group = QButtonGroup(self)
-        self._side_group.setExclusive(True)
-        self._buy_btn = QPushButton("買入")
-        self._sell_btn = QPushButton("賣出")
-        for b, style in ((self._buy_btn, _BUY_BTN_STYLE), (self._sell_btn, _SELL_BTN_STYLE)):
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(style)
-            self._side_group.addButton(b)
-        self._buy_btn.setChecked(True)   # 默認買入
-        price_label = QLabel("價格")
-        # 價格 = QDoubleSpinBox：原生 range/validator + 上下箭頭 stepper（自適應步長）；默認跟隨市價模式
+        # Commit 33：代碼變更 → 名稱 label / 合計金額 / 帳戶重新匹配（統一入口）
+        self._order_code.textChanged.connect(self._on_code_changed)
+        self._name_label = QLabel("")
+        self._name_label.setStyleSheet("color: #90A4AE;")
+        row1.addWidget(code_label)
+        row1.addWidget(self._order_code, 2)
+        row1.addWidget(QLabel("名稱"))
+        row1.addWidget(self._name_label, 3)
+        v.addLayout(row1)
+
+        # Row 2：價格（spinbox stepper）+ follow icon + 數量
         self._order_price = QDoubleSpinBox()
         self._order_price.setRange(0.0, 1e12)
         self._order_price.setDecimals(4)
@@ -406,22 +527,44 @@ class OrderWindow(QMainWindow):
         self._follow_btn.blockSignals(False)
         self._follow_btn.setFixedWidth(34)
         self._follow_btn.setToolTip("跟隨市價（報價自動更新）；點擊切換手動輸入")
-        qty_label = QLabel("數量")
         self._order_qty = QLineEdit()
         self._order_qty.setValidator(QIntValidator(1, 10**9))
         self._order_qty.setPlaceholderText("股數")
-        self._place_btn = QPushButton("下單")
-        h.addWidget(code_label)
-        h.addWidget(self._order_code, 2)
-        h.addWidget(self._buy_btn)
-        h.addWidget(self._sell_btn)
-        h.addWidget(price_label)
-        h.addWidget(self._order_price, 1)
-        h.addWidget(self._follow_btn)
-        h.addWidget(qty_label)
-        h.addWidget(self._order_qty)
-        h.addWidget(self._place_btn)
-        self._place_btn.clicked.connect(self._on_place_order)
+        # Commit 33：數量變更 → 合計金額 live 更新
+        self._order_qty.textChanged.connect(self._refresh_total_label)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("價格"))
+        row2.addWidget(self._order_price, 1)
+        row2.addWidget(self._follow_btn)
+        row2.addWidget(QLabel("數量"))
+        row2.addWidget(self._order_qty)
+        v.addLayout(row2)
+
+        # Row 3：合計金額（qty × price live 更新）
+        self._total_label = QLabel("合計 —")
+        self._total_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #FFC400;")
+        v.addWidget(self._total_label)
+
+        # Row 4：匹配帳戶 info（按標的種類 × 模式自動匹配）
+        self._acc_info_label = QLabel("帳戶 —")
+        self._acc_info_label.setStyleSheet("color: #90A4AE;")
+        v.addWidget(self._acc_info_label)
+
+        # 底部行：特大買賣按鍵（直接執行；買=紅 / 賣=綠）
+        btn_row = QHBoxLayout()
+        self._buy_btn = QPushButton("買入 BUY")
+        self._sell_btn = QPushButton("賣出 SELL")
+        for b, style in ((self._buy_btn, _BUY_BTN_STYLE), (self._sell_btn, _SELL_BTN_STYLE)):
+            b.setMinimumHeight(_BIG_BTN_MIN_HEIGHT)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(style)
+        # clicked 雙 overload → lambda 包零參數調用（AGENTS.md #4）
+        self._buy_btn.clicked.connect(lambda: self._on_place_order("BUY"))
+        self._sell_btn.clicked.connect(lambda: self._on_place_order("SELL"))
+        btn_row.addWidget(self._buy_btn, 1)
+        btn_row.addWidget(self._sell_btn, 1)
+        v.addLayout(btn_row)
+
         # toggled 只有單一 (bool) overload → slot 帶明確 bool 參數係正確綁定（唔似 clicked 雙 overload）
         self._follow_btn.toggled.connect(self._on_follow_toggled)
         self._order_price.valueChanged.connect(self._on_price_value_changed)
@@ -430,18 +573,40 @@ class OrderWindow(QMainWindow):
     # ------------------------------------------------------------- PIN 狀態機
 
     def _apply_pin_state(self) -> None:
-        """按當前 _pin_holder 狀態同步 UI enable/disable（LOCKED = holder is None）。"""
-        unlocked = self._pin_holder is not None
+        """按當前模式 + PIN 狀態同步 UI enable/disable（Commit 33）。
+
+        SIMULATE = 永遠解鎖（futu 規則：模擬盤無需交易密碼）；REAL = 需 PIN holder。
+        PIN 區只喺 REAL 顯示、模擬提示 label 相反；買賣按鍵跟隨解鎖狀態。
+        """
+        self._pin_box.setVisible(self._mode == "REAL")
+        self._sim_hint.setVisible(self._mode != "REAL")
+        unlocked = self._mode == "SIMULATE" or self._pin_holder is not None
         self._pin_edit.setEnabled(not unlocked)
         self._unlock_btn.setEnabled(not unlocked)
-        self._lock_btn.setEnabled(unlocked)
-        for w in (self._order_code, self._buy_btn, self._sell_btn, self._order_qty):   # Commit 31：買賣按鍵跟隨鎖狀態
+        self._lock_btn.setEnabled(self._pin_holder is not None)   # 有 holder 先可鎖（跨模式保留）
+        for w in (self._order_code, self._buy_btn, self._sell_btn, self._order_qty):
             w.setEnabled(unlocked)
         # 價格欄：「解鎖 AND 手動模式」先可編輯——follow mode 由市價驅動（disabled 防用戶輸入被覆蓋）
         self._order_price.setEnabled(unlocked and not self._following)
-        # follow 按鍵係模式切換（唔係交易動作）→ locked 都可用
-        # 下單按鍵跟隨鎖狀態（in-flight guard 由 _on_place_order/_on_order_result 短暫覆蓋）
-        self._place_btn.setEnabled(unlocked)
+
+    def _refresh_matched_account(self) -> None:
+        """按當前 code × mode 重算匹配下單帳戶 + 更新 info label（Commit 33）。
+
+        觸發點：模式切換（_sync_mode）、accounts_updated、code 變更、funds 更新（餘額刷新）。
+        純顯示邏輯——實際下單時 _on_place_order 再讀 `self._matched_acc`。
+        """
+        code = self._order_code.text().strip() if hasattr(self, "_order_code") else ""
+        self._matched_acc = _match_order_account(self._all_accounts, code, self._mode) if code else None
+        acc = self._matched_acc
+        if acc is None:
+            self._acc_info_label.setText("帳戶 —（無匹配帳戶）" if code else "帳戶 —")
+            return
+        card = f"…{acc.card_num[-4:]}" if acc.card_num and acc.card_num != "N/A" else str(acc.acc_id)
+        snap = self._funds_by_acc.get((acc.trd_env, acc.acc_id))
+        bal = _fmt_money(snap.total_assets) if snap is not None else "—"
+        env_zh = "實盤" if acc.trd_env == "REAL" else "模擬"
+        self._acc_info_label.setText(
+            f"帳戶 {env_zh} · {acc.acc_type} · 卡號 {card} · 餘額 {bal}")
 
     def _on_unlock_clicked(self) -> None:
         """解鎖：恰好 6 位數字 → 建 holder（24h deadline）+ 清空欄位 + 啟用交易。"""
@@ -495,10 +660,16 @@ class OrderWindow(QMainWindow):
             self._order_code.setText(code or "")
         finally:
             self._order_code.blockSignals(False)
+        self._on_code_changed()   # Commit 33：signal 被 block → 手動同步名稱/合計/帳戶 label
 
     def set_stock_catalog(self, entries: tuple) -> None:
-        """MainWindow.catalog_ready re-emit → 載入股票目錄（同 K 綫圖同源；Commit 31）。"""
+        """MainWindow.catalog_ready re-emit → 載入股票目錄（同 K 綫圖同源；Commit 31）。
+
+        Commit 33：同時建 `self._code_names`（canonical code → 「中文名 英文名」）供名稱 label 顯示。
+        """
         self._code_by_text = self._code_completer.set_catalog(tuple(entries))
+        self._code_names = {e.code: name_text(e) for e in entries}
+        self._refresh_name_label()
 
     def _on_code_activated(self, text: str) -> None:
         """Dropdown 選中 → 輸入欄只留 code（名稱唔入欄；同 K 綫圖一致）。"""
@@ -518,6 +689,30 @@ class OrderWindow(QMainWindow):
         finally:
             self._order_code.blockSignals(False)
 
+    def _refresh_name_label(self) -> None:
+        """代碼變更 → 名稱 label（中文名 + 英文名；目錄未載入 / 未知 code → 空）。Commit 33。"""
+        code = self._order_code.text().strip() if hasattr(self, "_order_code") else ""
+        name = self._code_names.get(code.upper()) or self._code_names.get(code) or ""
+        self._name_label.setText(name)
+
+    def _refresh_total_label(self) -> None:
+        """合計金額 label = 數量 × 價格（任一欄空/0 → 「—」）。Commit 33。"""
+        try:
+            qty = int(self._order_qty.text()) if self._order_qty.text().strip() else 0
+        except ValueError:
+            qty = 0
+        price = self._order_price.value()
+        if qty <= 0 or price <= 0:
+            self._total_label.setText("合計 —")
+            return
+        self._total_label.setText(f"合計 {_fmt_money(qty * price)}")
+
+    def _on_code_changed(self) -> None:
+        """代碼變更統一入口：名稱 label + 合計 + 帳戶重新匹配（code 決定標的種類）。Commit 33。"""
+        self._refresh_name_label()
+        self._refresh_total_label()
+        self._refresh_matched_account()
+
     def follow_price(self, price: float | None) -> None:
         """最新市價 → 自動更新下單價格（只喺 follow mode；manual mode no-op——唔覆蓋用戶輸入）。"""
         if not self._following or price is None or price <= 0:
@@ -529,6 +724,7 @@ class OrderWindow(QMainWindow):
             self._order_price.setSingleStep(_price_step(price))
         finally:
             self._order_price.blockSignals(False)
+        self._refresh_total_label()   # Commit 33：市價驅動 → 合計金額同步更新（signal 被 block，手動補）
 
     def _on_follow_toggled(self, on: bool) -> None:
         """follow 按鍵 toggle：跟隨市價（🔗）↔ 手動輸入（✎）。"""
@@ -544,13 +740,18 @@ class OrderWindow(QMainWindow):
         self._apply_pin_state()
 
     def _on_price_value_changed(self, value: float) -> None:
-        """價格變動 → 自適應 stepper 步長（10^(floor(log10(p))−2)）。"""
+        """價格變動 → 自適應 stepper 步長（10^(floor(log10(p))−2)）+ 合計金額刷新。"""
         self._order_price.setSingleStep(_price_step(value))
+        self._refresh_total_label()   # Commit 33：qty × price live
 
     # ------------------------------------------------------------- engine signal handlers（GUI thread）
 
     def _on_accounts(self, accounts: tuple[AccountInfo, ...]) -> None:
-        """帳戶 snapshot → 按 env tab 重繪卡片（只 ACTIVE；非 ACTIVE 隱藏；先清舊卡防殘留）。"""
+        """帳戶 snapshot → 按 env tab 重繪卡片（只 ACTIVE；非 ACTIVE 隱藏；先清舊卡防殘留）。
+
+        Commit 33：存全量 `self._all_accounts`（匹配用，含非 ACTIVE——匹配函數自己過濾）+ 重新匹配。
+        """
+        self._all_accounts = list(accounts)
         for env in ("REAL", "SIMULATE"):
             for c in self._env_card_lists[env]:
                 c.setParent(None)
@@ -572,6 +773,7 @@ class OrderWindow(QMainWindow):
             lbl = self._card_funds_labels.get((env, acc_id))
             if lbl is not None:
                 lbl.setText(f"總資產 {_fmt_money(snap.total_assets)}")
+        self._refresh_matched_account()   # Commit 33：帳戶列表更新 → 重新匹配下單帳戶
 
     def _on_positions(self, rows: tuple[PositionRow, ...]) -> None:
         """持倉 snapshot → table 重繪（字段同富途 APP 對齊；Commit 31：帳戶卡撳選過濾）。"""
@@ -601,6 +803,9 @@ class OrderWindow(QMainWindow):
     def _on_account_funds(self, acc_id: int, trd_env: str, funds: FundsSnapshot) -> None:
         """Per-account 資金事件 → 卡片「總資產」+ 該 env tab 加總（GUI 端 per-env fold，重用 engine._sum_funds）。"""
         self._funds_by_acc[(trd_env, acc_id)] = funds   # 累積；失敗帳戶保留上次值
+        m = self._matched_acc
+        if m is not None and (m.trd_env, m.acc_id) == (trd_env, acc_id):
+            self._refresh_matched_account()   # Commit 33：匹配帳戶資金到 → 下單 form「帳戶」label 餘額同步
         lbl = self._card_funds_labels.get((trd_env, acc_id))
         if lbl is not None:
             lbl.setText(f"總資產 {_fmt_money(funds.total_assets)}")
@@ -628,17 +833,22 @@ class OrderWindow(QMainWindow):
             risk_label.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
 
     def _on_orders(self, rows: tuple[OrderRow, ...]) -> None:
-        """今日訂單 snapshot → table 重繪（狀態格上色：已成綠 / 失敗・撤單紅 / pending 黃）。"""
+        """今日訂單 snapshot → table 重繪（Commit 33：11 欄全細節；狀態格上色：已成綠 / 失敗・撤單紅 / pending 黃）。"""
+        acc_card = {a.acc_id: a.card_num for a in self._all_accounts}   # Commit 33：帳戶欄（卡號末四位）
         table = self._orders_table
         table.setRowCount(len(rows))
         for r, row in enumerate(rows):
-            t = row.create_time
+            t = row.create_time or "—"
+            card = acc_card.get(row.acc_id)
+            acc_text = f"…{card[-4:]}" if card and card != "N/A" else (str(row.acc_id) if row.acc_id else "—")
             values = [
-                t[-8:] if len(t) >= 8 else (t or "—"),   # HH:MM:SS（SDK 格式 'YYYY-MM-DD HH:MM:SS'）
+                row.order_id or "—",
                 row.code, _SIDE_ZH.get(row.side, row.side or "—"),
                 row.order_type or "—", _order_status_zh(row.status),
                 f"{row.qty:g}", _fmt_money(row.price),
                 f"{row.dealt_qty:g}", _fmt_money(row.dealt_avg_price),
+                t[-8:] if len(t) >= 8 else t,   # HH:MM:SS（SDK 格式 'YYYY-MM-DD HH:MM:SS'）
+                acc_text,
             ]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -652,10 +862,9 @@ class OrderWindow(QMainWindow):
                 table.setItem(r, c, item)
 
     def _on_order_result(self, ok: bool, message: str) -> None:
-        """下單結果：status label 更新 + re-enable 下單按鍵（LOCKED 狀態保持 disabled）。"""
+        """下單結果：status label 更新 + 釋放 in-flight guard（按模式+PIN 狀態 re-enable 買賣按鍵）。"""
         self._set_status(message, _OK_COLOR if ok else _ERR_COLOR)
-        if self._pin_holder is not None:
-            self._place_btn.setEnabled(True)
+        self._apply_pin_state()   # Commit 33：取代舊 _place_btn re-enable——SIMULATE 恆啟用、REAL 視 PIN
 
     def _set_status(self, message: str, color: str) -> None:
         self._status_label.setText(message)
@@ -663,8 +872,12 @@ class OrderWindow(QMainWindow):
 
     # ------------------------------------------------------------- 下單流程（GUI thread）
 
-    def _on_place_order(self) -> None:
-        """GUI 驗證 → engine.place_order（worker thread 做阻塞 RPC）。"""
+    def _on_place_order(self, side_str: str) -> None:
+        """買賣特大按鍵直接執行（Commit 33）→ GUI 驗證 → engine.place_order（worker thread 做阻塞 RPC）。
+
+        `side_str` = "BUY" / "SELL"；dispatch 帶 `trd_env=self._mode` + `acc_id=匹配帳戶`；
+        PIN 只喺實盤傳（模擬盤無需交易密碼——futu 規則）。in-flight guard：兩按同時禁用。
+        """
         code = self._order_code.text().strip()
         price = self._order_price.value()   # QDoubleSpinBox 原生 range/validator（0–1e12、4 小數）
         qty_text = self._order_qty.text().strip()
@@ -687,10 +900,22 @@ class OrderWindow(QMainWindow):
         if price <= 0 or qty <= 0:
             self._set_status("價格與數量必須大於 0", _ERR_COLOR)
             return
-        side = TrdSide.SELL if self._sell_btn.isChecked() else TrdSide.BUY   # Commit 31：買賣按鍵（默認買入 checked）
-        pin = self._pin_holder.value if self._pin_holder is not None else None
-        self._place_btn.setEnabled(False)   # in-flight guard（order_result 後 re-enable）
-        self._engine.place_order(code, side, price, qty, pin=pin)
+        side = TrdSide.BUY if side_str == "BUY" else TrdSide.SELL
+        # Commit 33：實盤需 PIN 解鎖（模擬盤恆解鎖）；匹配帳戶必須存在先可下單
+        pin: str | None = None
+        if self._mode == "REAL":
+            if self._pin_holder is None:
+                self._set_status("實盤未解鎖——請輸入六位數 PIN", _ERR_COLOR)
+                return
+            pin = self._pin_holder.value
+        acc = self._matched_acc
+        env_zh = "實盤" if self._mode == "REAL" else "模擬盤"
+        if acc is None:
+            self._set_status(f"無匹配{env_zh}帳戶——無法下單（檢查帳戶狀態/市場授權）", _ERR_COLOR)
+            return
+        self._buy_btn.setEnabled(False)    # in-flight guard（order_result 後 _apply_pin_state 恢復）
+        self._sell_btn.setEnabled(False)
+        self._engine.place_order(code, side, price, qty, pin=pin, trd_env=self._mode, acc_id=acc.acc_id)
 
     # ------------------------------------------------------------- lifecycle
 

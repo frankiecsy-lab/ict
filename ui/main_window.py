@@ -545,9 +545,19 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(box)
         v.setContentsMargins(4, 2, 0, 2)
         v.setSpacing(2)
-        title = QLabel("逐筆成交")
-        title.setStyleSheet(f"color: {cfg.text_color}; font-family: Consolas; font-weight: bold;")
-        v.addWidget(title)
+        # Commit 33：標題行 + 顯示/隱藏 toggle（collapsed → 只留窄條按鈕、寬度 34）
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        self._tick_title = QLabel("逐筆成交")
+        self._tick_title.setStyleSheet(f"color: {cfg.text_color}; font-family: Consolas; font-weight: bold;")
+        self._tick_toggle_btn = QPushButton("👁")
+        self._tick_toggle_btn.setCheckable(True)
+        self._tick_toggle_btn.setChecked(True)   # 默認顯示（connect 前 setChecked → 構建期唔會觸發 signal）
+        self._tick_toggle_btn.setFixedWidth(26)
+        self._tick_toggle_btn.setToolTip("顯示/隱藏逐筆成交面板")
+        title_row.addWidget(self._tick_title, 1)
+        title_row.addWidget(self._tick_toggle_btn)
+        v.addLayout(title_row)
         # 空狀態提示（Commit 32）：無數據時解釋「點解一片空白」（休市 / 指數無逐筆 / 訂閱失敗見 status bar ⚠）
         self._tick_hint = QLabel("等待逐筆數據…")
         self._tick_hint.setStyleSheet(f"color: {cfg.axis_text_color}; font-family: Consolas; font-size: 11px;")
@@ -577,7 +587,17 @@ class MainWindow(QMainWindow):
         self._tick_timer.setSingleShot(True)
         self._tick_timer.setInterval(100)
         self._tick_timer.timeout.connect(self._flush_ticks)
+        # Commit 33：toggled 只有單一 (bool) overload → slot 帶明確 bool 參數係正確綁定（同 _follow_btn）
+        self._tick_toggle_btn.toggled.connect(self._on_tick_toggled)
+        self._tick_box = box   # toggle collapsed/expanded 時改 fixed width
         return box
+
+    def _on_tick_toggled(self, on: bool) -> None:
+        """Commit 33：逐筆成交顯示/隱藏——collapsed 只留窄條按鈕（寬度 34）、expanded 還原 270。"""
+        self._tick_title.setVisible(on)
+        self._tick_hint.setVisible(on)
+        self._tick_table.setVisible(on)
+        self._tick_box.setFixedWidth(270 if on else 34)
 
     def _on_tick_data(self, rows: tuple) -> None:
         """engine.tick_data（callback thread emit → auto-queue 過 GUI）：累積 buffer + arm flush timer。"""
