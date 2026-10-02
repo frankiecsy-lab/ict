@@ -36,6 +36,8 @@ from PySide6.QtCore import QObject, Signal
 
 from futu import OrderType, RET_OK, OpenSecTradeContext, TrdEnv, TrdMarket, TrdSide
 
+from .connection_test import CONNECT_RETRY_INTERVAL_S, tcp_reachable
+
 logger = logging.getLogger(__name__)
 
 # 持倉/資金輪詢間隔（秒）——refresh_cache=False 走 OpenD cache，5s 安全
@@ -260,6 +262,20 @@ class TradeEngine(QObject):
         """逐市場建 OpenSecTradeContext + get_acc_list 收集全部帳戶；成功後啟動 poll loop。"""
         cfg = self._cfg
         if cfg is None or self._closed:
+            return
+        # Commit 36：TCP pre-check + 自動重試——同 FutuEngine（AGENTS.md #20）：sync constructor 對死端點永久阻塞，
+        # 之前交易頁永遠「連線 OpenD 交易服務中…」零回饋；而家 fast-fail 後每 CONNECT_RETRY_INTERVAL_S 重試到 OpenD 起或 stop()
+        warned = False
+        while not self._closed:
+            ok, msg = tcp_reachable(cfg.trade_host, cfg.trade_port)
+            if ok:
+                break
+            if not warned and not self._closed:
+                self.error.emit(
+                    f"連唔到交易 OpenD {cfg.trade_host}:{cfg.trade_port}（{msg}）——每 {CONNECT_RETRY_INTERVAL_S:.0f}s 自動重試中…")
+                warned = True
+            time.sleep(CONNECT_RETRY_INTERVAL_S)
+        if self._closed:
             return
         self.status.emit("連線 OpenD 交易服務中…")
         seen: set[tuple[str, int]] = set()   # (trd_env, acc_id) dedupe——同一帳戶可出現喺多個市場 context

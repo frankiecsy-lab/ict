@@ -49,6 +49,7 @@ from futu import (
 
 from config import kline_period_minutes
 from .candle_aggregator import CandleAggregator
+from .connection_test import CONNECT_RETRY_INTERVAL_S, tcp_reachable
 from .stock_catalog import StockEntry, register_code_aliases
 from .subscription_store import SubscriptionStore, default_db_path
 from .timeutil import history_window, parse_market_time, resolve_tick_datetime
@@ -856,6 +857,20 @@ class FutuEngine(QObject):
 
     def _setup(self) -> None:
         cfg = self._cfg
+        # Commit 36：TCP pre-check + 自動重試——sync constructor 對死端點會入 while True 無限重試永久阻塞（AGENTS.md #20），
+        # 之前 K 線永遠「等待行情數據」零回饋；而家 fast-fail 後每 CONNECT_RETRY_INTERVAL_S 自動重試到 OpenD 起或 stop()
+        warned = False
+        while not self._closed:
+            ok, msg = tcp_reachable(cfg.quote_host, cfg.quote_port)
+            if ok:
+                break
+            if not warned and not self._closed:
+                self.error.emit(
+                    f"連唔到報價 OpenD {cfg.quote_host}:{cfg.quote_port}（{msg}）——每 {CONNECT_RETRY_INTERVAL_S:.0f}s 自動重試中…")
+                warned = True
+            time.sleep(CONNECT_RETRY_INTERVAL_S)
+        if self._closed:
+            return
         try:
             ctx = OpenQuoteContext(cfg.quote_host, cfg.quote_port)   # Commit 35：報價 OpenD 獨立端點
         except Exception as exc:  # noqa: BLE001 — 連線失敗（OpenD 未開等）→ 回報 GUI

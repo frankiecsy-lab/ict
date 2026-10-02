@@ -117,6 +117,12 @@ def _engine():
     engine.stop()   # idempotent——所有測試後都 clean shutdown
 
 
+@pytest.fixture(autouse=True)
+def _tcp_ok(monkeypatch):
+    """Commit 36：_setup() TCP pre-check 預設通過——現有測試聚焦 ctx mock 邏輯（零真實網絡）；重試行為有專項測試。"""
+    monkeypatch.setattr(te, "tcp_reachable", lambda host, port: (True, ""))
+
+
 # ------------------------------------------------------------- 純函數
 
 def test_needs_unlock_variants():
@@ -211,6 +217,25 @@ def test_market_ctx_failure_continues_other_markets(monkeypatch):
     assert any("HK" in m and "連線失敗" in m for m in error_events), f"errors={error_events}"
     assert list(engine._ctxs) == ["US"], "HK 失敗唔應影響 US context"
     assert any("已連線：1 個實倉帳戶" in m for m in status_events), f"status={status_events}"
+
+
+def test_setup_tcp_retry_until_success(monkeypatch):
+    """Commit 36：TCP pre-check 失敗 → error emit + 自動重試；重試成功 → setup 繼續（唔會永久阻塞）。"""
+    ctx = FakeTradeCtx()
+    _install_ctx_factory(monkeypatch, {"HK": ctx})
+    results = iter([(False, "Connection refused"), (True, "")])
+    monkeypatch.setattr(te, "tcp_reachable", lambda h, p: next(results))
+    monkeypatch.setattr(te, "CONNECT_RETRY_INTERVAL_S", 0.01)   # 測試唔等真 5s
+
+    engine = TradeEngine()
+    error_events: list[str] = []
+    status_events: list[str] = []
+    engine.error.connect(error_events.append)
+    engine.status.connect(status_events.append)
+    engine._cfg = _cfg(("HK",))
+    engine._setup()
+    assert len(error_events) == 1 and "連唔到交易 OpenD" in error_events[0], f"errors={error_events}"
+    assert any("連線 OpenD 交易服務中" in m for m in status_events), "重試成功後 setup 應繼續"
 
 
 # ------------------------------------------------------------- poll / queries

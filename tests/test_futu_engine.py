@@ -68,6 +68,12 @@ def _stop_engines():
             _CREATED_ENGINES.remove(eng)
 
 
+@pytest.fixture(autouse=True)
+def _tcp_ok(monkeypatch):
+    """Commit 36：_setup() TCP pre-check 預設通過——現有測試聚焦 ctx mock 邏輯（零真實網絡）；重試行為有專項測試。"""
+    monkeypatch.setattr(fe, "tcp_reachable", lambda host, port: (True, ""))
+
+
 class FakeCtx:
     """Mock OpenQuoteContext：scripted request_history_kline 回應 + lifecycle 記錄。"""
 
@@ -700,6 +706,31 @@ class TestSetup:
         eng._setup()
         assert len(errors) == 1 and "連唔到報價 OpenD" in errors[0]   # Commit 35：錯誤訊息帶端點（quote_host:port）
         assert eng._ctx is None
+
+    def test_tcp_precheck_retry_until_success(self, monkeypatch):
+        """Commit 36：TCP pre-check 失敗 → error emit + 自動重試；重試成功 → setup 繼續（唔會永久阻塞）。"""
+        eng = make_engine(history_count=2)
+        ctx = FakeCtx([(RET_OK, kline_df(HIST_ROWS), None)])
+        results = iter([(False, "Connection refused"), (True, "")])
+        monkeypatch.setattr(fe, "tcp_reachable", lambda h, p: next(results))
+        monkeypatch.setattr(fe, "CONNECT_RETRY_INTERVAL_S", 0.01)   # 測試唔等真 5s
+        monkeypatch.setattr(fe, "OpenQuoteContext", lambda h, p: ctx)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._setup()
+        assert len(errors) == 1 and "連唔到報價 OpenD" in errors[0]   # 首次失敗即刻有回饋（唔再靜默）
+        assert eng._ctx is ctx   # 重試成功 → setup 繼續行晒
+
+    def test_tcp_precheck_closed_exits_without_ctx(self, monkeypatch):
+        """stop() 喺 TCP 重試期間（closed=True）→ _setup 即刻退出：無 error emit、無 ctx。"""
+        eng = make_engine(history_count=2)
+        monkeypatch.setattr(fe, "tcp_reachable", lambda h, p: (False, "refused"))
+        monkeypatch.setattr(fe, "CONNECT_RETRY_INTERVAL_S", 0.01)
+        errors = []
+        eng.error.connect(errors.append)
+        eng._closed = True   # 模擬 stop() 已行過
+        eng._setup()
+        assert not errors and eng._ctx is None
 
     def test_subscribe_failure_closes_ctx(self, monkeypatch):
         eng = make_engine(history_count=2)
