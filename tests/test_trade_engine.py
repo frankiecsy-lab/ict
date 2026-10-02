@@ -48,13 +48,14 @@ class FakeTradeCtx:
         self.acc_list = (RET_OK, pd.DataFrame())      # 預設無帳戶
         self.positions = (RET_OK, [])
         self.funds = (RET_OK, [])
+        self.orders = (RET_OK, [])                    # order_list_query（今日訂單）
         self.place_results: list[tuple] = []          # [(ret, msg), ...]；最後一個重複使用
         self.unlock_result = (RET_OK, "ok")
         self.closed = False
         self.last_place_kwargs: dict | None = None
         self.calls = {
             "get_acc_list": 0, "position_list_query": 0, "accinfo_query": 0,
-            "place_order": 0, "unlock_trade": 0,
+            "order_list_query": 0, "place_order": 0, "unlock_trade": 0,
         }
 
     def get_acc_list(self):
@@ -68,6 +69,10 @@ class FakeTradeCtx:
     def accinfo_query(self, **kwargs):
         self.calls["accinfo_query"] += 1
         return self.funds
+
+    def order_list_query(self, **kwargs):
+        self.calls["order_list_query"] += 1
+        return self.orders
 
     def place_order(self, **kwargs):
         self.calls["place_order"] += 1
@@ -205,18 +210,22 @@ def test_market_ctx_failure_continues_other_markets(monkeypatch):
 
 # ------------------------------------------------------------- poll / queries
 
-def _wire_poll_state(engine: TradeEngine, ctx: FakeTradeCtx, acc_id: int = 7) -> None:
+def _wire_poll_state(engine: TradeEngine, ctx: FakeTradeCtx, acc_id: int = 7, order_acc: bool = True) -> None:
+    """Wire poll state：ctxs + REAL accounts（+ 可下單 acc_id，除非 order_acc=False）。"""
     engine._ctxs["HK"] = ctx
     engine._accounts["HK"] = [(acc_id, "card")]
+    if order_acc:
+        engine._order_accs["HK"] = acc_id
 
 
 def test_positions_signal_emits_mapped_rows():
-    """position_list_query dict → PositionRow 映射（pl_ratio 已是百分數、'N/A'→0.0）。"""
+    """position_list_query dict → PositionRow 映射（APP 對齊字段組、'N/A'→0.0）。"""
     ctx = FakeTradeCtx()
     ctx.positions = (RET_OK, [{
         "code": "HK.00700", "stock_name": "騰訊控股", "position_market": "HK",
-        "qty": 100, "can_sell_qty": 50, "cost_price": 300.0, "nominal_price": 320.0,
-        "market_val": 32000.0, "pl_ratio": 6.67, "pl_val": 2000.0,
+        "qty": 100, "can_sell_qty": 50, "average_cost": 300.0, "nominal_price": 320.0,
+        "market_val": 32000.0, "pl_ratio_avg_cost": 6.67, "unrealized_pl": 2000.0,
+        "today_pl_val": 150.0,
     }])
     engine = TradeEngine()
     _wire_poll_state(engine, ctx)
@@ -229,9 +238,75 @@ def test_positions_signal_emits_mapped_rows():
     row = pos_events[0][0]
     assert (row.code, row.name, row.market) == ("HK.00700", "騰訊控股", "HK")
     assert row.qty == 100.0 and row.can_sell_qty == 50.0
-    assert row.cost_price == 300.0 and row.last_price == 320.0
-    assert row.market_value == 32000.0 and row.pl_val == 2000.0
-    assert row.pl_ratio_pct == 6.67, "pl_ratio 已是百分數數字，唔好再 ×100"
+    assert row.avg_cost == 300.0 and row.last_price == 320.0
+    assert row.market_value == 32000.0 and row.unrealized_pl == 2000.0
+    assert row.pl_ratio_pct == 6.67, "pl_ratio_avg_cost 已是百分數數字，唔好再 ×100"
+    assert row.today_pl == 150.0
+
+
+def test_positions_dataframe_input_normalized():
+    """live bug regression：position_list_query 成功返回 **DataFrame**（非 list）→ _rows() normalize。"""
+    ctx = FakeTradeCtx()
+    ctx.positions = (RET_OK, pd.DataFrame([{
+        "code": "US.AAPL", "stock_name": "Apple", "position_market": "US",
+        "qty": 10, "can_sell_qty": 10, "average_cost": 150.0, "nominal_price": 140.0,
+        "market_val": 1400.0, "pl_ratio_avg_cost": -6.67, "unrealized_pl": -100.0,
+        "today_pl_val": -20.0,
+    }]))
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+
+    pos_events: list = []
+    engine.positions_updated.connect(pos_events.append)
+    engine._poll_once()
+
+    assert len(pos_events) == 1 and len(pos_events[0]) == 1, "DataFrame 必須 normalize 到 rows"
+    row = pos_events[0][0]
+    assert (row.code, row.avg_cost, row.unrealized_pl, row.pl_ratio_pct, row.today_pl) == \
+        ("US.AAPL", 150.0, -100.0, -6.67, -20.0)
+
+
+def test_funds_dataframe_input_normalized():
+    """live bug regression：accinfo_query 成功返回 **DataFrame** → _rows() normalize + risk_status。"""
+    ctx = FakeTradeCtx()
+    ctx.funds = (RET_OK, pd.DataFrame([{
+        "total_assets": 500_000.0, "hk_cash": 200_000.0, "us_cash": 1_000.0,
+        "hk_avl_withdrawal_cash": 150_000.0, "us_avl_withdrawal_cash": 800.0,
+        "power": 900_000.0, "initial_margin": 20_000.0, "maintenance_margin": 12_000.0,
+        "risk_status": "LEVEL3",
+    }]))
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+
+    funds_events: list = []
+    engine.funds_updated.connect(funds_events.append)
+    engine._poll_once()
+
+    assert len(funds_events) == 1, "DataFrame 必須 normalize（舊 isinstance(data, list) live 靜默失敗）"
+    f = funds_events[0]
+    assert f.total_assets == 500_000.0 and f.buying_power == 900_000.0
+    assert f.risk_status == "LEVEL3"
+
+
+def test_orders_dataframe_input_normalized():
+    """live bug regression：order_list_query 成功返回 **DataFrame** → OrderRow 映射。"""
+    ctx = FakeTradeCtx()
+    ctx.orders = (RET_OK, pd.DataFrame([{
+        "order_id": "777", "code": "HK.00700", "trd_side": "BUY", "order_type": "NORMAL",
+        "order_status": "FILLED_PART", "qty": 200, "price": 55.5,
+        "dealt_qty": 100, "dealt_avg_price": 55.4, "create_time": "2026-10-02 09:30:00",
+    }]))
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+
+    orders_events: list = []
+    engine.orders_updated.connect(orders_events.append)
+    engine._poll_once()
+
+    assert len(orders_events) == 1 and len(orders_events[0]) == 1
+    o = orders_events[0][0]
+    assert (o.order_id, o.code, o.side, o.status) == ("777", "HK.00700", "BUY", "FILLED_PART")
+    assert o.qty == 200.0 and o.dealt_qty == 100.0 and o.create_time.endswith("09:30:00")
 
 
 def test_positions_query_failure_returns_empty():
@@ -253,6 +328,7 @@ def test_funds_signal_emits_snapshot_totals():
         "total_assets": 1_000_000.0, "hk_cash": 500_000.0, "us_cash": 10_000.0,
         "hk_avl_withdrawal_cash": 400_000.0, "us_avl_withdrawal_cash": 8_000.0,
         "power": 2_000_000.0, "initial_margin": 50_000.0, "maintenance_margin": 30_000.0,
+        "risk_status": "LEVEL3",
     }
     ctx.funds = (RET_OK, [base])
     engine = TradeEngine()
@@ -271,6 +347,33 @@ def test_funds_signal_emits_snapshot_totals():
     assert f.withdraw_hkd == 800_000.0 and f.withdraw_usd == 16_000.0
     assert f.buying_power == 4_000_000.0
     assert f.initial_margin == 100_000.0 and f.maintenance_margin == 60_000.0
+    assert f.risk_status == "LEVEL3"
+
+
+def test_funds_risk_status_takes_most_severe():
+    """跨帳戶 risk_status 聚合取最嚴重（LEVEL1 > LEVEL2 > LEVEL3；空 = 無資訊）。"""
+    ctx = FakeTradeCtx()
+    # 兩帳戶：acc 7 LEVEL3、acc 8 LEVEL1 → 加總後應係 LEVEL1
+    responses = {7: {"total_assets": 100.0, "risk_status": "LEVEL3"},
+                 8: {"total_assets": 200.0, "risk_status": "LEVEL1"}}
+
+    def accinfo_query(acc_id=None, **kwargs):
+        ctx.calls["accinfo_query"] += 1
+        return (RET_OK, [responses[acc_id]])
+
+    ctx.accinfo_query = accinfo_query   # instance attr shadow method（per-acc response）
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+    engine._accounts["HK"] = [(7, "c1"), (8, "c2")]
+
+    funds_events: list = []
+    engine.funds_updated.connect(funds_events.append)
+    engine._poll_once()
+
+    assert len(funds_events) == 1
+    f = funds_events[0]
+    assert f.total_assets == 300.0
+    assert f.risk_status == "LEVEL1", "跨帳戶聚合取最嚴重"
 
 
 def test_funds_query_failure_skips_account():
@@ -309,6 +412,7 @@ def test_place_order_success_emits_order_id():
     kw = ctx.last_place_kwargs
     assert (kw["price"], kw["qty"], kw["code"]) == (100.5, 200, "HK.00700")
     assert kw["trd_side"] is TrdSide.BUY
+    assert kw["acc_id"] == 7, "place_order 必須帶明確 acc_id（per-market 下單帳戶）"
 
 
 def test_place_order_unlock_retry_on_locked_error():
@@ -415,3 +519,113 @@ def test_worker_exception_never_crashes_engine():
     engine.place_order("HK.00700", TrdSide.BUY, 10.0, 10)
     assert _pump_until(lambda: len(results) >= 1)
     assert results[0][0] is True
+
+
+# ------------------------------------------------------------- 帳戶分類 / 訂單輪詢
+
+def test_setup_classifies_all_accounts_and_excludes_master(monkeypatch):
+    """get_acc_list 收集全部帳戶（REAL/SIMULATE/比賽）；MASTER 主帳戶唔可選做下單帳戶。"""
+    ctx = FakeTradeCtx()
+    rows = [
+        # acc 1：REAL MASTER 主帳戶（auth HK,US）→ 分類可見、polling 計入、但唔可落單
+        {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1", "uni_card_num": "U1",
+         "acc_type": "MARGIN", "sim_acc_type": "", "security_firm": "FUTUSECURITIES",
+         "trdmarket_auth": ("HK", "US"), "acc_role": "MASTER", "acc_status": "NORMAL"},
+        # acc 2：REAL 非 MASTER（auth HK）→ HK 市場下單帳戶
+        {"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2", "uni_card_num": "U2",
+         "acc_type": "MARGIN", "sim_acc_type": "", "security_firm": "FUTUSECURITIES",
+         "trdmarket_auth": ("HK",), "acc_role": "", "acc_status": "NORMAL"},
+        # acc 3：SIMULATE 比賽帳戶 → 分類面板可見、唔入 polling / 下單
+        {"acc_id": 3, "trd_env": "SIMULATE", "card_num": "C3", "uni_card_num": "U3",
+         "acc_type": "MARGIN", "sim_acc_type": "COMPETITION", "security_firm": "",
+         "trdmarket_auth": ("US",), "acc_role": "", "acc_status": "NORMAL"},
+    ]
+    ctx.acc_list = (RET_OK, _acc_df(rows))
+    _install_ctx_factory(monkeypatch, {"HK": ctx})
+
+    engine = TradeEngine()
+    accounts_events: list = []
+    status_events: list[str] = []
+    engine.accounts_updated.connect(accounts_events.append)
+    engine.status.connect(status_events.append)
+    engine._cfg = _cfg(("HK",))
+    engine._setup()
+
+    assert len(accounts_events) == 1, "分類面板 accounts_updated 必須 emit"
+    accs = accounts_events[0]
+    assert {a.acc_id for a in accs} == {1, 2, 3}, "所有帳戶類型都要可見（含 SIMULATE/比賽）"
+    by_id = {a.acc_id: a for a in accs}
+    assert by_id[1].acc_role == "MASTER" and by_id[1].trdmarket_auth == ("HK", "US")
+    assert by_id[3].sim_acc_type == "COMPETITION" and by_id[3].trd_env == "SIMULATE"
+    # MASTER 排除：HK 下單帳戶 = acc 2（首個非 MASTER、REAL、auth 含 HK）
+    assert engine._order_accs.get("HK") == 2, "MASTER 主帳戶唔可以落單"
+    # polling 只計 REAL 帳戶（acc 1 + 2），SIMULATE 唔入
+    assert {aid for aid, _c in engine._accounts["HK"]} == {1, 2}
+    assert any("已連線：2 個實倉帳戶" in m for m in status_events), f"status={status_events}"
+
+
+def test_setup_dedupes_accounts_across_market_contexts(monkeypatch):
+    """同一帳戶出現喺多個市場 context → _all_accounts 按 (trd_env, acc_id) dedupe。"""
+    ctx = FakeTradeCtx()   # HK/US 共用同一 fake（get_acc_list 返回相同）
+    rows = [
+        {"acc_id": 1, "trd_env": TrdEnv.REAL, "card_num": "C1",
+         "trdmarket_auth": ("HK", "US"), "acc_role": ""},
+        {"acc_id": 2, "trd_env": TrdEnv.REAL, "card_num": "C2",
+         "trdmarket_auth": ("US",), "acc_role": ""},
+    ]
+    ctx.acc_list = (RET_OK, _acc_df(rows))
+    _install_ctx_factory(monkeypatch, {"HK": ctx, "US": ctx})
+
+    engine = TradeEngine()
+    accounts_events: list = []
+    engine.accounts_updated.connect(accounts_events.append)
+    engine._cfg = _cfg(("HK", "US"))
+    engine._setup()
+
+    assert len(accounts_events) == 1
+    accs = accounts_events[0]
+    assert [a.acc_id for a in accs] == [1, 2], "dedupe：同一帳戶唔可重複出現"
+    # per-market polling list 各自獨立（每個 context 查自己嗰份 REAL 帳戶）
+    assert {aid for aid, _c in engine._accounts["HK"]} == {1, 2}
+    assert {aid for aid, _c in engine._accounts["US"]} == {1, 2}
+
+
+def test_orders_poll_interval_respects_30s_limit():
+    """order_list_query 限頻 10 次/30s → 獨立 30s 間隔（注入 _time_fn 確定性測試）。"""
+    ctx = FakeTradeCtx()
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+
+    orders_events: list = []
+    engine.orders_updated.connect(orders_events.append)
+
+    now = [1000.0]
+    engine._time_fn = lambda: now[0]
+
+    engine._poll_once()   # 首輪：_last_order_poll=0.0 → 即查
+    assert ctx.calls["order_list_query"] == 1, "首輪 poll 應即查訂單"
+    assert len(orders_events) == 1
+
+    now[0] = 1029.0       # 30s 內 → 唔查（限頻安全）
+    engine._poll_once()
+    assert ctx.calls["order_list_query"] == 1, "30s 內唔可再查 order_list_query"
+    assert len(orders_events) == 1
+
+    now[0] = 1030.0       # 滿 30s → 再查
+    engine._poll_once()
+    assert ctx.calls["order_list_query"] == 2
+    assert len(orders_events) == 2
+
+
+def test_place_order_rejected_when_no_order_account():
+    """市場已連線但冇可下單帳戶（例如只有 MASTER）→ 明確拒絕、唔 spawn worker。"""
+    engine = TradeEngine()
+    ctx = FakeTradeCtx()
+    _wire_poll_state(engine, ctx, order_acc=False)   # _order_accs 空
+
+    results: list[tuple] = []
+    engine.order_result.connect(lambda ok, msg: results.append((ok, msg)))
+    engine.place_order("HK.00700", TrdSide.BUY, 10.0, 10)
+    assert len(results) == 1, "無下單帳戶 → 立即 emit（direct connection）"
+    assert results[0][0] is False and "冇可下單帳戶" in results[0][1]
+    assert ctx.calls["place_order"] == 0

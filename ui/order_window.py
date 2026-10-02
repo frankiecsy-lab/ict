@@ -1,4 +1,4 @@
-"""下單版面視窗：實倉持倉/資金顯示 + 限價買賣下單 + 六位數 PIN 交易解鎖。
+"""下單版面視窗：實倉資金/持倉/今日訂單顯示 + 全帳戶分類 + 限價買賣下單 + 六位數 PIN 交易解鎖。
 
 PIN 安全設計（用戶要求：6 位臨時密碼絕不明文顯示）:
 - input = QLineEdit EchoMode.Password + [0-9]{0,6} validator → UI 永遠圓點；
@@ -18,16 +18,56 @@ from PySide6.QtGui import (QColor, QDoubleValidator, QIntValidator,
                            QRegularExpressionValidator)
 from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QPushButton, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget, QAbstractItemView)
+                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+                               QAbstractItemView)
 
 from config import Config
-from engine.trade_engine import FundsSnapshot, PositionRow, TradeEngine
+from engine.trade_engine import (AccountInfo, FundsSnapshot, OrderRow, PositionRow,
+                                 TradeEngine)
 from futu import TrdSide
 
 # 狀態色（跟 MainWindow 深色主題語義）
 _OK_COLOR = "#089981"
 _ERR_COLOR = "#F23645"
 _WARN_COLOR = "#FFB020"
+
+# OrderStatus → 繁體中文（唔喺表內 fallback 原文）
+_ORDER_STATUS_ZH = {
+    "UNSUBMITTED": "待提交",
+    "WAITING_SUBMIT": "等待提交",
+    "SUBMITTING": "提交中",
+    "SUBMIT_FAILED": "提交失敗",
+    "TIMEOUT": "超時",
+    "SUBMITTED": "已提交",
+    "FILLED_PART": "部分成交",
+    "FILLED_ALL": "全部已成",
+    "CANCELLING_PART": "撤單中(部)",
+    "CANCELLING_ALL": "撤單中(全)",
+    "CANCELLED_PART": "部分撤單",
+    "CANCELLED_ALL": "全部撤單",
+    "FAILED": "下單失敗",
+    "DISABLED": "已失效",
+    "DELETED": "已刪除",
+    "FILL_CANCELLED": "成交後撤單",
+}
+
+# 訂單狀態格上色：已成=綠 / 失敗・撤單・失效=紅 / pending=黃（其餘 fallback 無色）
+_STATUS_GREEN = {"FILLED_ALL"}
+_STATUS_RED = {"FAILED", "SUBMIT_FAILED", "CANCELLED_PART", "CANCELLED_ALL",
+               "DISABLED", "DELETED", "TIMEOUT"}
+_STATUS_YELLOW = {"UNSUBMITTED", "WAITING_SUBMIT", "SUBMITTING", "SUBMITTED",
+                  "FILLED_PART", "CANCELLING_PART", "CANCELLING_ALL", "FILL_CANCELLED"}
+
+# TrdSide → 中文
+_SIDE_ZH = {"BUY": "買入", "SELL": "賣出", "SELL_SHORT": "沽空", "BUY_BACK": "回補"}
+
+# risk_status → 中文（LEVEL3=安全 / LEVEL2=警告 / LEVEL1=危險）
+_RISK_STATUS_ZH = {"LEVEL3": "安全", "LEVEL2": "警告", "LEVEL1": "危險"}
+
+
+def _order_status_zh(status: str) -> str:
+    """OrderStatus 值 → 繁體中文；唔喺表內 fallback 原文（空 → '—'）。"""
+    return _ORDER_STATUS_ZH.get(status, status or "—")
 
 
 class _PinHolder:
@@ -54,7 +94,7 @@ def _fmt_money(v: float) -> str:
 class OrderWindow(QMainWindow):
     """下單版面（獨立 top-level 視窗，可拖去第二螢幕）。
 
-    佈局：PIN bar → 資金/訂金 group → 持倉 table → 下單 group → status label。
+    佈局：PIN bar → [帳戶分類樹 | 資金/訂金] → 持倉 table → 今日訂單 table → 下單 group → status label。
     LOCKED（默認）：下單表單全 disabled；UNLOCKED：啟用 + countdown 顯示剩餘時間。
     """
 
@@ -64,7 +104,7 @@ class OrderWindow(QMainWindow):
         self._clock = clock
         self._unlock_ttl = unlock_ttl_seconds
         self.setWindowTitle("ICT Trader — 下單版面")
-        self.resize(980, 720)
+        self.resize(1000, 820)
 
         # 深色主題（跟 MainWindow 配色）
         self.setStyleSheet(
@@ -78,7 +118,7 @@ class OrderWindow(QMainWindow):
             f"color: {cfg.text_color}; padding: 4px 14px; }}"
             f"QPushButton:hover {{ background: #27354A; }}"
             f"QPushButton:disabled {{ color: #4A5568; background: #151B23; }}"
-            f"QTableWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
+            f"QTableWidget, QTreeWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
             f"QHeaderView::section {{ background: #1A212B; color: {cfg.axis_text_color}; "
             f"border: none; padding: 3px; }}"
         )
@@ -88,8 +128,12 @@ class OrderWindow(QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
         root.addWidget(self._build_pin_bar())
-        root.addWidget(self._build_funds_group())
+        top_row = QHBoxLayout()
+        top_row.addWidget(self._build_accounts_tree())
+        top_row.addWidget(self._build_funds_group(), 1)
+        root.addLayout(top_row)
         root.addWidget(self._build_positions_table(), 1)   # stretch：持倉表佔剩餘空間
+        root.addWidget(self._build_orders_group())
         root.addWidget(self._build_order_group())
         self._status_label = QLabel("等待連線…")
         self._status_label.setStyleSheet(f"color: {cfg.axis_text_color};")
@@ -98,8 +142,10 @@ class OrderWindow(QMainWindow):
 
         # Engine（child QObject → 同 window 一齊收）；signals auto-queue 去 GUI。
         self._engine = TradeEngine(self)
+        self._engine.accounts_updated.connect(self._on_accounts)
         self._engine.positions_updated.connect(self._on_positions)
         self._engine.funds_updated.connect(self._on_funds)
+        self._engine.orders_updated.connect(self._on_orders)
         self._engine.status.connect(lambda m: self._set_status(m, cfg.axis_text_color))
         self._engine.error.connect(lambda m: self._set_status(m, _ERR_COLOR))
         self._engine.order_result.connect(self._on_order_result)
@@ -142,8 +188,15 @@ class OrderWindow(QMainWindow):
         self._lock_btn.clicked.connect(self._on_lock_clicked)
         return bar
 
+    def _build_accounts_tree(self) -> QTreeWidget:
+        """帳戶分類樹：頂層 = REAL/SIMULATE 環境，子項 = 個別帳戶（類型/角色/卡號/市場）。"""
+        self._acc_tree = QTreeWidget()
+        self._acc_tree.setHeaderHidden(True)
+        self._acc_tree.setFixedWidth(340)
+        return self._acc_tree
+
     def _build_funds_group(self) -> QGroupBox:
-        """資金/訂金 group：8 個 label（總資產/現金 HKD/USD/可提 HKD/USD/購買力/初始保證金/維持保證金）。"""
+        """資金/訂金 group：9 個 label（總資產/現金 HKD/USD/可提 HKD/USD/購買力/初始保證金/維持保證金/風控狀態）。"""
         box = QGroupBox("資金 / 訂金")
         grid = QVBoxLayout(box)
         self._funds_labels: dict[str, QLabel] = {}
@@ -152,6 +205,7 @@ class OrderWindow(QMainWindow):
             ("cash_usd", "現金 USD"), ("withdraw_hkd", "可提 HKD"),
             ("withdraw_usd", "可提 USD"), ("buying_power", "購買力"),
             ("initial_margin", "初始保證金（訂金）"), ("maintenance_margin", "維持保證金"),
+            ("risk_status", "風控狀態"),
         ]
         for key, label_text in rows:
             row = QHBoxLayout()
@@ -167,14 +221,29 @@ class OrderWindow(QMainWindow):
         return box
 
     def _build_positions_table(self) -> QTableWidget:
-        """持倉 table：10 欄（代碼/名稱/市場/數量/可用/成本價/市價/市值/盈虧額/盈虧%）。"""
-        self._pos_table = QTableWidget(0, 10)
+        """持倉 table：11 欄（代碼/名稱/市場/數量/可用/平均成本/市價/市值/未實現盈虧/今日盈虧/盈虧%）。"""
+        self._pos_table = QTableWidget(0, 11)
         self._pos_table.setHorizontalHeaderLabels(
-            ["代碼", "名稱", "市場", "數量", "可用", "成本價", "市價", "市值", "盈虧額", "盈虧%"])
+            ["代碼", "名稱", "市場", "數量", "可用", "平均成本", "市價", "市值",
+             "未實現盈虧", "今日盈虧", "盈虧%"])
         self._pos_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._pos_table.verticalHeader().setVisible(False)
         self._pos_table.horizontalHeader().setStretchLastSection(True)
         return self._pos_table
+
+    def _build_orders_group(self) -> QGroupBox:
+        """今日訂單 group：fixed-height table（9 欄）。"""
+        box = QGroupBox("今日訂單")
+        v = QVBoxLayout(box)
+        self._orders_table = QTableWidget(0, 9)
+        self._orders_table.setHorizontalHeaderLabels(
+            ["時間", "代碼", "方向", "類型", "狀態", "數量", "價格", "已成交", "成交均價"])
+        self._orders_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._orders_table.verticalHeader().setVisible(False)
+        self._orders_table.horizontalHeader().setStretchLastSection(True)
+        self._orders_table.setFixedHeight(150)
+        v.addWidget(self._orders_table)
+        return box
 
     def _build_order_group(self) -> QGroupBox:
         """下單 group：code / side combo / price / qty / 下單按鍵。"""
@@ -263,27 +332,52 @@ class OrderWindow(QMainWindow):
 
     # ------------------------------------------------------------- engine signal handlers（GUI thread）
 
+    def _on_accounts(self, accounts: tuple[AccountInfo, ...]) -> None:
+        """帳戶分類 snapshot → 樹重繪（按環境分組：實盤 REAL / 模擬 SIMULATE）。"""
+        tree = self._acc_tree
+        tree.clear()
+        real = [a for a in accounts if a.trd_env == "REAL"]
+        sim = [a for a in accounts if a.trd_env != "REAL"]
+        for title, group in (("實盤 REAL", real), ("模擬 SIMULATE", sim)):
+            top = QTreeWidgetItem([f"{title}（{len(group)}）"])
+            tree.addTopLevelItem(top)
+            for a in sorted(group, key=lambda x: x.acc_id):
+                tags = []
+                if a.sim_acc_type == "COMPETITION":
+                    tags.append("比賽")
+                if a.acc_role == "MASTER":
+                    tags.append("主帳戶")
+                tag_text = f"（{'、'.join(tags)}）" if tags else ""
+                item = QTreeWidgetItem([f"{a.acc_id} · {a.acc_type or '—'}{tag_text}"])
+                card = a.uni_card_num or a.card_num
+                detail = (f"卡號：…{card[-4:]}（末四位）\n市場：{'/'.join(a.trdmarket_auth) or '—'}\n"
+                          f"券商：{a.security_firm or '—'}\n狀態：{a.acc_status or '—'}")
+                item.setToolTip(0, detail)
+                top.addChild(item)
+            top.setExpanded(True)
+
     def _on_positions(self, rows: tuple[PositionRow, ...]) -> None:
-        """持倉 snapshot → table 重繪。"""
+        """持倉 snapshot → table 重繪（字段同富途 APP 對齊）。"""
         table = self._pos_table
         table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             values = [
                 row.code, row.name, row.market,
                 f"{row.qty:g}", f"{row.can_sell_qty:g}",
-                _fmt_money(row.cost_price), _fmt_money(row.last_price),
-                _fmt_money(row.market_value), _fmt_money(row.pl_val),
+                _fmt_money(row.avg_cost), _fmt_money(row.last_price),
+                _fmt_money(row.market_value), _fmt_money(row.unrealized_pl),
+                _fmt_money(row.today_pl),
                 f"{row.pl_ratio_pct:+.2f}%",   # 已是百分數數字
             ]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if c >= 8:   # 盈虧額/盈虧%：正綠負紅
-                    color = _OK_COLOR if row.pl_val >= 0 else _ERR_COLOR
+                if c >= 8:   # 未實現盈虧/今日盈虧/盈虧%：正綠負紅（以 unrealized_pl 符號為準）
+                    color = _OK_COLOR if row.unrealized_pl >= 0 else _ERR_COLOR
                     item.setForeground(QColor(color))
                 table.setItem(r, c, item)
 
     def _on_funds(self, funds: FundsSnapshot) -> None:
-        """資金 snapshot → 8 個 label。"""
+        """資金 snapshot → 8 個金額 label + 風控狀態 label（LEVEL1 紅 / LEVEL2 黃）。"""
         mapping = {
             "total_assets": funds.total_assets,
             "cash_hkd": funds.cash_hkd,
@@ -296,6 +390,38 @@ class OrderWindow(QMainWindow):
         }
         for key, value in mapping.items():
             self._funds_labels[key].setText(_fmt_money(value))
+        risk_label = self._funds_labels["risk_status"]
+        risk_label.setText(_RISK_STATUS_ZH.get(funds.risk_status, funds.risk_status or "—"))
+        if funds.risk_status == "LEVEL1":
+            risk_label.setStyleSheet(f"font-weight: bold; color: {_ERR_COLOR};")
+        elif funds.risk_status == "LEVEL2":
+            risk_label.setStyleSheet(f"font-weight: bold; color: {_WARN_COLOR};")
+        else:
+            risk_label.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
+
+    def _on_orders(self, rows: tuple[OrderRow, ...]) -> None:
+        """今日訂單 snapshot → table 重繪（狀態格上色：已成綠 / 失敗・撤單紅 / pending 黃）。"""
+        table = self._orders_table
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            t = row.create_time
+            values = [
+                t[-8:] if len(t) >= 8 else (t or "—"),   # HH:MM:SS（SDK 格式 'YYYY-MM-DD HH:MM:SS'）
+                row.code, _SIDE_ZH.get(row.side, row.side or "—"),
+                row.order_type or "—", _order_status_zh(row.status),
+                f"{row.qty:g}", _fmt_money(row.price),
+                f"{row.dealt_qty:g}", _fmt_money(row.dealt_avg_price),
+            ]
+            for c, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if c == 4:   # 狀態格上色
+                    color = (_OK_COLOR if row.status in _STATUS_GREEN
+                             else _ERR_COLOR if row.status in _STATUS_RED
+                             else _WARN_COLOR if row.status in _STATUS_YELLOW
+                             else None)
+                    if color is not None:
+                        item.setForeground(QColor(color))
+                table.setItem(r, c, item)
 
     def _on_order_result(self, ok: bool, message: str) -> None:
         """下單結果：status label 更新 + re-enable 下單按鍵（LOCKED 狀態保持 disabled）。"""

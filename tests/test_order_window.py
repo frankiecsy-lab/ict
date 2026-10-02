@@ -12,11 +12,11 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication
 
 from config import Config
-from engine.trade_engine import FundsSnapshot, PositionRow
+from engine.trade_engine import AccountInfo, FundsSnapshot, OrderRow, PositionRow
 from futu import TrdSide
 
 import ui.order_window as ow
-from ui.order_window import OrderWindow, _PinHolder
+from ui.order_window import OrderWindow, _PinHolder, _order_status_zh
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -27,8 +27,10 @@ def _app():
 class FakeTradeEngine(QObject):
     """同 TradeEngine 相同 signal 簽名嘅 fake（唔 spawn thread、唔連 OpenD）。"""
 
+    accounts_updated = Signal(tuple)
     positions_updated = Signal(tuple)
     funds_updated = Signal(object)
+    orders_updated = Signal(tuple)
     status = Signal(str)
     error = Signal(str)
     order_result = Signal(bool, str)
@@ -153,8 +155,8 @@ def test_pin_never_in_plaintext_repr(monkeypatch):
 
 def test_positions_table_populated(monkeypatch):
     rows = (
-        PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0, 6.67),
-        PositionRow("US.AAPL", "Apple", "US", 10, 10, 150.0, 140.0, 1400.0, -100.0, -6.67),
+        PositionRow("HK.00700", "騰訊控股", "HK", 100, 50, 300.0, 320.0, 32000.0, 2000.0, 6.67, 150.0),
+        PositionRow("US.AAPL", "Apple", "US", 10, 10, 150.0, 140.0, 1400.0, -100.0, -6.67, -20.0),
     )
     w, fake = _make_window(monkeypatch)
 
@@ -164,7 +166,8 @@ def test_positions_table_populated(monkeypatch):
     assert table.rowCount() == 2
     assert table.item(0, 0).text() == "HK.00700"
     assert table.item(0, 3).text() == "100"      # %g 格式
-    assert table.item(0, 9).text() == "+6.67%"   # pl_ratio 已是百分數
+    assert table.item(0, 9).text() == "150.00"   # 今日盈虧（APP 對齊 today_pl_val）
+    assert table.item(0, 10).text() == "+6.67%"  # pl_ratio 已是百分數
     assert table.item(1, 8).text() == "-100.00"
 
     up = table.item(0, 8).foreground().color().name()
@@ -176,7 +179,7 @@ def test_funds_labels_updated(monkeypatch):
     funds = FundsSnapshot(
         total_assets=1_234_567.5, cash_hkd=500_000.0, cash_usd=10_000.25,
         withdraw_hkd=400_000.0, withdraw_usd=8_000.0, buying_power=2_000_000.0,
-        initial_margin=50_000.0, maintenance_margin=30_000.0)
+        initial_margin=50_000.0, maintenance_margin=30_000.0, risk_status="LEVEL3")
     w, fake = _make_window(monkeypatch)
 
     fake.funds_updated.emit(funds)
@@ -186,6 +189,73 @@ def test_funds_labels_updated(monkeypatch):
     assert w._funds_labels["cash_usd"].text() == "10,000.25"
     assert w._funds_labels["buying_power"].text() == "2,000,000.00"
     assert w._funds_labels["initial_margin"].text() == "50,000.00"
+    assert w._funds_labels["risk_status"].text() == "安全", "LEVEL3 → 中文風控狀態"
+
+
+def _acc(acc_id: int, env: str = "REAL", acc_type: str = "MARGIN", sim_acc_type: str = "",
+         role: str = "", auth=("HK",), card: str = "12345678") -> AccountInfo:
+    """AccountInfo test factory（keyword 參數，字段順序無關）。"""
+    return AccountInfo(
+        acc_id=acc_id, trd_env=env, acc_type=acc_type, sim_acc_type=sim_acc_type,
+        uni_card_num=f"U{card}", card_num=card, security_firm="FUTUSECURITIES",
+        trdmarket_auth=tuple(auth), acc_role=role, acc_status="NORMAL")
+
+
+def test_accounts_tree_groups_by_env_with_tags(monkeypatch):
+    """accounts_updated → 樹：頂層 REAL/SIMULATE 分組 + 比賽/主帳戶標記 + tooltip 卡號末四位。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.accounts_updated.emit((
+        _acc(2),                                        # REAL 普通
+        _acc(1, role="MASTER", auth=("HK", "US")),      # REAL MASTER 主帳戶
+        _acc(3, env="SIMULATE", sim_acc_type="COMPETITION", auth=("US",)),   # SIMULATE 比賽
+    ))
+
+    tree = w._acc_tree
+    assert tree.topLevelItemCount() == 2
+    real_top, sim_top = tree.topLevelItem(0), tree.topLevelItem(1)
+    assert real_top.text(0) == "實盤 REAL（2）"
+    assert sim_top.text(0) == "模擬 SIMULATE（1）"
+    # 子項按 acc_id 排序；MASTER → 「主帳戶」標記
+    assert real_top.childCount() == 2
+    assert real_top.child(0).text(0) == "1 · MARGIN（主帳戶）"
+    assert real_top.child(1).text(0) == "2 · MARGIN"
+    # 比賽帳戶 → 「比賽」標記 + tooltip 卡號末四位
+    comp = sim_top.child(0)
+    assert comp.text(0) == "3 · MARGIN（比賽）"
+    assert "…5678" in comp.toolTip(0), "tooltip 應含卡號末四位"
+
+
+def test_orders_table_populated_with_status_zh_and_color(monkeypatch):
+    """orders_updated → table：時間 HH:MM:SS + 方向/狀態中文映射 + 狀態格上色。"""
+    w, fake = _make_window(monkeypatch)
+
+    fake.orders_updated.emit((
+        OrderRow("1", "HK.00700", "BUY", "NORMAL", "FILLED_ALL", 200, 55.5, 200, 55.4,
+                 "2026-10-02 09:30:00"),
+        OrderRow("2", "US.AAPL", "SELL", "NORMAL", "SUBMITTED", 10, 140.0, 0, 0.0,
+                 "2026-10-02 10:00:05"),
+    ))
+
+    table = w._orders_table
+    assert table.rowCount() == 2
+    assert table.item(0, 0).text() == "09:30:00"      # HH:MM:SS（SDK 'YYYY-MM-DD HH:MM:SS'）
+    assert table.item(0, 1).text() == "HK.00700"
+    assert table.item(0, 2).text() == "買入"           # 方向中文映射
+    assert table.item(0, 4).text() == "全部已成"       # 狀態中文映射
+    assert table.item(1, 2).text() == "賣出"
+    assert table.item(1, 4).text() == "已提交"
+
+    filled = table.item(0, 4).foreground().color().name()
+    pending = table.item(1, 4).foreground().color().name()
+    assert filled != pending, "已成（綠）同 pending（黃）應有不同顏色"
+
+
+def test_order_status_zh_fallback_returns_raw():
+    """未知狀態 → 原文 fallback；空字串 → '—'。"""
+    assert _order_status_zh("FILLED_ALL") == "全部已成"
+    assert _order_status_zh("SOME_NEW_STATUS") == "SOME_NEW_STATUS"
+    assert _order_status_zh("") == "—"
 
 
 def test_order_result_updates_status_label(monkeypatch):
