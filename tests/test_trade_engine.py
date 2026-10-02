@@ -293,6 +293,20 @@ def test_funds_dataframe_input_normalized():
     assert f.risk_status == "LEVEL3"
 
 
+def test_account_funds_signal_accepts_snowflake_acc_id():
+    """Commit 32 live bug regression：富途 acc_id 係 18 位 snowflake（~2.8e17）——超出 PySide6
+    Signal(int) 嘅 C 4-byte signed int 上限（2^31-1）→ shiboken OverflowError + emit 靜默失效。
+    signal param 必須係 object，大整數原樣傳遞。"""
+    engine = TradeEngine()
+    funds_events: list = []
+    engine.account_funds_updated.connect(lambda *a: funds_events.append(a))
+    acc_id = 281756477678772637   # 用戶 live 實測嘅真實 acc_id（18 位）
+    engine.account_funds_updated.emit(acc_id, "REAL", object())
+
+    assert len(funds_events) == 1, "emit 必須成功交付（Signal(int) 會 OverflowError / 靜默失效）"
+    assert funds_events[0][0] == acc_id, "acc_id 必須原樣傳遞（唔好截斷/溢出）"
+
+
 def test_orders_dataframe_input_normalized():
     """live bug regression：order_list_query 成功返回 **DataFrame** → OrderRow 映射。"""
     ctx = FakeTradeCtx()

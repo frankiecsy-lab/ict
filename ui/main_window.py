@@ -548,6 +548,10 @@ class MainWindow(QMainWindow):
         title = QLabel("逐筆成交")
         title.setStyleSheet(f"color: {cfg.text_color}; font-family: Consolas; font-weight: bold;")
         v.addWidget(title)
+        # 空狀態提示（Commit 32）：無數據時解釋「點解一片空白」（休市 / 指數無逐筆 / 訂閱失敗見 status bar ⚠）
+        self._tick_hint = QLabel("等待逐筆數據…")
+        self._tick_hint.setStyleSheet(f"color: {cfg.axis_text_color}; font-family: Consolas; font-size: 11px;")
+        v.addWidget(self._tick_hint)
 
         table = QTableWidget(0, 5)
         table.setHorizontalHeaderLabels(["時間", "價格", "數量", "方向", "類型"])
@@ -595,6 +599,8 @@ class MainWindow(QMainWindow):
         self._tick_buffer.clear()
         while t.rowCount() > _TICK_MAX_ROWS:       # overflow → 刪最舊（底部）
             t.removeRow(t.rowCount() - 1)
+        if t.rowCount() and self._tick_hint.isVisible():   # Commit 32：有數據 → 收埋空狀態提示
+            self._tick_hint.hide()
 
     @staticmethod
     def _fill_tick_row(table: QTableWidget, row: int, tick: tuple[str, float, float, str, str]) -> None:
@@ -619,6 +625,7 @@ class MainWindow(QMainWindow):
         if self._tick_timer.isActive():
             self._tick_timer.stop()
         self._tick_table.setRowCount(0)
+        self._tick_hint.show()   # Commit 32：清空後重新顯示「等待逐筆數據…」
 
     # ------------------------------------------------------------- panes / time sync
 

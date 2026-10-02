@@ -162,7 +162,7 @@ class TradeEngine(QObject):
     Signals（全部 auto-queue 去 GUI）:
     - accounts_updated(tuple[AccountInfo])：setup 完成後嘅全帳戶分類 snapshot（全 env、dedupe）
     - positions_updated(tuple[PositionRow])：每輪 poll 後嘅全量持倉 snapshot
-    - account_funds_updated(int, str, object)：per-account (acc_id, trd_env, FundsSnapshot)——雙 env、ACTIVE only（GUI 端按 env 分組加總）
+    - account_funds_updated(object, str, object)：per-account (acc_id, trd_env, FundsSnapshot)——雙 env、ACTIVE only（GUI 端按 env 分組加總；acc_id 參數係 object 唔好 int，見下方註解）
     - orders_updated(tuple[OrderRow])：今日訂單 snapshot（30s 間隔、限頻安全）
     - status(str) / error(str)：連線與操作狀態訊息
     - order_result(bool, str)：(success, message)——下單結果（worker thread emit）
@@ -170,7 +170,9 @@ class TradeEngine(QObject):
 
     accounts_updated = Signal(tuple)
     positions_updated = Signal(tuple)
-    account_funds_updated = Signal(int, str, object)  # (acc_id, trd_env "REAL"/"SIMULATE", FundsSnapshot)——per-account、雙 env、ACTIVE only
+    # acc_id 用 object（唔好 int）：富途 acc_id 係 18 位 snowflake ID（~2.8e17），超出 PySide6 Signal(int)
+    # 嘅 C 4-byte signed int 上限（2^31-1）→ shiboken OverflowError + emit 靜默失效（Commit 32 live bug）。
+    account_funds_updated = Signal(object, str, object)  # (acc_id: int, trd_env "REAL"/"SIMULATE", FundsSnapshot)——per-account、雙 env、ACTIVE only
     orders_updated = Signal(tuple)
     status = Signal(str)
     error = Signal(str)

@@ -29,7 +29,7 @@ class FakeTradeEngine(QObject):
 
     accounts_updated = Signal(tuple)
     positions_updated = Signal(tuple)
-    account_funds_updated = Signal(int, str, object)   # (acc_id, trd_env "REAL"/"SIMULATE", FundsSnapshot)
+    account_funds_updated = Signal(object, str, object)   # (acc_id, trd_env "REAL"/"SIMULATE", FundsSnapshot)——object 唔好 int（18 位 snowflake acc_id，Commit 32）
     orders_updated = Signal(tuple)
     status = Signal(str)
     error = Signal(str)

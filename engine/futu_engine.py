@@ -609,6 +609,8 @@ class FutuEngine(QObject):
                         self._ensure_store().add(new_code, "TICKER")
                     else:
                         logger.warning("subscribe TICKER %s 失敗（非致命）: %s", new_code, info_tk)
+                        if not self._closed:   # Commit 32：visible warning——切換後逐筆面板空白原因要見到
+                            self.error.emit(f"TICKER 逐筆訂閱失敗（非致命）：{new_code} — 逐筆面板將無數據")
                 except Exception:  # noqa: BLE001 — TICKER 失敗唔阻切換
                     logger.exception("subscribe TICKER exception")
             if smt_target is not None and old_state.smt_code != smt_target:
@@ -919,6 +921,8 @@ class FutuEngine(QObject):
                     self._ensure_store().add(code, "TICKER")   # 入帳本（PK=(code, subtype)，同 QUOTE 獨立行）
                 else:
                     logger.warning("TICKER subscribe %s 失敗（非致命）: %s", code, info_tk)
+                    if not self._closed:   # Commit 32：visible warning——逐筆面板空白原因要喺 status bar ⚠ 見到
+                        self.error.emit(f"TICKER 逐筆訂閱失敗（非致命）：{code} — 逐筆面板將無數據")
             except Exception:  # noqa: BLE001 — TICKER 失敗唔阻開機
                 logger.exception("TICKER subscribe exception")
             self._schedule_reconcile()       # 開機對帳：query_subscription 清理上次殘留訂閱
