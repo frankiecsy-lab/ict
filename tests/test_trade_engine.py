@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication
 from futu import RET_OK, TrdEnv, TrdSide
 
 import engine.trade_engine as te
-from engine.trade_engine import TradeEngine, _f, _needs_unlock
+from engine.trade_engine import OrderRow, TradeEngine, _f, _needs_unlock
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -100,7 +100,9 @@ def _install_ctx_factory(monkeypatch, ctxs_by_market: dict[str, FakeTradeCtx]):
 
 
 def _cfg(markets=("HK",)):
-    return SimpleNamespace(trd_markets=markets, opend_host="127.0.0.1", opend_port=11111)
+    # Commit 35：交易 OpenD 獨立端點（trade_host/trade_port）——Config dataclass 永遠有呢兩欄
+    return SimpleNamespace(trd_markets=markets, opend_host="127.0.0.1", opend_port=11111,
+                           trade_host="127.0.0.1", trade_port=11111)
 
 
 def _acc_df(rows: list[dict]) -> pd.DataFrame:
@@ -698,3 +700,93 @@ def test_place_order_rejected_when_no_order_account():
     assert len(results) == 1, "無下單帳戶 → 立即 emit（direct connection）"
     assert results[0][0] is False and "冇可下單帳戶" in results[0][1]
     assert ctx.calls["place_order"] == 0
+
+
+# ---------------------------------------------------------------- Commit 35 R2：雙 env 訂單輪詢 + 即時刷新
+
+def test_orders_poll_covers_both_envs():
+    """Commit 35 R2：訂單輪詢覆蓋兩個 env（此前 hardcoded REAL——SIMULATE 訂單「下咗單但唔顯示」bug）。"""
+    ctx = FakeTradeCtx()
+
+    def order_list_query(trd_env=None, acc_id=None, **kw):
+        ctx.calls["order_list_query"] += 1
+        env = "REAL" if trd_env == TrdEnv.REAL else "SIMULATE"
+        return (RET_OK, [{
+            "order_id": f"{env}-1", "code": "HK.00700", "trd_side": "BUY",
+            "order_type": "NORMAL", "order_status": "FILLED_ALL", "qty": 200,
+            "price": 55.5, "dealt_qty": 200, "dealt_avg_price": 55.4,
+            "create_time": "2026-10-02 09:30:00",
+        }])
+
+    ctx.order_list_query = order_list_query   # instance attr shadow method（per-env scripted response）
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+    engine._funds_targets = [("HK", 1, "REAL"), ("HK", 2, "SIMULATE")]
+
+    events: list[tuple] = []
+    engine.orders_updated.connect(events.append)
+    engine._poll_once()
+
+    assert ctx.calls["order_list_query"] == 2, "每個 (env, acc_id) target 各查一次"
+    rows = events[0]
+    assert len(rows) == 2
+    assert {r.trd_env for r in rows} == {"REAL", "SIMULATE"}
+
+
+def test_refresh_orders_worker_merges_cache_and_emits_full():
+    """Commit 35 R2：下單/撤單成功後即時刷新——重查目標帳戶 → merge 其他帳戶 cache → emit 全量。"""
+    ctx = FakeTradeCtx()
+
+    def order_list_query(trd_env=None, acc_id=None, **kw):
+        ctx.calls["order_list_query"] += 1
+        return (RET_OK, [{
+            "order_id": "R-new", "code": "HK.00700", "trd_side": "BUY",
+            "order_type": "NORMAL", "order_status": "OPEN", "qty": 200,
+            "price": 55.5, "dealt_qty": 0, "dealt_avg_price": 0.0,
+            "create_time": "2026-10-02 09:31:00",
+        }])
+
+    ctx.order_list_query = order_list_query
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)   # REAL acc 7
+
+    sim_row = OrderRow(order_id="S-old", code="US.AAPL", side="SELL", order_type="NORMAL",
+                       status="OPEN", qty=-100.0, price=0.0, dealt_qty=0.0,
+                       dealt_avg_price=0.0, create_time="2026-10-02 10:00:00",
+                       acc_id=8, trd_env="SIMULATE")
+
+    events: list[tuple] = []
+    engine.orders_updated.connect(events.append)
+    engine._refresh_orders_worker([("HK", 7, "REAL")], {("SIMULATE", 8): [sim_row]})
+
+    assert ctx.calls["order_list_query"] == 1, "只查目標帳戶（限頻安全）"
+    assert engine._orders_cache[("SIMULATE", 8)] == [sim_row], "其他帳戶 cache 保留"
+    ids = {r.order_id for r in events[0]}
+    assert ids == {"R-new", "S-old"}, "merge 後 emit 全量"
+
+
+def test_refresh_orders_now_filters_targets_by_env_and_acc(monkeypatch):
+    """Commit 35 R2：refresh_orders_now(trd_env, acc_id) → worker 只查匹配 (env, acc_id) 嘅 targets。"""
+    captured: dict = {}
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), **kw):
+            captured["target"], captured["args"] = target, args
+
+        def start(self):
+            pass   # 唔真跑 worker（直接斷言 spawn 參數）
+
+    monkeypatch.setattr(te.threading, "Thread", _FakeThread)
+
+    ctx = FakeTradeCtx()
+    engine = TradeEngine()
+    _wire_poll_state(engine, ctx)
+    engine._funds_targets = [("HK", 7, "REAL"), ("US", 8, "SIMULATE")]
+    with engine._lock:
+        engine._orders_cache = {("SIMULATE", 8): []}
+
+    engine.refresh_orders_now("SIMULATE")
+    assert captured["args"][0] == [("US", 8, "SIMULATE")]
+
+    engine.refresh_orders_now("REAL", acc_id=7)
+    assert captured["args"][0] == [("HK", 7, "REAL")]

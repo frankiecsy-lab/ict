@@ -698,7 +698,7 @@ class TestSetup:
         errors = []
         eng.error.connect(errors.append)
         eng._setup()
-        assert len(errors) == 1 and "連唔到 OpenD" in errors[0]
+        assert len(errors) == 1 and "連唔到報價 OpenD" in errors[0]   # Commit 35：錯誤訊息帶端點（quote_host:port）
         assert eng._ctx is None
 
     def test_subscribe_failure_closes_ctx(self, monkeypatch):

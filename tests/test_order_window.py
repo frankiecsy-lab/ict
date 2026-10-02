@@ -8,8 +8,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必須喺 PySide6 import 前
 
 import pytest
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QMessageBox, QPushButton
 
 from config import Config
 from engine.trade_engine import AccountInfo, FundsSnapshot, OrderRow, PositionRow
@@ -433,14 +433,14 @@ def test_shutdown_stops_engine(monkeypatch):
 # ------------------------------------------------------------- 標的同步 / 跟隨市價 / stepper
 
 def test_price_step_magnitudes():
-    """_price_step 純函數：10^(floor(log10(p))−2) + clamp [0.001, 10]。"""
+    """_price_step 純函數：10^(floor(log10(p))−2) + clamp [0.01, 10]（Commit 35 R5：價格固定兩位小數）。"""
     assert _price_step(55.5) == pytest.approx(0.1)
     assert _price_step(5.5) == pytest.approx(0.01)
     assert _price_step(555.0) == pytest.approx(1.0)
-    assert _price_step(0) == 0.001          # ≤0 → 最小步長
-    assert _price_step(-3.0) == 0.001
+    assert _price_step(0) == 0.01           # ≤0 → 最小步長（= 顯示精度）
+    assert _price_step(-3.0) == 0.01
     assert _price_step(99_999.0) == 10.0    # 上限 clamp
-    assert _price_step(0.05) == 0.001       # 下限 clamp
+    assert _price_step(0.05) == 0.01        # 下限 clamp（唔可以細過兩位小數顯示精度）
 
 
 def test_set_symbol_syncs_order_code_even_when_locked(monkeypatch):
@@ -768,7 +768,7 @@ def test_matched_account_info_label(monkeypatch):
 
 
 def test_orders_table_account_column(monkeypatch):
-    """Commit 33：訂單表第 11 欄 = 來源帳戶（卡號末四位）。"""
+    """Commit 33 + Commit 35 R2：訂單表第 11 欄 = env 前綴 + 來源帳戶（卡號末四位）。"""
     w, fake = _make_window(monkeypatch)
     fake.accounts_updated.emit((_acc(1),))   # REAL、card 12345678
 
@@ -777,7 +777,22 @@ def test_orders_table_account_column(monkeypatch):
                    dealt_avg_price=55.4, create_time="2026-10-02 09:30:00", acc_id=1)
     fake.orders_updated.emit((row,))
 
-    assert w._orders_table.item(0, 10).text() == "…5678"
+    assert w._orders_table.item(0, 10).text() == "實盤 …5678"
+
+
+def test_orders_table_account_column_simulate_env(monkeypatch):
+    """Commit 35 R2：SIMULATE 訂單 → 「模擬」前綴；無卡號帳戶 → env + acc_id fallback。"""
+    w, fake = _make_window(monkeypatch)
+    sim_acc = _acc(7, env="SIMULATE", card="N/A")   # 模擬帳戶、無卡號
+    fake.accounts_updated.emit((sim_acc,))
+
+    row = OrderRow(order_id="9002", code="US.AAPL", side="SELL", order_type="MARKET",
+                   status="OPEN", qty=-100, price=0.0, dealt_qty=0,
+                   dealt_avg_price=0.0, create_time="2026-10-02 10:00:00", acc_id=7,
+                   trd_env="SIMULATE")
+    fake.orders_updated.emit((row,))
+
+    assert w._orders_table.item(0, 10).text() == "模擬 7"
 
 
 def test_set_symbol_refreshes_labels(monkeypatch):
@@ -1133,3 +1148,136 @@ def test_action_queue_keeps_buttons_disabled_until_drained(monkeypatch):
 
     fake.order_result.emit(True, "ok")    # done 2 → queue 空 → _apply_pin_state 恢復
     assert w._buy_btn.isEnabled() is True and w._sell_btn.isEnabled() is True
+
+
+# ---------------------------------------------------------------- Commit 35：下單頁實戰升級
+
+def test_mode_buttons_top_bar_exclusive_switch(monkeypatch):
+    """Commit 35 R3：實盤/模擬盤按喺下單頁頂部（全局切換、互斥）；form 內 mode selector 已移除。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._mode_sim_btn.isChecked() is True and w._mode == "SIMULATE"   # 默認模擬盤
+    w._mode_real_btn.click()
+    assert w._mode == "REAL"
+    assert w._mode_real_btn.isChecked() is True and not w._mode_sim_btn.isChecked(), "互斥組"
+    w._mode_sim_btn.click()
+    assert w._mode == "SIMULATE"
+
+
+def test_env_funds_mini_panels_both_envs(monkeypatch):
+    """Commit 35 R4：實盤/模擬資金明細移去右上角（per-env 9 欄 label 組）。"""
+    w, fake = _make_window(monkeypatch)
+    assert set(w._env_funds_labels) == {"REAL", "SIMULATE"}
+    for env in ("REAL", "SIMULATE"):
+        fields = w._env_funds_labels[env]
+        assert len(fields) == 9
+        assert all(isinstance(l, QLabel) and l.text() == "—" for l in fields.values())
+    # per-account 資金事件 → 對應 env mini panel 更新（total_assets 欄）
+    fake.account_funds_updated.emit(1, "SIMULATE", _funds(total_assets=88_000.0))
+    assert w._env_funds_labels["SIMULATE"]["total_assets"].text() != "—"
+
+
+def test_price_spinbox_two_decimals(monkeypatch):
+    """Commit 35 R5：交易價格固定小數後兩位（如 3.33）。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._order_price.decimals() == 2
+
+
+def test_set_symbol_forces_follow_mode_and_resets_price(monkeypatch):
+    """Commit 35 R1：標的改變 → 強制返跟隨現價模式（即使用戶已切手動輸入）+ 價格重置等新市價。"""
+    w, _ = _make_window(monkeypatch)
+    w._follow_btn.setChecked(False)   # 先切去手動輸入
+    assert w._following is False
+    w.set_symbol("HK.00700")
+    assert w._following is True, "強制返跟隨模式"
+    assert w._order_price.value() == 0.0, "重置（新標的市價會喺下一個 tick 填入）"
+
+
+def test_set_symbol_then_tick_fills_current_price(monkeypatch):
+    """Commit 35 R1：標的改變後，新市價 tick → 訂單價格 = 現價（兩位小數顯示）。"""
+    w, _ = _make_window(monkeypatch)
+    w.set_symbol("HK.00700")
+    w.follow_price(3.3349)
+    assert w._order_price.value() == pytest.approx(3.33), "兩位小數（如 3.33）"
+
+
+def test_endpoint_settings_defaults_from_cfg(monkeypatch):
+    """Commit 35 R8：OpenD 連線設定面板——報價/交易各自 IP+PORT（默認 127.0.0.1/11111）。"""
+    w, _ = _make_window(monkeypatch)
+    assert w._quote_host_edit.text() == "127.0.0.1" and w._quote_port_spin.value() == 11111
+    assert w._trade_host_edit.text() == "127.0.0.1" and w._trade_port_spin.value() == 11111
+
+
+def test_save_endpoints_writes_env_and_emits_payload(monkeypatch, tmp_path):
+    """Commit 35 R8：儲存並重連 → 寫四個端點變數去 .env + emit endpoints_changed（int port）。"""
+    w, _ = _make_window(monkeypatch)
+    written: dict = {}
+
+    def fake_save(updates, env_path=None):
+        written.update(updates)
+        return tmp_path / ".env"
+
+    monkeypatch.setattr(ow, "save_env_values", fake_save)
+    payloads = []
+    w.endpoints_changed.connect(payloads.append)
+
+    w._quote_host_edit.setText("10.0.0.5")
+    w._quote_port_spin.setValue(22222)
+    w._trade_host_edit.setText("10.0.0.6")
+    w._trade_port_spin.setValue(33333)
+    w._on_save_endpoints_clicked()
+
+    assert written == {"FUTU_QUOTE_HOST": "10.0.0.5", "FUTU_QUOTE_PORT": "22222",
+                       "FUTU_TRADE_HOST": "10.0.0.6", "FUTU_TRADE_PORT": "33333"}
+    assert payloads == [{"quote": ("10.0.0.5", 22222), "trade": ("10.0.0.6", 33333)}]
+
+
+def test_save_endpoints_empty_host_falls_back_to_loopback(monkeypatch, tmp_path):
+    """Commit 35 R8：空 host → fallback 127.0.0.1（唔寫空值）。"""
+    w, _ = _make_window(monkeypatch)
+    written: dict = {}
+
+    def fake_save(updates, env_path=None):
+        written.update(updates)
+        return tmp_path / ".env"
+
+    monkeypatch.setattr(ow, "save_env_values", fake_save)
+    w._quote_host_edit.setText("   ")
+    w._on_save_endpoints_clicked()
+    assert written["FUTU_QUOTE_HOST"] == "127.0.0.1"
+
+
+def test_conn_test_button_worker_updates_status_label(monkeypatch):
+    """Commit 35 R8：連線測試按鍵 → _ConnTester worker thread（阻塞調用唔喺 GUI thread）；
+    result auto-queue 返去更新狀態 label。"""
+    w, _ = _make_window(monkeypatch)
+    calls = []
+
+    def fake_test_endpoint(kind, host, port):
+        calls.append((kind, host, port))
+        return True, "10.9.9.9:22222 連線成功"
+
+    monkeypatch.setattr(ow.connection_test, "test_endpoint", fake_test_endpoint)
+
+    w._quote_host_edit.setText("10.9.9.9")
+    w._quote_port_spin.setValue(22222)
+    w._start_conn_test("quote")
+
+    # worker thread → auto-queue signal；等 drain（offscreen：pump events 至 label 更新或 timeout）
+    from PySide6.QtCore import QEventLoop
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.timeout.connect(lambda: loop.quit() if "報價端點" in w._conn_status_label.text() else None)
+    timer.start(10)
+    QTimer.singleShot(3000, loop.quit)   # timeout guard（防 hang）
+    loop.exec()
+    timer.stop()
+
+    assert calls == [("quote", "10.9.9.9", 22222)]
+    assert w._conn_status_label.text().startswith("報價端點") and "連線成功" in w._conn_status_label.text()
+
+
+def test_order_form_row_spacing(monkeypatch):
+    """Commit 35 R7：下單 FORM 合理隔行（10px）。"""
+    w, _ = _make_window(monkeypatch)
+    group = next(g for g in w.findChildren(QGroupBox) if g.objectName() == "orderGroup")
+    assert group.layout().spacing() == 10

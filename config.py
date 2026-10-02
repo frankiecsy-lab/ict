@@ -92,9 +92,13 @@ def _str_list(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
 class Config:
     """不可變運行配置；一律經 from_env() 構造。"""
 
-    # --- 富途 OpenD 連線 ---
-    opend_host: str = "127.0.0.1"
+    # --- 富途 OpenD 連線（Commit 35：報價 / 交易拆成兩個獨立端點，可指向不同 OpenD 實例）---
+    opend_host: str = "127.0.0.1"   # legacy fallback 預設值（FUTU_OPEND_HOST/PORT）
     opend_port: int = 11111
+    quote_host: str = "127.0.0.1"   # 報價 OpenD（FutuEngine；FUTU_QUOTE_HOST，fallback FUTU_OPEND_HOST）
+    quote_port: int = 11111
+    trade_host: str = "127.0.0.1"   # 交易 OpenD（TradeEngine；FUTU_TRADE_HOST，fallback FUTU_OPEND_HOST）
+    trade_port: int = 11111
 
     # --- 行情 ---
     trading_code: str = "HK.HSImain"
@@ -140,9 +144,17 @@ class Config:
         if convention not in _CONVENTION_COLORS:
             convention = "HK"
 
+        # Commit 35：報價 / 交易端點各自可設；未設時 fallback 舊 FUTU_OPEND_HOST/PORT（向後相容）
+        base_host = _str("FUTU_OPEND_HOST", "127.0.0.1")
+        base_port = _int("FUTU_OPEND_PORT", 11111)
+
         return cls(
-            opend_host=_str("FUTU_OPEND_HOST", "127.0.0.1"),
-            opend_port=_int("FUTU_OPEND_PORT", 11111),
+            opend_host=base_host,
+            opend_port=base_port,
+            quote_host=_str("FUTU_QUOTE_HOST", base_host),
+            quote_port=_int("FUTU_QUOTE_PORT", base_port),
+            trade_host=_str("FUTU_TRADE_HOST", base_host),
+            trade_port=_int("FUTU_TRADE_PORT", base_port),
             trading_code=_str("TRADING_CODE", "HK.HSImain"),
             kline_type=kline_type,
             history_count=max(1, _int("HISTORY_COUNT", 1000)),
@@ -172,3 +184,34 @@ class Config:
     @property
     def down_color(self) -> str:
         return self.color_down or _CONVENTION_COLORS[self.convention]["down"]
+
+
+def save_env_values(updates: dict[str, object], env_path: str | Path | None = None) -> Path:
+    """將 key=value 寫入 .env（Commit 35：下單頁「OpenD 連線設定」儲存按鈕用）。
+
+    - 已存在嘅行 → **原地更新**（保留行位置、其餘行同註釋不動）；
+    - 唔存在嘅 key → append 到檔尾。
+    寫完後呼叫方重新 `Config.from_env()` 取新配置並重連對應 engine。
+    """
+    if env_path is None:
+        env_path = _default_env_path()
+    p = Path(env_path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    remaining = dict(updates)
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        key = None
+        if "=" in stripped and not stripped.startswith("#"):
+            candidate = stripped.split("=", 1)[0].strip()
+            # 只匹配純 KEY= 行（排除 export KEY= / 帶空白嘅變體）
+            if candidate and all(c.isalnum() or c == "_" for c in candidate):
+                key = candidate
+        if key is not None and key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for k, v in remaining.items():
+        out.append(f"{k}={v}")
+    p.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return p

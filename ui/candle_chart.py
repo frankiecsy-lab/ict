@@ -16,6 +16,7 @@ ICT FVG / Order Block / Kill Zone 圖層（Step 1 零 overlay）。
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from datetime import timedelta
 from typing import Callable
@@ -308,6 +309,20 @@ class CandleChart(QWidget):
         self._repaint_timer.timeout.connect(self._on_repaint_tick)
 
     # ------------------------------------------------------------- public API
+
+    def apply_theme(self, t) -> None:
+        """切換淺色/暗色主題（Commit 35 R6）：換一個新 Config（frozen dataclass replace），
+        paint 時讀 `self._cfg` 嘅顏色字段自動跟隨——零 paint 代碼改動。
+
+        只覆蓋背景 / 網格 / 文字 / 軸 / 最新價線五個主題色；up/down 漲跌色跟 convention
+        （市場慣例）唔跟主題，visible_bars 等其餘字段原樣保留。
+        """
+        self._cfg = dataclasses.replace(
+            self._cfg,
+            bg_color=t.bg, grid_color=t.grid, text_color=t.text,
+            axis_text_color=t.muted, last_price_color=t.accent,
+        )
+        self.update()
 
     def update_bars(self, bars: tuple[Bar, ...]) -> None:
         """接收新 snapshot（Signal queued 過嚟）；30ms 內多次調用只 repaint 一次。"""

@@ -12,6 +12,8 @@ import logging
 import signal
 import sys
 
+from dataclasses import replace as _replace_cfg
+
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
@@ -53,6 +55,41 @@ def main() -> int:
     window.catalog_ready.connect(order_window.set_stock_catalog)   # Commit 31：股票目錄 → 下單代碼補全/驗證
     order_window.code_changed.connect(window.switch_symbol)   # Commit 34：反向同步——下單標的 → K 綫圖
     order_window.set_symbol(window.code_edit.text())   # 初始同步一次（UI-state restored code）
+
+    # Commit 35 R6：全局主題同步——MainWindow toggle → OrderWindow；啟動時用還原後嘅主題（UI state）同步一次
+    window.theme_changed.connect(order_window.set_theme)
+    order_window.set_theme(window.current_theme())
+
+    def _on_endpoints_changed(payload):
+        """Commit 35 R8：OpenD 端點變更（OrderWindow 已寫 .env）→ 選擇性重啟受影響 engine。
+
+        用 payload 對照當前 cfg（唔重新 from_env()——load_dotenv(override=False) 令程序環境變數
+        優先於 .env，重讀未必反映剛儲存嘅值；payload = 用戶實際輸入、確定性最高）。
+        """
+        nonlocal cfg
+        if not isinstance(payload, dict):
+            return
+        quote = tuple(payload.get("quote", ()))
+        trade = tuple(payload.get("trade", ()))
+        q_changed = len(quote) == 2 and (cfg.quote_host, cfg.quote_port) != (str(quote[0]), int(quote[1]))
+        t_changed = len(trade) == 2 and (cfg.trade_host, cfg.trade_port) != (str(trade[0]), int(trade[1]))
+        if not (q_changed or t_changed):
+            return
+        new_cfg = _replace_cfg(
+            cfg,
+            quote_host=str(quote[0]) if q_changed else cfg.quote_host,
+            quote_port=int(quote[1]) if q_changed else cfg.quote_port,
+            trade_host=str(trade[0]) if t_changed else cfg.trade_host,
+            trade_port=int(trade[1]) if t_changed else cfg.trade_port,
+        )
+        cfg = new_cfg   # 更新對照基準（下次變更比較用）
+        if q_changed:
+            window.reconnect(new_cfg)      # FutuEngine restart（保留 periods/code/smt UI 狀態）
+        if t_changed:
+            order_window.reconnect(new_cfg)   # TradeEngine restart
+
+    order_window.endpoints_changed.connect(_on_endpoints_changed)
+
     window.show()
     order_window.show()
 

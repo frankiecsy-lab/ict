@@ -14,6 +14,8 @@ _ALL_KEYS = [
     "HISTORY_COUNT", "VISIBLE_BARS", "CONVENTION", "COLOR_UP", "COLOR_DOWN",
     "BG_COLOR", "GRID_COLOR", "TEXT_COLOR", "AXIS_TEXT_COLOR",
     "LAST_PRICE_COLOR", "TRD_MARKETS", "DEBUG",
+    # Commit 35 R8：報價 / 交易獨立端點（fallback FUTU_OPEND_HOST/PORT）
+    "FUTU_QUOTE_HOST", "FUTU_QUOTE_PORT", "FUTU_TRADE_HOST", "FUTU_TRADE_PORT",
 ]
 
 
@@ -150,3 +152,57 @@ def test_trd_markets_empty_falls_back_to_default(monkeypatch, tmp_path):
     monkeypatch.setenv("TRD_MARKETS", ", ,")
     cfg = Config.from_env(env_file=tmp_path / "no_such.env")
     assert cfg.trd_markets == ("HK", "US")
+
+
+# ---------------------------------------------------------------- Commit 35 R8：報價/交易獨立端點
+
+def test_endpoint_defaults(tmp_path):
+    """Commit 35 R8：報價/交易端點預設 127.0.0.1/11111。"""
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert (cfg.quote_host, cfg.quote_port) == ("127.0.0.1", 11111)
+    assert (cfg.trade_host, cfg.trade_port) == ("127.0.0.1", 11111)
+
+
+def test_endpoint_independent_override(monkeypatch, tmp_path):
+    """Commit 35 R8：報價/交易端點可指向不同 OpenD 實例（各自獨立 IP+PORT）。"""
+    monkeypatch.setenv("FUTU_QUOTE_HOST", "10.0.0.1")
+    monkeypatch.setenv("FUTU_QUOTE_PORT", "21111")
+    monkeypatch.setenv("FUTU_TRADE_HOST", "10.0.0.2")
+    monkeypatch.setenv("FUTU_TRADE_PORT", "31111")
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert (cfg.quote_host, cfg.quote_port) == ("10.0.0.1", 21111)
+    assert (cfg.trade_host, cfg.trade_port) == ("10.0.0.2", 31111)
+
+
+def test_endpoint_fallback_to_legacy_opend(monkeypatch, tmp_path):
+    """FUTU_QUOTE_*/TRADE_* 未設 → fallback legacy FUTU_OPEND_HOST/PORT（向後相容）。"""
+    monkeypatch.setenv("FUTU_OPEND_HOST", "192.168.1.50")
+    monkeypatch.setenv("FUTU_OPEND_PORT", "41111")
+    cfg = Config.from_env(env_file=tmp_path / "no_such.env")
+    assert (cfg.quote_host, cfg.quote_port) == ("192.168.1.50", 41111)
+    assert (cfg.trade_host, cfg.trade_port) == ("192.168.1.50", 41111)
+
+
+def test_save_env_values_updates_in_place_and_appends(tmp_path):
+    """Commit 35 R8：save_env_values——已存在行原地更新（註釋/位置保留）、新 key append 檔尾。"""
+    from config import save_env_values
+
+    env = tmp_path / ".env"
+    env.write_text("# comment\nFUTU_QUOTE_HOST=127.0.0.1\n# another\n", encoding="utf-8")
+    path = save_env_values({"FUTU_QUOTE_HOST": "10.9.9.9", "FUTU_TRADE_PORT": "22222"}, env_path=env)
+    assert path == env
+    lines = env.read_text(encoding="utf-8").splitlines()
+    # 原地更新：行位置唔變、註釋保留
+    assert lines[0] == "# comment" and lines[1] == "FUTU_QUOTE_HOST=10.9.9.9" and lines[2] == "# another"
+    # 新 key append 到檔尾
+    assert any(line.strip() == "FUTU_TRADE_PORT=22222" for line in lines)
+
+
+def test_save_env_values_creates_file_if_missing(tmp_path):
+    """Commit 35 R8：.env 唔存在 → 建立並寫入。"""
+    from config import save_env_values
+
+    env = tmp_path / ".env"
+    path = save_env_values({"FUTU_QUOTE_HOST": "10.9.9.9"}, env_path=env)
+    assert path == env and env.exists()
+    assert "FUTU_QUOTE_HOST=10.9.9.9" in env.read_text(encoding="utf-8")

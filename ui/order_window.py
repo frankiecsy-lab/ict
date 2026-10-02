@@ -23,20 +23,23 @@ Threading：TradeEngine 係 child QObject；所有 RPC 喺 engine worker thread�
 from __future__ import annotations
 
 import math
+import threading
 import time
 
-from PySide6.QtCore import Qt, QRegularExpression, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QRegularExpression, QTimer, Signal
 from PySide6.QtGui import QColor, QIntValidator, QRegularExpressionValidator
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QTabWidget, QTableWidget,
+                               QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from config import Config
+from config import Config, save_env_values
+from engine import connection_test
 from engine.trade_engine import (AccountInfo, FundsSnapshot, OrderRow, PositionRow,
                                  TradeEngine, _sum_funds)
 from futu import TrdSide
 from engine.stock_catalog import name_text
 from .stock_completer import StockCompleter, code_from_completion
+from .theme import Theme, build_qss, get_theme
 
 # 狀態色（跟 MainWindow 深色主題語義）
 _OK_COLOR = "#089981"
@@ -160,11 +163,38 @@ def _fmt_money(v: float) -> str:
 
 
 def _price_step(price: float) -> float:
-    """自適應 stepper 步長 = 10^(floor(log10(p))−2)——55.5→0.1、5.5→0.01、555→1.0；clamp [0.001, 10]。"""
+    """自適應 stepper 步長 = 10^(floor(log10(p))−2)——55.5→0.1、5.5→0.01、555→1.0；clamp [0.01, 10]。
+
+    Commit 35 R5：下限 0.001 → **0.01**（交易價格固定小數後兩位，如 3.33——步長唔可以細過顯示精度）。
+    """
     if price <= 0:
-        return 0.001
+        return 0.01
     step = 10 ** (math.floor(math.log10(price)) - 2)
-    return max(0.001, min(step, 10.0))
+    return max(0.01, min(step, 10.0))
+
+
+class _ConnTester(QObject):
+    """OpenD 連線測試 worker（Commit 35 R8）：`test_endpoint()` 係阻塞函數（TCP + SDK 握手，
+    最壞 ~5s+），必須喺獨立 thread 跑；結果經 `result(kind, ok, msg)` auto-queue 返 GUI。
+
+    唔做 engine child——由 OrderWindow 持有引用（`_conn_testers` list）防 GC；每次測試新建一個，
+    run 完即棄（一次性）。
+    """
+
+    result = Signal(str, bool, str)   # (kind "quote"/"trade", ok, message)
+
+    def __init__(self, kind: str, host: str, port: int) -> None:
+        super().__init__()
+        self._kind = kind
+        self._host = host
+        self._port = port
+
+    def run(self) -> None:
+        try:
+            ok, msg = connection_test.test_endpoint(self._kind, self._host, self._port)
+        except Exception as exc:  # noqa: BLE001 — worker 邊界，任何異常都轉成失敗結果
+            ok, msg = False, f"連線測試異常：{exc}"
+        self.result.emit(self._kind, ok, msg)
 
 
 class OrderWindow(QMainWindow):
@@ -180,9 +210,17 @@ class OrderWindow(QMainWindow):
     Commit 34：PIN bar + 模式選擇器移入下單 form；`code_changed(str)` signal → K 綫視窗反向同步標的
     （600ms debounce）；數量默認 = 每手單位（lot size）；買賣二次確認 checkbox；訂單/持倉 per-row
     撤單/平倉 + 全部撤單/全部平倉（全部二次確認）；成功/錯誤 status label 高對比當眼。
+
+    Commit 35：頂部 top bar——右側 = 雙 env 資金明細 mini panel（R4，取代舊右欄 funds group）+
+    **全局實盤/模擬盤模式按鍵**（R3，由 PIN bar 移入、form 內選擇器取消）；下單 form 價格固定
+    2 位小數（R5）+ 合理隔行（R7）；標的改變 → 強制 follow mode + 價格重置等現價填回（R1）；
+    訂單表「帳戶」欄顯示 env 前綴（模擬/實盤 …卡號末四位，R2——雙 env 訂單分組可辨）；
+    OpenD 連線設定 group（R8）：報價/交易兩端點各自 IP+PORT + 連線測試按鍵 + 儲存並重連
+    （`endpoints_changed(object)` signal → main.py 比對後選擇性 restart engine）。
     """
 
     code_changed = Signal(str)   # Commit 34：下單代碼變更 → K 綫視窗反向同步（debounce 後 emit canonical code）
+    endpoints_changed = Signal(object)   # Commit 35 R8：{"quote": (host, port), "trade": (host, port)} → main.py 重連
 
     def __init__(self, cfg: Config, *, clock=time.time, unlock_ttl_seconds: float = 24 * 3600) -> None:
         super().__init__()
@@ -192,36 +230,21 @@ class OrderWindow(QMainWindow):
         self.setWindowTitle("ICT Trader — 下單版面")
         self.resize(1280, 860)   # 左欄訂單/持倉上下二分（各 11-12 欄）需要寬度
 
-        # 深色主題（跟 MainWindow 配色）
-        self.setStyleSheet(
-            f"QMainWindow {{ background: {cfg.bg_color}; }}"
-            f"QWidget {{ color: {cfg.text_color}; font-family: Consolas; }}"
-            f"QGroupBox {{ border: 1px solid {cfg.grid_color}; margin-top: 8px; }}"
-            f"QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {cfg.axis_text_color}; }}"
-            f"QLineEdit, QComboBox {{ background: #1A212B; border: 1px solid {cfg.grid_color}; "
-            f"color: {cfg.text_color}; padding: 3px 6px; }}"
-            f"QDoubleSpinBox {{ background: #1A212B; border: 1px solid {cfg.grid_color}; "
-            f"color: {cfg.text_color}; padding: 3px 6px; }}"
-            f"QPushButton {{ background: #1E2836; border: 1px solid {cfg.grid_color}; "
-            f"color: {cfg.text_color}; padding: 4px 14px; }}"
-            f"QPushButton:hover {{ background: #27354A; }}"
-            f"QPushButton:disabled {{ color: #4A5568; background: #151B23; }}"
-            f"QTableWidget {{ background: {cfg.bg_color}; gridline-color: {cfg.grid_color}; border: none; }}"
-            f"QFrame#accountCard {{ background: #1A212B; border: 1px solid {cfg.grid_color}; border-radius: 6px; }}"
-            f"QTabWidget::pane {{ border: 1px solid {cfg.grid_color}; top: -1px; }}"
-            f"QTabBar::tab {{ background: #151B23; color: {cfg.axis_text_color}; padding: 4px 10px; "
-            f"border: 1px solid {cfg.grid_color}; border-bottom: none; margin-right: 2px; }}"
-            f"QTabBar::tab:selected {{ background: #1A212B; color: {cfg.text_color}; font-weight: bold; }}"
-            f"QHeaderView::section {{ background: #1A212B; color: {cfg.axis_text_color}; "
-            f"border: none; padding: 3px; }}"
-        )
+        # Commit 35 R6：全局主題（默認 dark = 同現行行為一致）；set_theme() 切換時重新 setStyleSheet
+        self._theme = get_theme("dark")
+        self.setStyleSheet(build_qss(self._theme))
+
+        # Commit 35 R4：雙 env 資金明細 mini panel label registry——必須喺 _build_top_bar()（下方）之前初始化
+        self._env_funds_labels: dict[str, dict[str, QLabel]] = {}
 
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
-        # Commit 34：PIN bar 唔再放頂部——移入右欄限價下單 form 內（_build_order_group）。
-        # 主區左右佈局：左欄 = 監控側（帳戶卡片 + 今日訂單/持倉上下水平二分）；右欄 = 交易側全高（資金/訂金 + 限價下單 form）。
+        # Commit 35 R3+R4：頂部 top bar——右側 = 雙 env 資金明細 mini panel（取代舊右欄 funds group）
+        # + **全局實盤/模擬盤模式按鍵**（由下單 form PIN bar 移入，form 內選擇器取消）。
+        root.addWidget(self._build_top_bar())
+        # 主區左右佈局：左欄 = 監控側（帳戶卡片 + 今日訂單/持倉上下水平二分）；右欄 = 交易側（限價下單 form + OpenD 設定）。
         main_row = QHBoxLayout()
         left_col = QVBoxLayout()
         left_col.addWidget(self._build_account_cards())
@@ -231,8 +254,9 @@ class OrderWindow(QMainWindow):
         tables_row.addWidget(self._build_positions_group(), 1)   # 下：持倉 group（Commit 34：+操作欄 +全部平倉）
         left_col.addLayout(tables_row, 1)                        # stretch：表格佔左欄剩餘高度
         right_col = QVBoxLayout()
-        right_col.addWidget(self._build_funds_group())
-        right_col.addWidget(self._build_order_group(), 1)        # 下單 form 填右欄剩餘高度（交易按鍵喺內）
+        # Commit 35 R4：資金/訂金 group 移去 top bar mini panel；右欄底部 = OpenD 連線設定（R8）
+        right_col.addWidget(self._build_order_group(), 1)        # 下單 form 填右欄主要高度（交易按鍵喺內）
+        right_col.addWidget(self._build_opend_settings_group())
         main_row.addLayout(left_col, 3)
         main_row.addLayout(right_col, 2)
         root.addLayout(main_row, 1)
@@ -290,26 +314,33 @@ class OrderWindow(QMainWindow):
         self._pos_row_btns: list[QPushButton] = []          # per-row 平倉按鈕（重繪前 deleteLater 清理）
         self._ord_row_btns: list[QPushButton] = []          # per-row 撤單按鈕（重繪前 deleteLater 清理）
 
+        # Commit 35 R8：OpenD 連線測試 worker（持有引用防 GC；一次性、run 完即棄）
+        self._conn_testers: list[_ConnTester] = []
+
         self._on_code_changed()   # Commit 33：初始代碼（cfg.trading_code）→ 名稱/合計/帳戶 label 就緒
         self._apply_pin_state()   # 初始：SIMULATE 默認 → 表單 enabled；PIN 區隱藏
         self._engine.start(cfg)
 
     # ------------------------------------------------------------- widget builders
 
-    def _build_pin_bar(self) -> QWidget:
-        """PIN bar（Commit 34：移入下單 form）：兩行佈局——row1 = 交易模式選擇器 + countdown；
-        row2 = PIN 輸入區（**只實盤先顯示**）/ 模擬盤提示。
+    def _build_top_bar(self) -> QWidget:
+        """頂部 top bar（Commit 35 R3+R4）：右側聚簇——雙 env 資金明細 mini panel + **全局模式按鍵**。
 
-        模擬盤無需交易密碼（futu 規則）→ `_pin_box` 隱藏、顯示提示 label；實盤 → masked PIN input +
-        解鎖/鎖定按鍵 + countdown。模式切換唔會清空已解鎖嘅 PIN holder（24h 狀態跨模式保留）。
+        - R4：實盤/模擬資金明細由舊右欄 funds group 移入呢度（兩個並排 mini panel，9 欄各半寬、
+          compact 字體）；`_env_funds_labels[env][field]` 結構不變 → `_on_account_funds` 零改動。
+        - R3：實盤/模擬盤模式按鍵由下單 form PIN bar 移入（右上角），**全局切換**——form 內選擇器取消；
+          checked 高亮由 window-level QSS `QPushButton:checked` accent 處理（唔再 hardcoded stylesheet）。
         """
         bar = QWidget()
-        v = QVBoxLayout(bar)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(6)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)   # 全部內容靠右（右上角）
 
-        # row1：交易模式選擇器 + countdown
-        row1 = QHBoxLayout()
+        # R4：雙 env 資金明細 mini panel（並排）
+        for env in ("REAL", "SIMULATE"):
+            row.addWidget(self._build_funds_mini(env))
+
+        # R3：全局交易模式按鍵 + countdown
         title = QLabel("交易模式")
         title.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
         self._mode_sim_btn = QPushButton("模擬盤 SIMULATE")
@@ -317,9 +348,6 @@ class OrderWindow(QMainWindow):
         for btn, checked in ((self._mode_sim_btn, True), (self._mode_real_btn, False)):
             btn.setCheckable(True)
             btn.setChecked(checked)
-            btn.setStyleSheet(
-                "QPushButton { background: #1E2836; border: 1px solid #2A3441; color: #7A8699; font-weight: bold; }"
-                "QPushButton:checked { background: #27435C; border-color: #4FC3F7; color: #FFFFFF; }")
         mode_group = QButtonGroup(self)
         mode_group.setExclusive(True)
         mode_group.addButton(self._mode_sim_btn)
@@ -327,13 +355,58 @@ class OrderWindow(QMainWindow):
 
         self._countdown_label = QLabel("")
         self._countdown_label.setStyleSheet(f"color: {_WARN_COLOR};")
-        row1.addWidget(title)
-        row1.addWidget(self._mode_sim_btn)
-        row1.addWidget(self._mode_real_btn)
-        row1.addStretch(1)
-        row1.addWidget(self._countdown_label)
+        row.addWidget(title)
+        row.addWidget(self._mode_sim_btn)
+        row.addWidget(self._mode_real_btn)
+        row.addWidget(self._countdown_label)
 
-        # row2：PIN 輸入區（REAL only）/ 模擬盤提示
+        # 模式切換：lambda 包零參數調用（toggled 雖只有一個 (bool) overload，統一 lambda 最穩）
+        self._mode_sim_btn.toggled.connect(lambda: self._sync_mode())
+        self._mode_real_btn.toggled.connect(lambda: self._sync_mode())
+        return bar
+
+    def _build_funds_mini(self, env: str) -> QGroupBox:
+        """單一 env 資金明細 mini panel（Commit 35 R4）：9 欄 compact form，填 `_env_funds_labels[env]`。"""
+        box = QGroupBox("實盤 REAL" if env == "REAL" else "模擬 SIMULATE")
+        grid = QVBoxLayout(box)
+        grid.setContentsMargins(8, 12, 8, 6)
+        grid.setSpacing(2)
+        rows = [
+            ("total_assets", "總資產"), ("cash_hkd", "現金 HKD"),
+            ("cash_usd", "現金 USD"), ("withdraw_hkd", "可提 HKD"),
+            ("withdraw_usd", "可提 USD"), ("buying_power", "購買力"),
+            ("initial_margin", "初始保證金（訂金）"), ("maintenance_margin", "維持保證金"),
+            ("risk_status", "風控狀態"),
+        ]
+        labels: dict[str, QLabel] = {}
+        for key, label_text in rows:
+            r = QHBoxLayout()
+            name = QLabel(f"{label_text}：")
+            name.setStyleSheet("color: #7A8699; font-size: 12px;")
+            value = QLabel("—")
+            value.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color}; font-size: 12px;")
+            labels[key] = value
+            r.addWidget(name)
+            r.addStretch(1)
+            r.addWidget(value)
+            grid.addLayout(r)
+        self._env_funds_labels[env] = labels
+        box.setFixedWidth(300)   # 兩個並排共 ~620px，唔會擠爆 top bar
+        return box
+
+    def _build_pin_bar(self) -> QWidget:
+        """PIN bar（Commit 35：單行——模式選擇器已移去 top bar；只留 PIN 輸入 + 解鎖/鎖定）。
+
+        模擬盤無需交易密碼（futu 規則）→ `_pin_box` 隱藏、顯示提示 label；實盤 → masked PIN input +
+        解鎖/鎖定按鍵。countdown 喺 top bar 模式按鍵旁。模式切換唔會清空已解鎖嘅 PIN holder
+        （24h 狀態跨模式保留）。
+        """
+        bar = QWidget()
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        # PIN 輸入區（REAL only）/ 模擬盤提示
         self._pin_box = QWidget()
         ph = QHBoxLayout(self._pin_box)
         ph.setContentsMargins(0, 0, 0, 0)
@@ -361,14 +434,10 @@ class OrderWindow(QMainWindow):
         row2.addWidget(self._sim_hint)
         row2.addStretch(1)
 
-        v.addLayout(row1)
         v.addLayout(row2)
 
         self._unlock_btn.clicked.connect(self._on_unlock_clicked)
         self._lock_btn.clicked.connect(self._on_lock_clicked)
-        # 模式切換：lambda 包零參數調用（toggled 雖只有一個 (bool) overload，統一 lambda 最穩）
-        self._mode_sim_btn.toggled.connect(lambda: self._sync_mode())
-        self._mode_real_btn.toggled.connect(lambda: self._sync_mode())
         return bar
 
     def _sync_mode(self) -> None:
@@ -376,6 +445,107 @@ class OrderWindow(QMainWindow):
         self._mode = "SIMULATE" if self._mode_sim_btn.isChecked() else "REAL"
         self._refresh_matched_account()   # 匹配依賴 env——切換即刻重算
         self._apply_pin_state()
+
+    def _build_opend_settings_group(self) -> QGroupBox:
+        """OpenD 連線設定 group（Commit 35 R8）：報價/交易兩端點各自 IP+PORT + 連線測試按鍵。
+
+        - 默認值由 `self._cfg` 讀入（Config.from_env fallback chain：FUTU_QUOTE_* → FUTU_OPEND_*）；
+        - 「儲存並重連」→ `save_env_values()` 寫 .env + emit `endpoints_changed` → main.py 比對
+          舊/新端點、選擇性 restart engine（報價變 → K 綫視窗 reconnect；交易變 → 本視窗 reconnect）；
+        - 連線測試按鍵 → `_ConnTester` worker thread——`test_endpoint()` 係阻塞函數
+          （TCP + SDK 握手，最壞 ~5s+），嚴禁 GUI thread 直接 call。
+        """
+        box = QGroupBox("OpenD 連線設定")
+        v = QVBoxLayout(box)
+        v.setSpacing(6)
+
+        self._quote_host_edit = QLineEdit(self._cfg.quote_host)
+        self._quote_port_spin = QSpinBox()
+        self._quote_port_spin.setRange(1, 65535)
+        self._quote_port_spin.setValue(int(self._cfg.quote_port))
+        self._trade_host_edit = QLineEdit(self._cfg.trade_host)
+        self._trade_port_spin = QSpinBox()
+        self._trade_port_spin.setRange(1, 65535)
+        self._trade_port_spin.setValue(int(self._cfg.trade_port))
+
+        for label_text, host_edit, port_spin, kind in (
+            ("報價 OpenD", self._quote_host_edit, self._quote_port_spin, "quote"),
+            ("交易 OpenD", self._trade_host_edit, self._trade_port_spin, "trade"),
+        ):
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            test_btn = QPushButton("測試")
+            # lambda 包零參數調用（AGENTS.md #4：clicked 雙 overload，slot 帶參會綁定 bool 版）
+            test_btn.clicked.connect(lambda _=False, k=kind: self._start_conn_test(k))
+            row.addWidget(lbl)
+            row.addWidget(host_edit, 1)
+            row.addWidget(port_spin)
+            row.addWidget(test_btn)
+            v.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        self._save_endpoints_btn = QPushButton("儲存並重連")
+        self._conn_status_label = QLabel("")
+        self._conn_status_label.setStyleSheet(f"color: {self._cfg.axis_text_color}; font-size: 12px;")
+        btn_row.addWidget(self._save_endpoints_btn)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+        v.addWidget(self._conn_status_label)
+
+        self._save_endpoints_btn.clicked.connect(self._on_save_endpoints_clicked)
+        return box
+
+    def _start_conn_test(self, kind: str) -> None:
+        """連線測試按鍵 → spawn `_ConnTester` worker thread（阻塞 TCP+SDK 握手唔可以喺 GUI thread）。"""
+        if kind == "quote":
+            host, port = self._quote_host_edit.text().strip(), self._quote_port_spin.value()
+        else:
+            host, port = self._trade_host_edit.text().strip(), self._trade_port_spin.value()
+        tester = _ConnTester(kind, host, port)
+        self._conn_testers.append(tester)   # 持有引用防 GC（thread run 完即棄）
+        tester.result.connect(self._on_conn_test_result)
+        threading.Thread(target=tester.run, daemon=True).start()
+
+    def _on_conn_test_result(self, kind: str, ok: bool, msg: str) -> None:
+        """worker result（auto-queue 返 GUI）：group 內測試狀態 label + 成功/失敗配色。"""
+        zh = "報價" if kind == "quote" else "交易"
+        self._conn_status_label.setText(f"{zh}端點：{msg}")
+        self._conn_status_label.setStyleSheet(
+            f"color: {'#089981' if ok else _ERR_COLOR}; font-size: 12px;")
+
+    def _on_save_endpoints_clicked(self) -> None:
+        """儲存並重連 → 四個端點變數寫 .env + emit `endpoints_changed`（main.py 比對後選擇性 restart）。"""
+        updates = {
+            "FUTU_QUOTE_HOST": self._quote_host_edit.text().strip() or "127.0.0.1",
+            "FUTU_QUOTE_PORT": str(self._quote_port_spin.value()),
+            "FUTU_TRADE_HOST": self._trade_host_edit.text().strip() or "127.0.0.1",
+            "FUTU_TRADE_PORT": str(self._trade_port_spin.value()),
+        }
+        try:
+            path = save_env_values(updates)
+        except Exception as exc:  # noqa: BLE001 — .env 寫入失敗（權限等）→ status bar 回報、唔 emit
+            self._set_status(f"OpenD 設定儲存失敗：{exc}", _ERR_COLOR)
+            return
+        self._set_status(f"OpenD 設定已儲存（{path.name}）——重連中…", self._cfg.axis_text_color)
+        self.endpoints_changed.emit({
+            "quote": (updates["FUTU_QUOTE_HOST"], int(updates["FUTU_QUOTE_PORT"])),
+            "trade": (updates["FUTU_TRADE_HOST"], int(updates["FUTU_TRADE_PORT"])),
+        })
+
+    def set_theme(self, theme) -> None:
+        """全局主題切換（Commit 35 R6）：重新 setStyleSheet(build_qss(t))——Qt 自動重繪所有 widget。
+
+        Theme 實例原樣採用（MainWindow 嘅 dark 可能帶 .env 顏色覆蓋、唔係純 DARK palette）；
+        字串 → get_theme() 解析。
+        """
+        self._theme = theme if isinstance(theme, Theme) else get_theme(str(theme or ""))
+        self.setStyleSheet(build_qss(self._theme))
+
+    def reconnect(self, new_cfg: Config) -> None:
+        """端點變更 → engine restart（Commit 35 R8）：stop() 冪等 + start(new_cfg)；UI 狀態（PIN/模式）保留。"""
+        self._cfg = new_cfg
+        self._engine.stop()
+        self._engine.start(new_cfg)
 
     def _build_account_cards(self) -> QTabWidget:
         """帳戶卡片區：按環境 tab 分類（實盤 REAL / 模擬 SIMULATE），每帳戶一張卡。
@@ -449,39 +619,6 @@ class OrderWindow(QMainWindow):
             else:
                 card.setStyleSheet("")   # 空 = 回落 window-level stylesheet 默認樣式
 
-    def _build_funds_group(self) -> QGroupBox:
-        """資金/訂金 group：按環境 tab 分類（實盤/模擬），各 tab = 該 env 全部 ACTIVE 帳戶加總嘅 9 欄。"""
-        box = QGroupBox("資金 / 訂金")
-        outer = QVBoxLayout(box)
-        self._funds_tabs = QTabWidget()
-        self._env_funds_labels: dict[str, dict[str, QLabel]] = {}
-        rows = [
-            ("total_assets", "總資產"), ("cash_hkd", "現金 HKD"),
-            ("cash_usd", "現金 USD"), ("withdraw_hkd", "可提 HKD"),
-            ("withdraw_usd", "可提 USD"), ("buying_power", "購買力"),
-            ("initial_margin", "初始保證金（訂金）"), ("maintenance_margin", "維持保證金"),
-            ("risk_status", "風控狀態"),
-        ]
-        for env in ("REAL", "SIMULATE"):
-            page = QWidget()
-            grid = QVBoxLayout(page)
-            labels: dict[str, QLabel] = {}
-            for key, label_text in rows:
-                row = QHBoxLayout()
-                name = QLabel(f"{label_text}：")
-                name.setStyleSheet("color: #7A8699;")
-                value = QLabel("—")
-                value.setStyleSheet(f"font-weight: bold; color: {self._cfg.text_color};")
-                labels[key] = value
-                row.addWidget(name)
-                row.addStretch(1)
-                row.addWidget(value)
-                grid.addLayout(row)
-            self._env_funds_labels[env] = labels
-            self._funds_tabs.addTab(page, "實盤 REAL" if env == "REAL" else "模擬 SIMULATE")
-        outer.addWidget(self._funds_tabs)
-        return box
-
     def _build_positions_group(self) -> QGroupBox:
         """持倉 group（Commit 34）：header row（全部平倉按鍵）+ table 13 欄。
 
@@ -540,6 +677,7 @@ class OrderWindow(QMainWindow):
         box = QGroupBox("限價下單")
         box.setObjectName("orderGroup")   # Commit 34：PIN bar 移入呢度（測試定位用）
         v = QVBoxLayout(box)
+        v.setSpacing(10)   # Commit 35 R7：form 合理隔行（默認 ~6px → 10px，行距清晰唔擠迫）
         cfg = self._cfg
 
         # Row 1：代碼（模糊自動補全 + 目錄驗證）+ 中文名稱 label
@@ -566,7 +704,7 @@ class OrderWindow(QMainWindow):
         # Row 2：價格（spinbox stepper）+ follow icon + 數量
         self._order_price = QDoubleSpinBox()
         self._order_price.setRange(0.0, 1e12)
-        self._order_price.setDecimals(4)
+        self._order_price.setDecimals(2)   # Commit 35 R5：交易價格固定小數後兩位（如 3.33）
         self._order_price.setValue(0.0)
         self._order_price.setSingleStep(_price_step(1.0))   # = 0.01；valueChanged 後自適應
         self._follow_btn = QPushButton("🔗")
@@ -715,6 +853,8 @@ class OrderWindow(QMainWindow):
 
         Commit 34：價格欄重置為 0（新標的市價由 follow mode 下一個 tick 驅動）+ 清最後市價 +
         記錄 `_last_emitted_code`（防反向同步 debounce 將同一 code emit 返去 K 綫視窗）。
+        Commit 35 R1：標的改變 → **強制跟隨現價模式**（用戶之前切咗手動輸入都拉返 🔗）——
+        價格設為現價並自動跟現價；先清 `_last_followed_price` 再 force follow，避免用舊標的市價填回。
         """
         self._order_code.blockSignals(True)
         try:
@@ -728,6 +868,14 @@ class OrderWindow(QMainWindow):
             self._order_price.setValue(0.0)
         finally:
             self._order_price.blockSignals(False)
+        # Commit 35 R1：強制跟隨現價（manual mode → follow）；_last_followed_price 已清 → 唔會用舊市價填回
+        if not self._following:
+            self._follow_btn.blockSignals(True)
+            try:
+                self._follow_btn.setChecked(True)
+            finally:
+                self._follow_btn.blockSignals(False)
+            self._on_follow_toggled(True)   # signal 被 block → 手動觸發（glyph/tooltip + _apply_pin_state）
         # 反向同步防 loop：呢個 code 來自 K 綫視窗，唔好再 emit 返去
         self._last_emitted_code = (code or "").strip().upper()
         self._on_code_changed()   # Commit 33：signal 被 block → 手動同步名稱/合計/帳戶 label
@@ -972,8 +1120,9 @@ class OrderWindow(QMainWindow):
         """今日訂單 snapshot → table 重繪（Commit 33：11 欄全細節；狀態格上色：已成綠 / 失敗・撤單紅 / pending 黃）。
 
         Commit 34：加「操作」欄——per-row「撤單」按鈕（只可撤狀態先 enabled）+ 存當前顯示行。
+        Commit 35 R2：雙 env 訂單輪詢 → 「帳戶」欄加 env 前綴（實盤/模擬 …卡號末四位），兩環境訂單分組可辨。
         """
-        acc_card = {a.acc_id: a.card_num for a in self._all_accounts}   # Commit 33：帳戶欄（卡號末四位）
+        acc_card = {(a.trd_env, a.acc_id): a.card_num for a in self._all_accounts}   # Commit 35 R2：(env, acc_id) → 卡號
         table = self._orders_table
         # Commit 34：重繪前清理舊 per-row 按鈕（setCellWidget widget 唔會隨 setRowCount shrink 自動刪除）
         for b in self._ord_row_btns:
@@ -983,8 +1132,14 @@ class OrderWindow(QMainWindow):
         self._displayed_orders = rows   # Commit 34：per-row「撤單」按鈕回調用呢份
         for r, row in enumerate(rows):
             t = row.create_time or "—"
-            card = acc_card.get(row.acc_id)
-            acc_text = f"…{card[-4:]}" if card and card != "N/A" else (str(row.acc_id) if row.acc_id else "—")
+            env_zh = "實盤" if row.trd_env == "REAL" else "模擬"   # Commit 35 R2：env 前綴（雙 env 訂單可辨）
+            card = acc_card.get((row.trd_env, row.acc_id))
+            if card and card != "N/A":
+                acc_text = f"{env_zh} …{card[-4:]}"
+            elif row.acc_id:
+                acc_text = f"{env_zh} {row.acc_id}"
+            else:
+                acc_text = "—"
             values = [
                 row.order_id or "—",
                 row.code, _SIDE_ZH.get(row.side, row.side or "—"),

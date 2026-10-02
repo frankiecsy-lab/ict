@@ -787,3 +787,53 @@ def test_switch_symbol_empty_noop(monkeypatch):
     win.switch_symbol(None)   # type: ignore[arg-type]
 
     assert engine.switch_calls == []
+
+
+# ---------------------------------------------------------------- Commit 35 R6：全局淺色/暗色主題切換
+
+def test_theme_default_dark_with_cfg_overlay(monkeypatch):
+    """Commit 35 R6：默認 dark = DARK palette + .env 顏色覆蓋；按鍵 glyph 顯示目標模式（現 dark → ☀️）。"""
+    win, _ = _make_window(monkeypatch)
+    assert win._theme.name == "dark"
+    assert win._theme_btn.text() == "☀️"
+
+
+def test_theme_toggle_roundtrip_and_signal(monkeypatch):
+    """Commit 35 R6：全局淺色/暗色切換——theme_changed emit + glyph 顯示目標模式。"""
+    win, _ = _make_window(monkeypatch)
+    emitted = []
+    win.theme_changed.connect(emitted.append)
+
+    win.toggle_theme()
+    assert win._theme.name == "light" and len(emitted) == 1 and emitted[0].name == "light"
+    assert win._theme_btn.text() == "🌙", "現 light → 按鍵顯示 🌙（目標模式）"
+
+    win.toggle_theme()
+    assert win._theme.name == "dark", "切返 dark = _default_dark（.env 覆蓋版，唔係純 DARK palette）"
+    assert len(emitted) == 2 and emitted[1].name == "dark"
+    assert win._theme_btn.text() == "☀️"
+
+
+def test_theme_persisted_in_ui_state(monkeypatch):
+    """Commit 35 R6：主題偏好寫入 UI state（單行 JSON blob，schema 演化免 ALTER）。"""
+    win, _ = _make_window(monkeypatch)
+    win.toggle_theme()   # → light + _save_ui_state
+    assert win._state_store.saved and win._state_store.saved[-1].get("theme") == "light"
+
+
+def test_saved_theme_restored_on_startup(monkeypatch):
+    """Commit 35 R6：開機還原主題偏好（saved_state['theme']）。"""
+    win, _ = _make_window(monkeypatch, saved_state={"theme": "light"})
+    assert win._theme.name == "light"
+
+
+def test_set_theme_accepts_string_and_instance(monkeypatch):
+    """Commit 35 R6：set_theme 雙形態——string（get_theme 解析）/ Theme instance（原樣套用）。"""
+    from ui.theme import LIGHT
+
+    win, _ = _make_window(monkeypatch)
+    win.set_theme("light")
+    assert win._theme.name == "light" and win._theme.bg == LIGHT.bg
+
+    win.set_theme(LIGHT)   # instance 原樣（main.py 接線：MainWindow.theme_changed → OrderWindow.set_theme）
+    assert win._theme is LIGHT

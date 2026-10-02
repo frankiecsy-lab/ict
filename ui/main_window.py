@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -34,6 +35,7 @@ from engine.stock_catalog import basic_info_text, name_text
 from engine.ui_state_store import UIStateStore, default_ui_state_path
 from .candle_chart import CandleChart
 from .stock_completer import StockCompleter, code_from_completion
+from .theme import Theme, build_qss, get_theme
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +75,23 @@ def format_latency(ms: float | None) -> str:
     return f"{ms:.1f}ms"
 
 
+def _cfg_theme(base: Theme, cfg) -> Theme:
+    """將 .env 顏色覆蓋（BG_COLOR/GRID_COLOR/TEXT_COLOR/AXIS_TEXT_COLOR/LAST_PRICE_COLOR）疊加去 base theme。
+
+    Commit 35 R6：默認 dark 主題 = DARK palette + .env 覆蓋——保留既有「.env 自訂深色配色」行為；
+    cfg 全部係預設值時結果 == 純 DARK（無副作用）。
+    """
+    return dataclasses.replace(
+        base, bg=cfg.bg_color, grid=cfg.grid_color, text=cfg.text_color,
+        muted=cfg.axis_text_color, accent=cfg.last_price_color)
+
+
 class MainWindow(QMainWindow):
     # 跨視窗同步 signal（main.py 接線去 OrderWindow）：K 綫標的切換 / 最新收市價 / 股票目錄
     code_changed = Signal(str)
     last_price = Signal(float)
     catalog_ready = Signal(tuple)   # engine catalog re-emit → OrderWindow StockCompleter（Commit 31）
+    theme_changed = Signal(object)   # Commit 35 R6：主題切換 → main.py 接線去 OrderWindow.set_theme
 
     def __init__(self, cfg):
         super().__init__()
@@ -85,12 +99,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ICT Trader")
         self.resize(1280, 800)
 
-        # 深色主題（status bar / label 跟 .env 配色）
-        self.setStyleSheet(
-            f"QMainWindow {{ background: {cfg.bg_color}; }}"
-            f"QStatusBar {{ background: {cfg.bg_color}; color: {cfg.text_color}; border: none; }}"
-            f"QLabel {{ color: {cfg.text_color}; font-family: Consolas; }}"
-        )
+        # Commit 35 R6：全局主題——默認 dark = DARK palette + .env 顏色覆蓋（同現行行為一致）；
+        # _default_dark = light → dark 切返時嘅歸宿（保留 .env 自訂配色）
+        self._default_dark = _cfg_theme(get_theme("dark"), cfg)
+        self._theme = self._default_dark
+        self.setStyleSheet(build_qss(self._theme))
         sb = self.statusBar()
         sb.showMessage("連線 OpenD 中…", 0)
 
@@ -176,11 +189,7 @@ class MainWindow(QMainWindow):
             combo.setCurrentText(cfg.kline_type)   # pane 0 預設跟 .env kline_type
         else:
             combo.setCurrentIndex(min(index, len(KLINE_TYPES) - 1))  # 其餘 pane 錯開週期
-        combo.setStyleSheet(
-            f"QComboBox {{ background: {cfg.bg_color}; color: {cfg.text_color};"
-            f" border: 1px solid {cfg.axis_text_color}; border-radius: 3px; padding: 0 6px;"
-            f" font-family: Consolas; min-height: 20px; }}"
-        )
+        combo.setStyleSheet(self._combo_style())   # Commit 35 R6：抽方法——set_theme() 重新套用
         combo.currentTextChanged.connect(lambda _t, i=index: self._on_pane_period_changed(i))
 
         chart = CandleChart(cfg) if index else self.chart
@@ -233,22 +242,8 @@ class MainWindow(QMainWindow):
         第二行 = 當前標的基本資料 LABEL（每手股數 / 上市日期，深色主題跟 cfg 配色）。"""
         cfg = self._cfg
         bar = QFrame()
-        bar.setStyleSheet(
-            f"QFrame {{ background: {cfg.grid_color}; border-bottom: 1px solid {cfg.axis_text_color}; }}"
-            f"QLabel {{ color: {cfg.text_color}; font-family: Consolas; padding-left: 8px; }}"
-            f"QLineEdit {{"
-            f" background: {cfg.bg_color}; color: {cfg.text_color};"
-            f" border: 1px solid {cfg.axis_text_color}; border-radius: 4px;"
-            f" padding: 2px 8px; font-family: Consolas; }}"
-            f"QPushButton {{"
-            f" background: {cfg.bg_color}; color: {cfg.text_color};"
-            f" border: 1px solid {cfg.axis_text_color}; border-radius: 4px;"
-            f" padding: 2px 8px; font-family: Consolas; }}"
-            f"QPushButton:hover {{ background: {cfg.grid_color}; }}"
-            f"QPushButton:checked {{"
-            f" background: {cfg.last_price_color}; color: {cfg.bg_color};"
-            f" border-color: {cfg.last_price_color}; font-weight: bold; }}"
-        )
+        self._control_bar = bar   # Commit 35 R6：set_theme() 重新套用 widget-level QSS 用
+        bar.setStyleSheet(self._bar_style())
         v = QVBoxLayout(bar)
         v.setContentsMargins(0, 2, 0, 2)
         v.setSpacing(2)
@@ -310,7 +305,15 @@ class MainWindow(QMainWindow):
 
         h.addStretch(1)
 
+        # Commit 35 R6：全局淺色/暗色主題切換（control bar 最右）；glyph 顯示「目標模式」
+        self._theme_btn = QPushButton("☀️")
+        self._theme_btn.setFixedWidth(34)
+        self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        h.addWidget(self._theme_btn)
+
         self.code_edit.returnPressed.connect(self._do_switch)
+        # lambda 包零參數調用（AGENTS.md #4：clicked 雙 overload）
+        self._theme_btn.clicked.connect(lambda: self.toggle_theme())
         # 放大/縮小按鍵已移去各 pane header row（異步縮放、每 pane 獨立，見 _build_pane_widget）。
         v.addLayout(h)
 
@@ -325,7 +328,102 @@ class MainWindow(QMainWindow):
         h2.addWidget(self.info_label)
         h2.addStretch(1)
         v.addLayout(h2)
+        self._update_theme_btn_glyph()   # Commit 35 R6：初始 glyph（默認 dark → ☀️）
         return bar
+
+    # ------------------------------------------------------------- Commit 35 R6：全局主題切換
+
+    def _bar_style(self) -> str:
+        """control bar widget-level QSS（set_theme() 重新套用用）。"""
+        t = self._theme
+        return (f"QFrame {{ background: {t.panel}; border-bottom: 1px solid {t.border}; }}"
+                f"QLabel {{ color: {t.text}; font-family: Consolas; padding-left: 8px; }}"
+                f"QLineEdit {{ background: {t.bg}; color: {t.text};"
+                f" border: 1px solid {t.border}; border-radius: 4px;"
+                f" padding: 2px 8px; font-family: Consolas; }}"
+                f"QPushButton {{ background: {t.button}; color: {t.text};"
+                f" border: 1px solid {t.border}; border-radius: 4px;"
+                f" padding: 2px 8px; font-family: Consolas; }}"
+                f"QPushButton:hover {{ background: {t.button_hover}; }}"
+                f"QPushButton:checked {{ background: {t.accent}; color: #101418;"
+                f" border-color: {t.accent}; font-weight: bold; }}")
+
+    def _combo_style(self) -> str:
+        """pane 週期 combo widget-level QSS（set_theme() 重新套用用）。"""
+        t = self._theme
+        return (f"QComboBox {{ background: {t.panel}; color: {t.text};"
+                f" border: 1px solid {t.border}; border-radius: 3px; padding: 0 6px;"
+                f" font-family: Consolas; min-height: 20px; }}")
+
+    def _tick_table_style(self) -> str:
+        """逐筆交易表 widget-level QSS（set_theme() 重新套用用）。
+
+        顏色映射同原 cfg 版本一致：bg→t.bg、text→t.text、border→t.muted、header→t.grid。
+        """
+        t = self._theme
+        return (f"QTableWidget {{ background: {t.bg}; color: {t.text};"
+                f" border: 1px solid {t.muted}; font-family: Consolas; font-size: 12px; }}"
+                f"QHeaderView::section {{ background: {t.grid}; color: {t.text};"
+                f" border: none; padding: 2px; font-family: Consolas; }}")
+
+    def current_theme(self) -> Theme:
+        """當前主題（main.py 啟動時同步去 OrderWindow 用）。"""
+        return self._theme
+
+    def _resolve_theme(self, name: str) -> Theme:
+        """主題名 → Theme；'dark' 用 .env 顏色覆蓋版（同現行行為一致）、未知值 fallback DARK。"""
+        return self._default_dark if (name or "").strip().lower() == "dark" else get_theme(name)
+
+    def set_theme(self, theme) -> None:
+        """全局主題切換：視窗 QSS + widget-level stylesheets + 全部 pane 圖表。
+
+        `theme` 接受 Theme 實例（原樣採用——可能帶 .env 顏色覆蓋）或名稱字串（_resolve_theme 解析）。
+        漲跌色跟隨市場慣例唔跟隨主題——CandleChart.apply_theme() 只換背景/網格/文字色。
+        """
+        self._theme = theme if isinstance(theme, Theme) else self._resolve_theme(str(theme or ""))
+        t = self._theme
+        self.setStyleSheet(build_qss(t))
+        self._control_bar.setStyleSheet(self._bar_style())
+        for combo in self._pane_combos:
+            combo.setStyleSheet(self._combo_style())
+        for pane in self._panes:
+            pane.apply_theme(t)
+        # widget-level 覆蓋樣式（setStyleSheet 喺子 widget 上、視窗級 QSS 唔會自動重套）
+        self.info_label.setStyleSheet(
+            f"color: {t.muted}; font-family: Consolas; padding-left: 8px;"
+        )
+        self._tick_title.setStyleSheet(f"color: {t.text}; font-weight: bold;")
+        self._tick_hint.setStyleSheet(f"color: {t.muted}; font-size: 11px;")
+        self._tick_table.setStyleSheet(self._tick_table_style())
+        self._update_theme_btn_glyph()
+
+    def toggle_theme(self) -> None:
+        """control bar 主題按鍵：dark ↔ light + emit theme_changed（main.py → OrderWindow）+ 持久化。
+
+        dark → light 用標準 LIGHT palette；light → dark 切返 .env 顏色覆蓋版（_default_dark）。
+        """
+        target = get_theme("light") if self._theme.name == "dark" else self._default_dark
+        self.set_theme(target)
+        self.theme_changed.emit(self._theme)
+        self._save_ui_state()   # 「theme」欄位存偏好（單行 JSON blob、schema 演化免費）
+
+    def _update_theme_btn_glyph(self) -> None:
+        """glyph 顯示「目標模式」：當前 dark → ☀️（撳一下轉淺色）、當前 light → 🌙。"""
+        if self._theme.name == "dark":
+            self._theme_btn.setText("☀️")
+            self._theme_btn.setToolTip("切換淺色主題")
+        else:
+            self._theme_btn.setText("🌙")
+            self._theme_btn.setToolTip("切換暗色主題")
+
+    def reconnect(self, new_cfg) -> None:
+        """端點變更 → engine restart（Commit 35 R8）：保留當前 UI 狀態（periods/code/smt）。"""
+        self._cfg = new_cfg
+        self._engine.stop()
+        code = self.code_edit.text().strip() or None
+        smt_btn = self._indicator_btns.get("smt")
+        smt_on = bool(smt_btn.isChecked()) if smt_btn is not None else False
+        self._engine.start(new_cfg, periods=list(self._desired_periods()), code=code, smt=smt_on)
 
     def _desired_periods(self) -> frozenset[str]:
         """全部 6 pane combo 週期 union = engine 目標活躍週期集合。
@@ -395,6 +493,11 @@ class MainWindow(QMainWindow):
                 for pane in self._panes:
                     pane.set_indicator(key, want)
 
+        # Commit 35 R6：主題偏好還原（傳字串 → set_theme 經 _resolve_theme：'dark' = .env 覆蓋版）
+        theme_name = state.get("theme")
+        if isinstance(theme_name, str) and theme_name.strip():
+            self.set_theme(theme_name)
+
         # code：set 輸入欄（blockSignals 避免觸發 textChanged guard）+ 返回俾 start()
         code = state.get("code")
         if isinstance(code, str) and code.strip():
@@ -417,6 +520,7 @@ class MainWindow(QMainWindow):
                 "pane_count": self._pane_count,
                 "periods": [c.currentText() for c in self._pane_combos],
                 "indicators": [k for k, b in self._indicator_btns.items() if b.isChecked()],
+                "theme": self._theme.name,   # Commit 35 R6：主題偏好（單行 JSON blob、schema 演化免費）
             }
             code = self.code_edit.text().strip()
             if code:
@@ -589,12 +693,7 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setStyleSheet(
-            f"QTableWidget {{ background: {cfg.bg_color}; color: {cfg.text_color};"
-            f" border: 1px solid {cfg.axis_text_color}; font-family: Consolas; font-size: 12px; }}"
-            f"QHeaderView::section {{ background: {cfg.grid_color}; color: {cfg.text_color};"
-            f" border: none; padding: 2px; font-family: Consolas; }}"
-        )
+        table.setStyleSheet(self._tick_table_style())   # Commit 35 R6：抽方法——set_theme() 重新套用
         for col, w in ((0, 74), (1, 56), (2, 48), (3, 40), (4, 40)):
             table.setColumnWidth(col, w)
         v.addWidget(table, 1)

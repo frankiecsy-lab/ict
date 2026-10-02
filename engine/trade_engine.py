@@ -155,6 +155,7 @@ class OrderRow:
     dealt_avg_price: float
     create_time: str
     acc_id: int = 0          # 來源帳戶（Commit 33：訂單表 per-account 顯示；default 保舊構造相容）
+    trd_env: str = "REAL"    # 來源環境 "REAL"/"SIMULATE"（Commit 35：雙 env 訂單輪詢，GUI 分組顯示）
 
 
 class TradeEngine(QObject):
@@ -198,6 +199,7 @@ class TradeEngine(QObject):
         self._lock = threading.Lock()
         self._time_fn = time.time                            # 可注入 clock（訂單輪詢間隔測試）
         self._last_order_poll = 0.0                          # 初始化 0 → 首輪 poll 即查訂單
+        self._orders_cache: dict[tuple[str, int], list[OrderRow]] = {}   # {(trd_env, acc_id) → rows}：下單/撤單成功後即時刷新合併用（Commit 35）
 
     @property
     def cfg(self):
@@ -217,6 +219,7 @@ class TradeEngine(QObject):
             self._funds_targets.clear()
             self._order_accs.clear()
             self._all_accounts.clear()
+            self._orders_cache.clear()
             self._last_order_poll = 0.0
             thread = threading.Thread(target=self._setup, name="trade-setup", daemon=True)
             self._thread = thread
@@ -269,7 +272,7 @@ class TradeEngine(QObject):
                 continue
             try:
                 ctx = OpenSecTradeContext(
-                    filter_trdmarket=mkt_enum, host=cfg.opend_host, port=cfg.opend_port)
+                    filter_trdmarket=mkt_enum, host=cfg.trade_host, port=cfg.trade_port)   # Commit 35：交易 OpenD 獨立端點
             except Exception as exc:  # noqa: BLE001 — 單市場失敗唔影響其他市場
                 logger.exception("create %s trade context failed", market)
                 self.error.emit(f"{market} 市場連線失敗：{exc}")
@@ -384,16 +387,22 @@ class TradeEngine(QObject):
             info = self._query_funds(ctx, acc_id, trd_env)
             if info is not None and not self._closed:
                 self.account_funds_updated.emit(acc_id, trd_env, info)
-        # 訂單輪詢：獨立 30s 間隔（order_list_query 限頻 10 次/30s）；首輪即查（_last_order_poll=0.0）
+        # 訂單輪詢：獨立 30s 間隔（order_list_query 限頻 10 次/30s）；首輪即查（_last_order_poll=0.0）。
+        # Commit 35：雙 env 覆蓋——重用 _funds_targets（(env,acc_id) dedupe），SIMULATE 訂單此前完全冇 poll
+        # →「下單成功但訂單表唔顯示」bug；per-(env,acc_id) cache 供下單/撤單後即時刷新合併。
         if self._time_fn() - self._last_order_poll >= _ORDER_POLL_INTERVAL:
             self._last_order_poll = self._time_fn()
             orders: list[OrderRow] = []
-            for market in sorted(self._ctxs):
+            new_cache: dict[tuple[str, int], list[OrderRow]] = {}
+            for market, acc_id, trd_env in self._funds_targets:
                 ctx = self._ctxs.get(market)
                 if ctx is None:
                     continue
-                for acc_id, _card in self._accounts.get(market, ()):
-                    orders.extend(self._query_orders(ctx, acc_id))
+                rows = self._query_orders(ctx, acc_id, trd_env)
+                new_cache[(trd_env, acc_id)] = rows
+                orders.extend(rows)
+            with self._lock:
+                self._orders_cache = new_cache
             if not self._closed:
                 self.orders_updated.emit(tuple(orders))
         if self._closed:
@@ -464,10 +473,14 @@ class TradeEngine(QObject):
             risk_status=_s(info.get("risk_status")),   # LEVEL3=安全 / LEVEL2=警告 / LEVEL1=危險
         )
 
-    def _query_orders(self, ctx, acc_id: int) -> list[OrderRow]:
-        """order_list_query（無 start/end = 今日訂單）→ [OrderRow]；失敗/無數據 → []。"""
+    def _query_orders(self, ctx, acc_id: int, trd_env: str = "REAL") -> list[OrderRow]:
+        """order_list_query（無 start/end = 今日訂單）→ [OrderRow]；失敗/無數據 → []。
+
+        Commit 35：trd_env 參數化（此前 hardcoded TrdEnv.REAL——SIMULATE 訂單永遠查唔到）。
+        """
+        env_enum = TrdEnv.REAL if trd_env == "REAL" else TrdEnv.SIMULATE
         try:
-            ret, data = ctx.order_list_query(trd_env=TrdEnv.REAL, acc_id=acc_id, refresh_cache=True)
+            ret, data = ctx.order_list_query(trd_env=env_enum, acc_id=acc_id, refresh_cache=True)
         except Exception as exc:  # noqa: BLE001 — 單筆查詢失敗唔殺整輪 poll
             logger.exception("order_list_query failed (acc=%s)", acc_id)
             return []
@@ -488,10 +501,48 @@ class TradeEngine(QObject):
                     dealt_avg_price=_f(row.get("dealt_avg_price")),
                     create_time=_s(row.get("create_time")),
                     acc_id=acc_id,
+                    trd_env=trd_env,
                 ))
             except Exception:  # noqa: BLE001 — 單行損壞跳過
                 logger.exception("bad order row skipped")
         return out
+
+    def refresh_orders_now(self, trd_env: str = "REAL", acc_id: int | None = None) -> None:
+        """下單/撤單成功後嘅即時刷新（Commit 35）：spawn worker 只查目標 (env, acc_id)，
+        同其他帳戶 cache 合併後 emit 完整 snapshot——唔使等 30s poll gate。
+
+        限頻安全：每次操作 = 1 次 order_list_query（唔係 N）。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            targets = [(m, a, e) for (m, a, e) in self._funds_targets
+                       if e == trd_env and (acc_id is None or a == acc_id)]
+            cache_snapshot = dict(self._orders_cache)
+        thread = threading.Thread(
+            target=self._refresh_orders_worker, args=(targets, cache_snapshot),
+            name="trade-orders-refresh", daemon=True)
+        with self._lock:
+            if not self._closed:
+                self._workers.append(thread)
+        thread.start()
+
+    def _refresh_orders_worker(self, targets: list[tuple[str, int, str]],
+                               base_cache: dict[tuple[str, int], list[OrderRow]]) -> None:
+        """Worker：重查目標帳戶訂單 → 合併 cache（其他帳戶保留上次值）→ emit 全量。"""
+        merged = dict(base_cache)
+        for market, acc_id, trd_env in targets:
+            ctx = self._ctxs.get(market)
+            if ctx is None:
+                continue
+            rows = self._query_orders(ctx, acc_id, trd_env)
+            merged[(trd_env, acc_id)] = rows
+        with self._lock:
+            if not self._closed:
+                self._orders_cache = merged
+                orders = [r for rows in merged.values() for r in rows]
+        if not self._closed:
+            self.orders_updated.emit(tuple(orders))
 
     # ------------------------------------------------------------- place order（worker thread）
 
@@ -545,6 +596,7 @@ class TradeEngine(QObject):
         try:
             ret, msg = ctx.place_order(qty=qty, **order_kw)
             if ret == RET_OK and not _needs_unlock(str(msg)):
+                self.refresh_orders_now(trd_env, acc_id)   # Commit 35：下單成功即時刷新訂單表（唔使等 30s）
                 self.order_result.emit(True, f"下單成功 order_id={msg}")
                 return
             err = str(msg)
@@ -555,6 +607,7 @@ class TradeEngine(QObject):
                     return
                 ret2, msg2 = ctx.place_order(qty=qty, **order_kw)
                 if ret2 == RET_OK and not _needs_unlock(str(msg2)):
+                    self.refresh_orders_now(trd_env, acc_id)   # Commit 35：解鎖重試成功同樣即時刷新
                     self.order_result.emit(True, f"下單成功（解鎖後重試）order_id={msg2}")
                 else:
                     self.order_result.emit(False, f"解鎖後重試失敗：{msg2}")
@@ -606,6 +659,7 @@ class TradeEngine(QObject):
         try:
             ret, msg = ctx.cancel_order(order_id=order_id, acc_id=acc_id, trd_env=env_enum)
             if ret == RET_OK:
+                self.refresh_orders_now(trd_env, acc_id)   # Commit 35：撤單成功即時刷新（狀態 → CANCELED）
                 self.cancel_result.emit(True, f"撤單成功 order_id={order_id}")
             else:
                 self.cancel_result.emit(False, str(msg))

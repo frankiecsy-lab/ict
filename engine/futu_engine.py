@@ -857,11 +857,11 @@ class FutuEngine(QObject):
     def _setup(self) -> None:
         cfg = self._cfg
         try:
-            ctx = OpenQuoteContext(cfg.opend_host, cfg.opend_port)
+            ctx = OpenQuoteContext(cfg.quote_host, cfg.quote_port)   # Commit 35：報價 OpenD 獨立端點
         except Exception as exc:  # noqa: BLE001 — 連線失敗（OpenD 未開等）→ 回報 GUI
             logger.exception("OpenQuoteContext connect failed")
             if not self._closed:
-                self.error.emit(f"連唔到 OpenD {cfg.opend_host}:{cfg.opend_port}: {exc}")
+                self.error.emit(f"連唔到報價 OpenD {cfg.quote_host}:{cfg.quote_port}: {exc}")
             return
         with self._lock:
             if self._ctx is not None:  # stop() 已行過 / 重複 start → close 自己嘅連線退出
